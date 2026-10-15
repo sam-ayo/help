@@ -1,6 +1,6 @@
 //! The main window: a sidebar, a list of chats, and the chat view, as in a mail app.
 
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use acp_host::{AgentKind, Command, Event, PermissionOptionView, Session, ToolStatus};
 use gpui::{
@@ -96,6 +96,9 @@ pub struct AppView {
     drag_pending: bool,
     /// The sidebar shows. The user can hide it to give the chat more room.
     sidebar_open: bool,
+    /// The tool cards that the user opened or closed, as (chat id, tool id). A card for a failed
+    /// tool starts open. The other cards start closed.
+    toggled_tools: HashSet<(u64, String)>,
     /// The agent for new chats: the agent that the user picked last.
     agent: AgentKind,
     _subs: Vec<gpui::Subscription>,
@@ -156,6 +159,7 @@ impl AppView {
             vm_busy: false,
             drag_pending: false,
             sidebar_open: true,
+            toggled_tools: HashSet::new(),
             agent,
             _subs: subs,
         };
@@ -165,6 +169,7 @@ impl AppView {
         } else {
             view.new_chat(agent, window, cx);
         }
+        view.scroll.scroll_to_bottom();
         view
     }
 
@@ -1237,7 +1242,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_item(&self, ix: usize, item: &Item, kind: AgentKind, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_item(&self, ix: usize, item: &Item, chat_id: u64, kind: AgentKind, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         match item {
             Item::User(text) => h_flex()
@@ -1248,23 +1253,45 @@ impl AppView {
                         .px_4()
                         .py_2p5()
                         .rounded(px(18.))
-                        .bg(accent(&theme))
-                        .text_color(theme.primary_foreground)
+                        // A tint of the accent, with the normal text color, so that every theme has
+                        // good contrast.
+                        .bg(accent(&theme).opacity(if theme.is_dark() { 0.24 } else { 0.12 }))
+                        .text_color(theme.foreground)
                         .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true)),
                 )
                 .into_any_element(),
-            Item::Agent(text) => h_flex()
-                .items_start()
-                .gap_3()
-                .child(avatar(kind, 28.))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .pt_0p5()
-                        .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true)),
-                )
-                .into_any_element(),
+            Item::Agent(text) => {
+                let group: SharedString = format!("agent-message-{ix}").into();
+                let copy = text.clone();
+                h_flex()
+                    .group(group.clone())
+                    .items_start()
+                    .gap_3()
+                    .child(avatar(kind, 28.))
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .pt_0p5()
+                            .gap_1()
+                            .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true))
+                            // The copy button shows when the pointer is on the message. Only the
+                            // visibility changes, so the layout stays the same.
+                            .child(
+                                h_flex().invisible().group_hover(group, |s| s.visible()).child(
+                                    Button::new(("copy", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(Icon::new(KitIcon::Copy).text_color(theme.muted_foreground))
+                                        .tooltip("Copy")
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
+                                        }),
+                                ),
+                            ),
+                    )
+                    .into_any_element()
+            }
             Item::Thought(text) => h_flex()
                 .items_start()
                 .gap_2()
@@ -1274,45 +1301,69 @@ impl AppView {
                 .child(div().flex_1().min_w_0().text_sm().italic().child(text.clone()))
                 .into_any_element(),
             Item::Tool {
+                id,
                 title,
                 kind: tool_kind,
                 status,
                 detail,
-                ..
-            } => v_flex()
-                .ml(px(40.))
-                .rounded_lg()
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.foreground.opacity(0.02))
-                .overflow_hidden()
-                .child(
-                    h_flex()
-                        .px_3()
-                        .py_2()
-                        .gap_2()
-                        .child(Icon::new(tool_icon(tool_kind)).size(px(14.)).text_color(theme.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().text_sm().child(title.clone()))
-                        .child(status_icon(*status, &theme)),
-                )
-                .when_some(detail.clone(), |el, d| {
-                    let short: String = d.chars().take(1200).collect();
-                    el.child(
-                        div()
+            } => {
+                // A click on the header opens or closes the output. A failed tool starts open.
+                let key = (chat_id, id.clone());
+                let open = detail.is_some() && (self.toggled_tools.contains(&key) != (*status == ToolStatus::Failed));
+                v_flex()
+                    .ml(px(40.))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.foreground.opacity(0.02))
+                    .overflow_hidden()
+                    .child(
+                        h_flex()
+                            .id(("tool", ix))
                             .px_3()
                             .py_2()
-                            .max_h(px(180.))
-                            .overflow_hidden()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .bg(theme.foreground.opacity(0.03))
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground)
-                            .child(short),
+                            .gap_2()
+                            .when(detail.is_some(), |el| {
+                                el.cursor_pointer()
+                                    .hover(|el| el.bg(theme.foreground.opacity(0.03)))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.toggled_tools.remove(&key) {
+                                            this.toggled_tools.insert(key.clone());
+                                        }
+                                        cx.notify();
+                                    }))
+                            })
+                            .child(Icon::new(tool_icon(tool_kind)).size(px(14.)).text_color(theme.muted_foreground))
+                            .child(div().flex_1().min_w_0().truncate().text_sm().child(title.clone()))
+                            .child(status_icon(*status, &theme))
+                            .when(detail.is_some(), |el| {
+                                el.child(
+                                    Icon::new(if open { KitIcon::ChevronDown } else { KitIcon::ChevronRight })
+                                        .size(px(14.))
+                                        .text_color(theme.muted_foreground),
+                                )
+                            }),
                     )
-                })
-                .into_any_element(),
+                    .when_some(detail.clone().filter(|_| open), |el, d| {
+                        let short: String = d.chars().take(4000).collect();
+                        el.child(
+                            div()
+                                .id(("tool-detail", ix))
+                                .px_3()
+                                .py_2()
+                                .max_h(px(240.))
+                                .overflow_y_scroll()
+                                .border_t_1()
+                                .border_color(theme.border)
+                                .bg(theme.foreground.opacity(0.03))
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .child(short),
+                        )
+                    })
+                    .into_any_element()
+            }
             Item::Plan(entries) => {
                 let done = entries.iter().filter(|(_, s)| *s == ToolStatus::Done).count();
                 v_flex()
@@ -1560,7 +1611,8 @@ impl AppView {
                             .flex_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .when(busy, |el| el.child("is working…")),
+                            .when(!busy && !closed, |el| el.child("Return to send, Shift-Return for a new line"))
+                            .when(closed, |el| el.child("The agent stopped. Start a new chat to continue.")),
                     )
                     .child(action),
             )
@@ -1575,15 +1627,26 @@ impl Render for AppView {
         let chat = self.chats.get(self.active);
         let kind = chat.map(|c| c.kind).unwrap_or(AgentKind::Claude);
         let empty = chat.is_none_or(|c| c.items.is_empty());
-        let items: Vec<gpui::AnyElement> = chat
+        let mut items: Vec<gpui::AnyElement> = chat
             .map(|c| {
                 c.items
                     .iter()
                     .enumerate()
-                    .map(|(ix, item)| self.render_item(ix, item, kind, cx))
+                    .map(|(ix, item)| self.render_item(ix, item, c.id, kind, cx))
                     .collect()
             })
             .unwrap_or_default();
+        // While the agent works, a row at the end shows it. A permission request shows instead.
+        if chat.is_some_and(|c| c.busy && c.permission.is_none()) {
+            items.push(
+                h_flex()
+                    .gap_3()
+                    .child(avatar(kind, 28.))
+                    .child(Spinner::new().with_size(px(14.)).color(accent(&theme)))
+                    .child(div().text_sm().text_color(theme.muted_foreground).child("Working…"))
+                    .into_any_element(),
+            );
+        }
         let permission = chat
             .and_then(|c| c.permission.as_ref())
             .map(|p| self.render_permission(p, cx).into_any_element());
