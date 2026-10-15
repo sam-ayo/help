@@ -1847,7 +1847,7 @@ impl Render for AppView {
                     Button::new("stop-turn")
                         .ghost()
                         .small()
-                        .icon(Icon::new(KitIcon::Square))
+                        .icon(Icon::new(KitIcon::CircleStop))
                         .tooltip_with_action("Stop", &StopAgent, None)
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )

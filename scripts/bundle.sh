@@ -6,8 +6,9 @@ PROFILE=debug
 if [[ "$1" == "--release" ]]; then PROFILE=release; cargo build --release; else cargo build; fi
 APP="target/$PROFILE/AgentDesk.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/$PROFILE/agent-desk target/$PROFILE/agent-desk-mcp target/$PROFILE/agent-desk-guest "$APP/Contents/MacOS/"
+cp assets/AppIcon.icns "$APP/Contents/Resources/"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -18,6 +19,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleIdentifier</key><string>com.agentdesk.app</string>
   <key>CFBundleExecutable</key><string>agent-desk</string>
   <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
