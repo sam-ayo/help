@@ -97,7 +97,18 @@ fn main() {
         .with_assets(gpui_kit_assets::AllAssets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            cx.bind_keys([KeyBinding::new("cmd-n", ui::NewChat, None)]);
+            cx.bind_keys([
+                KeyBinding::new("cmd-n", ui::NewChat, None),
+                KeyBinding::new("cmd-w", ui::CloseChat, None),
+                KeyBinding::new("cmd-]", ui::NextChat, None),
+                KeyBinding::new("cmd-[", ui::PreviousChat, None),
+                KeyBinding::new("cmd-.", ui::StopAgent, None),
+                KeyBinding::new("cmd-f", ui::FocusSearch, None),
+                KeyBinding::new("cmd-ctrl-s", ui::ToggleSidebar, None),
+                KeyBinding::new("cmd-1", ui::ShowAllChats, None),
+                KeyBinding::new("cmd-2", ui::ShowClaudeChats, None),
+                KeyBinding::new("cmd-3", ui::ShowCodexChats, None),
+            ]);
             cx.set_global(theme::ThemeChoice::load(support.join("theme")));
             theme::apply(None, cx);
             cx.on_window_closed(|cx, _| {

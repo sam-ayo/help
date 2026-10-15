@@ -19,12 +19,29 @@ use gpui_component::{
     v_flex,
 };
 use gpui_kit_assets::IconName as KitIcon;
+use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, oneshot};
 use vm::VmPhase;
 
 use crate::{Env, theme};
 
-gpui::actions!(agent_desk, [NewChat]);
+mod demo;
+
+gpui::actions!(
+    agent_desk,
+    [
+        NewChat,
+        CloseChat,
+        NextChat,
+        PreviousChat,
+        StopAgent,
+        FocusSearch,
+        ToggleSidebar,
+        ShowAllChats,
+        ShowClaudeChats,
+        ShowCodexChats,
+    ]
+);
 
 enum Item {
     User(String),
@@ -57,6 +74,10 @@ struct Chat {
     busy: bool,
     closed: bool,
     permission: Option<PendingPermission>,
+    /// The time of the last message or agent event, for the chat list.
+    updated: DateTime<Local>,
+    /// The text in the composer that the user did not send. Each chat keeps its own.
+    draft: String,
 }
 
 pub struct AppView {
@@ -73,6 +94,8 @@ pub struct AppView {
     vm_busy: bool,
     /// The mouse went down on a toolbar. A move then drags the window.
     drag_pending: bool,
+    /// The sidebar shows. The user can hide it to give the chat more room.
+    sidebar_open: bool,
     /// The agent for new chats: the agent that the user picked last.
     agent: AgentKind,
     _subs: Vec<gpui::Subscription>,
@@ -132,14 +155,22 @@ impl AppView {
             vm_phase,
             vm_busy: false,
             drag_pending: false,
+            sidebar_open: true,
             agent,
             _subs: subs,
         };
-        view.new_chat(agent, window, cx);
+        if demo::enabled() {
+            view.chats = demo::chats();
+            view.next_id = view.chats.len() as u64 + 1;
+        } else {
+            view.new_chat(agent, window, cx);
+        }
         view
     }
 
     fn new_chat(&mut self, kind: AgentKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         let id = self.next_id;
         self.next_id += 1;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -153,6 +184,8 @@ impl AppView {
             busy: false,
             closed: false,
             permission: None,
+            updated: Local::now(),
+            draft: String::new(),
         });
         self.active = self.chats.len() - 1;
         // Show the new chat in the list.
@@ -166,6 +199,7 @@ impl AppView {
                 let ok = this.update(cx, |this, cx| {
                     if let Some(chat) = this.chats.iter_mut().find(|c| c.id == id) {
                         apply(chat, event);
+                        chat.updated = Local::now();
                     }
                     this.scroll.scroll_to_bottom();
                     cx.notify();
@@ -195,6 +229,7 @@ impl AppView {
         session.send(Command::Prompt(text.clone()));
         chat.items.push(Item::User(text));
         chat.busy = true;
+        chat.updated = Local::now();
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.scroll.scroll_to_bottom();
         cx.notify();
@@ -235,17 +270,26 @@ impl AppView {
         if chat.kind == kind {
             return;
         }
+        // The text that the user typed is for the new agent. It goes to the new chat.
+        let draft = self.composer.read(cx).value().to_string();
         if !chat.items.iter().any(|i| matches!(i, Item::User(_))) {
             // Dropping the session stops the old agent. Keep the chat in the same place in the list.
             let ix = self.active;
             self.chats.remove(ix);
+            // No chat is active now, so `new_chat` keeps no draft.
+            self.active = usize::MAX;
             self.new_chat(kind, window, cx);
             let chat = self.chats.pop().expect("new_chat adds a chat");
             self.chats.insert(ix, chat);
             self.active = ix;
         } else {
+            if let Some(chat) = self.chats.get_mut(self.active) {
+                chat.draft.clear();
+            }
+            self.active = usize::MAX;
             self.new_chat(kind, window, cx);
         }
+        self.composer.update(cx, |s, cx| s.set_value(draft, window, cx));
         cx.notify();
     }
 
@@ -257,6 +301,7 @@ impl AppView {
                 self.new_chat(self.agent, window, cx);
             }
             self.active = self.active.min(self.chats.len() - 1);
+            self.load_draft(window, cx);
         }
         cx.notify();
     }
@@ -286,22 +331,72 @@ impl AppView {
     }
 
     /// The indexes of the chats that the list shows: the agent filter and the search apply.
+    /// The chat with the newest activity comes first, as in a mail app.
     fn visible(&self, cx: &Context<Self>) -> Vec<usize> {
         let query = self.search.read(cx).value().to_lowercase();
         let query = query.trim();
-        self.chats
+        let mut visible: Vec<usize> = self
+            .chats
             .iter()
             .enumerate()
             .filter(|(_, c)| self.filter.is_none_or(|f| f == c.kind))
-            .filter(|(_, c)| query.is_empty() || c.title.to_lowercase().contains(query) || preview(c).to_lowercase().contains(query))
+            .filter(|(_, c)| {
+                query.is_empty() || c.title.to_lowercase().contains(query) || preview(c).to_lowercase().contains(query)
+            })
             .map(|(ix, _)| ix)
-            .collect()
+            .collect();
+        visible.sort_by(|&a, &b| self.chats[b].updated.cmp(&self.chats[a].updated));
+        visible
     }
 
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.active = ix;
+        if ix != self.active {
+            self.save_draft(cx);
+            self.active = ix;
+            self.load_draft(window, cx);
+            self.scroll.scroll_to_bottom();
+        }
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
+    }
+
+    /// Keep the composer text in the active chat.
+    fn save_draft(&mut self, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().to_string();
+        if let Some(chat) = self.chats.get_mut(self.active) {
+            chat.draft = text;
+        }
+    }
+
+    /// Put the draft of the active chat in the composer.
+    fn load_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let draft = self.chats.get(self.active).map(|c| c.draft.clone()).unwrap_or_default();
+        self.composer.update(cx, |s, cx| s.set_value(draft, window, cx));
+    }
+
+    /// Go to the next chat in the list (`step` 1) or the previous chat (`step` -1).
+    fn step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let visible = self.visible(cx);
+        let Some(pos) = visible.iter().position(|&ix| ix == self.active) else {
+            if let Some(&first) = visible.first() {
+                self.select(first, window, cx);
+            }
+            return;
+        };
+        if let Some(&ix) = pos.checked_add_signed(step).and_then(|p| visible.get(p)) {
+            self.select(ix, window, cx);
+        }
+    }
+
+    fn set_filter(&mut self, filter: Option<AgentKind>, cx: &mut Context<Self>) {
+        self.filter = filter;
+        cx.notify();
+    }
+
+    /// Put a suggested prompt in the composer, for the user to change or send.
+    fn suggest(&mut self, text: &'static str, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |s, cx| s.set_value(text, window, cx));
+        window.focus(&self.composer.focus_handle(cx), cx);
     }
 }
 
@@ -508,6 +603,19 @@ fn section_header(label: &'static str, theme: &Theme) -> Div {
         .child(label)
 }
 
+/// The button that hides or shows the sidebar.
+fn sidebar_toggle(id: &'static str, tooltip: &'static str, cx: &mut Context<AppView>) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .icon(Icon::new(KitIcon::PanelLeft))
+        .tooltip_with_action(tooltip, &ToggleSidebar, None)
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.sidebar_open = !this.sidebar_open;
+            cx.notify();
+        }))
+}
+
 /// A menu item with a round color swatch before the label.
 fn swatch_item(title: &'static str, color: Hsla) -> PopupMenuItem {
     PopupMenuItem::element(move |_, _| {
@@ -563,6 +671,22 @@ fn nav_row(
                 .filter(|&n| n > 0)
                 .map(|n| div().text_xs().text_color(theme.muted_foreground).child(n.to_string())),
         )
+}
+
+/// The time of a chat for the list, as in a mail app: the time today, the weekday in the last
+/// week, and the date before that.
+fn short_time(t: DateTime<Local>) -> String {
+    let now = Local::now();
+    let days = (now.date_naive() - t.date_naive()).num_days();
+    if days == 0 {
+        t.format("%-I:%M %p").to_string()
+    } else if days == 1 {
+        "Yesterday".into()
+    } else if days < 7 {
+        t.format("%A").to_string()
+    } else {
+        t.format("%b %-d").to_string()
+    }
 }
 
 /// A short line for the chat list: the last text of the agent, or what it does now.
@@ -652,10 +776,7 @@ impl AppView {
             .child(div().text_xs().text_color(theme.muted_foreground).child("⌘N"));
 
         let mut filters = vec![nav_row("filter-all", KitIcon::Inbox, "All chats", Some(count(None)), self.filter.is_none(), &theme)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.filter = None;
-                cx.notify();
-            }))];
+            .on_click(cx.listener(|this, _, _, cx| this.set_filter(None, cx)))];
         for kind in AgentKind::ALL {
             filters.push(
                 nav_row(
@@ -666,10 +787,7 @@ impl AppView {
                     self.filter == Some(kind),
                     &theme,
                 )
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.filter = Some(kind);
-                    cx.notify();
-                })),
+                .on_click(cx.listener(move |this, _, _, cx| this.set_filter(Some(kind), cx))),
             );
         }
 
@@ -688,7 +806,9 @@ impl AppView {
                     .h(px(TOOLBAR - INSET * 2.))
                     // Leave room for the traffic lights.
                     .pl(px(76.))
-                    .child(brand),
+                    .pr_1p5()
+                    .child(div().flex_1().child(brand))
+                    .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
             .child(div().pt_2().child(new_chat))
             .child(section_header("Chats", &theme))
@@ -819,13 +939,17 @@ impl AppView {
                 self.toolbar("list-toolbar", cx)
                     .px_4()
                     .gap_2()
+                    // Without the sidebar, the traffic lights are on this toolbar.
+                    .when(!self.sidebar_open, |el| {
+                        el.pl(px(84.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx))
+                    })
                     .child(div().flex_1().text_lg().font_semibold().child(title))
                     .child(
                         Button::new("list-new-chat")
                             .ghost()
                             .small()
                             .icon(Icon::new(KitIcon::SquarePen))
-                            .tooltip("New chat")
+                            .tooltip_with_action("New chat", &NewChat, None)
                             .on_click(cx.listener(|this, _, window, cx| this.new_chat(this.agent, window, cx))),
                     ),
             )
@@ -926,25 +1050,32 @@ impl AppView {
                                     .font_semibold()
                                     .child(agent_name(chat.kind)),
                             )
-                            // The status shows until the pointer is on the row. Then the close button shows
-                            // in the same place. Hover styles change only the visibility, not the layout:
-                            // GPUI lays out without the hover style, and paints with it.
+                            // The time and the status show until the pointer is on the row. Then the close
+                            // button shows over them. Hover styles change only the visibility, not the
+                            // layout: GPUI lays out without the hover style, and paints with it.
                             .child(
                                 div()
                                     .relative()
-                                    .flex()
                                     .flex_shrink_0()
-                                    .items_center()
-                                    .justify_center()
-                                    .size(px(20.))
-                                    .children(trailing.map(|t| div().group_hover(group.clone(), |s| s.invisible()).child(t)))
                                     .child(
-                                        div()
+                                        h_flex()
+                                            .h(px(20.))
+                                            .gap_1p5()
+                                            .group_hover(group.clone(), |s| s.invisible())
+                                            .children(trailing)
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(short_time(chat.updated)),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
                                             .absolute()
-                                            .inset_0()
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
+                                            .top_0()
+                                            .right_0()
+                                            .h(px(20.))
                                             .invisible()
                                             .group_hover(group, |s| s.visible())
                                             .child(
@@ -1271,7 +1402,12 @@ impl AppView {
                             .flex_1()
                             .min_w_0()
                             .child(div().text_sm().font_semibold().child("The agent asks for permission"))
-                            .child(div().text_sm().text_color(theme.muted_foreground).child(p.title.clone())),
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(TextView::markdown("permission-title", SharedString::from(p.title.clone()))),
+                            ),
                     ),
             )
             .child(
@@ -1287,6 +1423,73 @@ impl AppView {
                     })),
             )
         .into_any_element()
+    }
+
+    /// The top of a new chat: the agent, a question, and the folder that the agent works in.
+    fn render_greeting(&self, kind: AgentKind, theme: &Theme) -> gpui::AnyElement {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let folder = self.env.workspace.display().to_string();
+        let folder = match folder.strip_prefix(&home) {
+            Some(rest) if !home.is_empty() => format!("~{rest}"),
+            _ => folder,
+        };
+        v_flex()
+            .items_center()
+            .gap_3()
+            .px_6()
+            .child(avatar(kind, 44.))
+            .child(
+                div()
+                    .text_2xl()
+                    .font_semibold()
+                    .child(format!("What should {} work on?", agent_name(kind))),
+            )
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(KitIcon::Folder).size(px(14.)))
+                    .child(folder),
+            )
+            .into_any_element()
+    }
+
+    /// Prompts to start from. A click puts the prompt in the composer.
+    fn render_suggestions(&self, kind: AgentKind, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const SUGGESTIONS: [(KitIcon, &str, &str); 4] = [
+            (KitIcon::BookOpen, "Explain this project", "Explain how this project works. Start with the main parts."),
+            (KitIcon::Bug, "Find a bug", "Find a bug in this project and fix it. Tell me what you changed."),
+            (KitIcon::FlaskConical, "Write tests", "Write tests for the part of this project with the fewest tests."),
+            (KitIcon::Monitor, "Test on the Agent Mac", "Use the Agent Mac to start the app and check that it works."),
+        ];
+        h_flex()
+            .w_full()
+            .max_w(px(COLUMN))
+            .mx_auto()
+            .px_6()
+            .gap_2()
+            .flex_wrap()
+            .justify_center()
+            .children(SUGGESTIONS.iter().enumerate().map(|(i, &(icon, label, prompt))| {
+                h_flex()
+                    .id(("suggestion", i))
+                    .px_3()
+                    .py_1p5()
+                    .gap_1p5()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .hover(|el| el.bg(theme.secondary).text_color(theme.foreground))
+                    .on_click(cx.listener(move |this, _, window, cx| this.suggest(prompt, window, cx)))
+                    .child(Icon::new(icon).size(px(14.)).text_color(agent_color(kind)))
+                    .child(label)
+            }))
+            .into_any_element()
     }
 
     /// The agent icon in the composer. A click opens a menu to change the agent.
@@ -1411,7 +1614,7 @@ impl Render for AppView {
                     .ghost()
                     .small()
                     .icon(Icon::new(KitIcon::Trash))
-                    .tooltip("Close chat")
+                    .tooltip_with_action("Close chat", &CloseChat, None)
                     .on_click(cx.listener(move |this, _, window, cx| this.close_chat(active, window, cx))),
             )
             .when(busy, |el| {
@@ -1420,7 +1623,7 @@ impl Render for AppView {
                         .ghost()
                         .small()
                         .icon(Icon::new(KitIcon::Square))
-                        .tooltip("Stop")
+                        .tooltip_with_action("Stop", &StopAgent, None)
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )
             })
@@ -1439,7 +1642,7 @@ impl Render for AppView {
                     .ghost()
                     .small()
                     .icon(Icon::new(KitIcon::ChevronUp))
-                    .tooltip("Previous chat")
+                    .tooltip_with_action("Previous chat", &PreviousChat, None)
                     .disabled(prev.is_none())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(ix) = prev {
@@ -1452,7 +1655,7 @@ impl Render for AppView {
                     .ghost()
                     .small()
                     .icon(Icon::new(KitIcon::ChevronDown))
-                    .tooltip("Next chat")
+                    .tooltip_with_action("Next chat", &NextChat, None)
                     .disabled(next.is_none())
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if let Some(ix) = next {
@@ -1492,7 +1695,10 @@ impl Render for AppView {
                 .justify_center()
                 // Sit a little above the center.
                 .pb(px(TOOLBAR * 2.))
+                .gap_6()
+                .child(self.render_greeting(kind, &theme))
                 .child(composer)
+                .child(self.render_suggestions(kind, &theme, cx))
                 .into_any_element()
         } else {
             v_flex()
@@ -1524,8 +1730,21 @@ impl Render for AppView {
             .size_full()
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &NewChat, window, cx| this.new_chat(this.agent, window, cx)))
-            .child(self.render_sidebar(cx))
-            .child(div().w(px(INSET)).h_full())
+            .on_action(cx.listener(|this, _: &CloseChat, window, cx| this.close_chat(this.active, window, cx)))
+            .on_action(cx.listener(|this, _: &NextChat, window, cx| this.step(1, window, cx)))
+            .on_action(cx.listener(|this, _: &PreviousChat, window, cx| this.step(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                window.focus(&this.search.focus_handle(cx), cx)
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                this.sidebar_open = !this.sidebar_open;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &ShowAllChats, _, cx| this.set_filter(None, cx)))
+            .on_action(cx.listener(|this, _: &ShowClaudeChats, _, cx| this.set_filter(Some(AgentKind::Claude), cx)))
+            .on_action(cx.listener(|this, _: &ShowCodexChats, _, cx| this.set_filter(Some(AgentKind::Codex), cx)))
+            .when(self.sidebar_open, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
             .child(self.render_list(&visible, cx))
             .child(
                 v_flex()
