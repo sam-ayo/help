@@ -1,0 +1,12 @@
+[package]
+name = "acp_host"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+agent-client-protocol = { version = "=3.3.0", features = ["process"] }
+anyhow.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tracing.workspace = true

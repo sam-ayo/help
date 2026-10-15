@@ -1,0 +1,18 @@
+[package]
+name = "vm"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+protocol.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+libc = "0.2"
+objc2 = { version = "0.6.5", features = ["exception"] }
+objc2-foundation = "0.3.2"
+objc2-virtualization = "0.3.2"
+objc2-app-kit = "0.3.2"
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+
+[dev-dependencies]
