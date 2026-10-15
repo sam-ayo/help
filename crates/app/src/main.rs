@@ -23,6 +23,8 @@ pub struct Env {
     pub workspace: PathBuf,
     /// The agent that the user picked last. New chats use it.
     pub agent_file: PathBuf,
+    /// The saved chats.
+    pub chats_file: PathBuf,
 }
 
 fn app_support() -> PathBuf {
@@ -91,6 +93,7 @@ fn main() {
         },
         workspace: PathBuf::from(std::env::var("HOME").unwrap_or_default()),
         agent_file: support.join("agent"),
+        chats_file: support.join("chats.json"),
     };
 
     gpui_platform::application()

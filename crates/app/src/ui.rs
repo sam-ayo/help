@@ -26,6 +26,7 @@ use vm::VmPhase;
 use crate::{Env, theme};
 
 mod demo;
+mod history;
 
 gpui::actions!(
     agent_desk,
@@ -167,6 +168,8 @@ impl AppView {
             view.chats = demo::chats();
             view.next_id = view.chats.len() as u64 + 1;
         } else {
+            view.chats = history::load(&view.env.chats_file, 1);
+            view.next_id = view.chats.len() as u64 + 1;
             view.new_chat(agent, window, cx);
         }
         view.scroll.scroll_to_bottom();
@@ -178,14 +181,12 @@ impl AppView {
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         let id = self.next_id;
         self.next_id += 1;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let session = acp_host::start(&self.env.runtime, kind, self.env.workspace.clone(), self.env.bridge.clone(), tx);
         self.chats.push(Chat {
             id,
             kind,
             title: "New chat".into(),
             items: vec![],
-            session: Some(session),
+            session: None,
             busy: false,
             closed: false,
             permission: None,
@@ -197,14 +198,36 @@ impl AppView {
         if self.filter.is_some_and(|f| f != kind) {
             self.filter = None;
         }
+        self.connect(self.active, cx);
         // The user can type at once. The session queues prompts until the agent is ready.
         window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    /// Start an agent session for the chat at `ix`, and show its events in the chat.
+    fn connect(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(chat) = self.chats.get_mut(ix) else { return };
+        let id = chat.id;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        chat.session = Some(acp_host::start(
+            &self.env.runtime,
+            chat.kind,
+            self.env.workspace.clone(),
+            self.env.bridge.clone(),
+            tx,
+        ));
+        chat.closed = false;
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
                 let ok = this.update(cx, |this, cx| {
+                    // Keep the chats at the end of each turn, and when the agent stops.
+                    let save = matches!(event, Event::TurnEnded(_) | Event::Closed);
                     if let Some(chat) = this.chats.iter_mut().find(|c| c.id == id) {
                         apply(chat, event);
                         chat.updated = Local::now();
+                    }
+                    if save {
+                        this.save_chats();
                     }
                     this.scroll.scroll_to_bottom();
                     cx.notify();
@@ -215,7 +238,13 @@ impl AppView {
             }
         })
         .detach();
-        cx.notify();
+    }
+
+    /// Keep the chats in a file. The sample chats are not kept.
+    fn save_chats(&self) {
+        if !demo::enabled() {
+            history::save(&self.env.chats_file, &self.chats);
+        }
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -223,20 +252,32 @@ impl AppView {
         if text.trim().is_empty() {
             return;
         }
-        let Some(chat) = self.chats.get_mut(self.active) else { return };
-        if chat.busy || chat.closed {
+        let ix = self.active;
+        let Some(chat) = self.chats.get(ix) else { return };
+        if chat.busy {
             return;
         }
+        // A chat from an earlier start of the app, or a chat whose agent stopped, has no session.
+        // A new session starts, and its first prompt has the earlier messages.
+        let prompt = if chat.session.is_none() {
+            let prompt = history::prompt_with_context(chat, &text);
+            self.connect(ix, cx);
+            prompt
+        } else {
+            text.clone()
+        };
+        let chat = &mut self.chats[ix];
         let Some(session) = &chat.session else { return };
         if chat.items.iter().all(|i| !matches!(i, Item::User(_))) {
             chat.title = text.lines().next().unwrap_or("").chars().take(40).collect();
         }
-        session.send(Command::Prompt(text.clone()));
+        session.send(Command::Prompt(prompt));
         chat.items.push(Item::User(text));
         chat.busy = true;
         chat.updated = Local::now();
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.scroll.scroll_to_bottom();
+        self.save_chats();
         cx.notify();
     }
 
@@ -307,6 +348,7 @@ impl AppView {
             }
             self.active = self.active.min(self.chats.len() - 1);
             self.load_draft(window, cx);
+            self.save_chats();
         }
         cx.notify();
     }
@@ -1088,7 +1130,7 @@ impl AppView {
                                                     .ghost()
                                                     .xsmall()
                                                     .icon(Icon::new(KitIcon::X).text_color(theme.muted_foreground))
-                                                    .tooltip("Close chat")
+                                                    .tooltip("Delete chat")
                                                     .on_click(cx.listener(move |this, _, window, cx| {
                                                         cx.stop_propagation();
                                                         this.close_chat(ix, window, cx)
@@ -1569,7 +1611,8 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_composer(&self, kind: AgentKind, busy: bool, closed: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// `detached` is true for a chat with messages and no agent session: the next message starts one.
+    fn render_composer(&self, kind: AgentKind, busy: bool, detached: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let action = if busy {
             Button::new("stop")
@@ -1585,7 +1628,6 @@ impl AppView {
                 .rounded(ButtonRounded::Size(px(14.)))
                 .icon(Icon::new(KitIcon::ArrowUp))
                 .tooltip("Send")
-                .disabled(closed)
                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
         };
         v_flex()
@@ -1611,8 +1653,10 @@ impl AppView {
                             .flex_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .when(!busy && !closed, |el| el.child("Return to send, Shift-Return for a new line"))
-                            .when(closed, |el| el.child("The agent stopped. Start a new chat to continue.")),
+                            .when(!busy && !detached, |el| el.child("Return to send, Shift-Return for a new line"))
+                            .when(!busy && detached, |el| {
+                                el.child("Send a message to continue. A new session gets the earlier messages.")
+                            }),
                     )
                     .child(action),
             )
@@ -1650,7 +1694,9 @@ impl Render for AppView {
         let permission = chat
             .and_then(|c| c.permission.as_ref())
             .map(|p| self.render_permission(p, cx).into_any_element());
-        let (busy, closed) = chat.map(|c| (c.busy, c.closed)).unwrap_or_default();
+        let busy = chat.is_some_and(|c| c.busy);
+        let detached =
+            chat.is_some_and(|c| c.session.is_none() && c.items.iter().any(|i| matches!(i, Item::User(_))));
         let title = chat.map(|c| c.title.clone()).unwrap_or_default();
         let composer = v_flex()
             .w_full()
@@ -1659,7 +1705,7 @@ impl Render for AppView {
             .px_6()
             .gap_2()
             .children(permission)
-            .child(self.render_composer(kind, busy, closed, cx));
+            .child(self.render_composer(kind, busy, detached, cx));
 
         // The place of the chat in the list, as "1 of 19" in a mail app.
         let position = visible.iter().position(|&ix| ix == self.active);
@@ -1677,7 +1723,7 @@ impl Render for AppView {
                     .ghost()
                     .small()
                     .icon(Icon::new(KitIcon::Trash))
-                    .tooltip_with_action("Close chat", &CloseChat, None)
+                    .tooltip_with_action("Delete chat", &CloseChat, None)
                     .on_click(cx.listener(move |this, _, window, cx| this.close_chat(active, window, cx))),
             )
             .when(busy, |el| {

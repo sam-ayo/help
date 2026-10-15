@@ -41,8 +41,8 @@ impl AgentKind {
 
     fn login_hint(self) -> &'static str {
         match self {
-            AgentKind::Claude => "Run `claude` in a terminal and log in, then start a new chat.",
-            AgentKind::Codex => "Run `codex login` in a terminal, then start a new chat.",
+            AgentKind::Claude => "Run `claude` in a terminal and log in, then send your message again.",
+            AgentKind::Codex => "Run `codex login` in a terminal, then send your message again.",
         }
     }
 }
@@ -131,7 +131,8 @@ pub fn start(
     runtime.spawn(async move {
         if !on_path("npx") {
             let _ = ev.send(Event::Error(
-                "Cannot find `npx`. Install Node.js (for example `brew install node`), then start a new chat.".into(),
+                "Cannot find `npx`. Install Node.js (for example `brew install node`), then send your message again."
+                    .into(),
             ));
             let _ = ev.send(Event::Closed);
             return;

@@ -213,6 +213,7 @@ dependencies = [
  "gpui-pre-platform",
  "protocol",
  "rust-embed",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
