@@ -151,6 +151,7 @@ pub fn load(path: &Path, first_id: u64) -> Vec<Chat> {
                 .map(|t| t.with_timezone(&Local))
                 .unwrap_or_else(Local::now),
             draft: String::new(),
+            unread: false,
         })
         .collect()
 }
@@ -198,6 +199,7 @@ mod tests {
             permission: None,
             updated: Local::now(),
             draft: String::new(),
+            unread: false,
         }
     }
 

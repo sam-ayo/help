@@ -24,6 +24,7 @@ fn chat(id: u64, kind: AgentKind, title: &str, minutes: i64, items: Vec<Item>) -
         permission: None,
         updated: Local::now() - Duration::minutes(minutes),
         draft: String::new(),
+        unread: false,
     }
 }
 
@@ -93,7 +94,7 @@ pub fn chats() -> Vec<Chat> {
         reply,
     });
 
-    let done = chat(
+    let mut done = chat(
         3,
         AgentKind::Claude,
         "Summarize the README",
@@ -109,6 +110,8 @@ pub fn chats() -> Vec<Chat> {
             ),
         ],
     );
+
+    done.unread = true;
 
     let mut failed = chat(
         4,

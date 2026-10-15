@@ -79,6 +79,8 @@ struct Chat {
     updated: DateTime<Local>,
     /// The text in the composer that the user did not send. Each chat keeps its own.
     draft: String,
+    /// The agent finished a turn while the user looked at a different chat.
+    unread: bool,
 }
 
 pub struct AppView {
@@ -88,6 +90,9 @@ pub struct AppView {
     next_id: u64,
     composer: Entity<TextareaState>,
     search: Entity<InputState>,
+    /// The title field while the user renames the active chat.
+    rename: Entity<InputState>,
+    renaming: bool,
     /// The chat list shows only the chats of this agent. `None` shows all chats.
     filter: Option<AgentKind>,
     scroll: ScrollHandle,
@@ -114,6 +119,7 @@ impl AppView {
                 .submit_on_enter(true)
         });
         let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
+        let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Chat title"));
         let subs = vec![
             cx.subscribe_in(&composer, window, |this, _state, ev: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = ev {
@@ -123,6 +129,12 @@ impl AppView {
             cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
                 if let InputEvent::Change = ev {
                     cx.notify();
+                }
+            }),
+            // Return or a click outside the field keeps the new title.
+            cx.subscribe_in(&rename, window, |this, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                    this.finish_rename(window, cx);
                 }
             }),
         ];
@@ -154,6 +166,8 @@ impl AppView {
             next_id: 1,
             composer,
             search,
+            rename,
+            renaming: false,
             filter: None,
             scroll: ScrollHandle::new(),
             vm_phase,
@@ -192,6 +206,7 @@ impl AppView {
             permission: None,
             updated: Local::now(),
             draft: String::new(),
+            unread: false,
         });
         self.active = self.chats.len() - 1;
         // Show the new chat in the list.
@@ -222,7 +237,11 @@ impl AppView {
                 let ok = this.update(cx, |this, cx| {
                     // Keep the chats at the end of each turn, and when the agent stops.
                     let save = matches!(event, Event::TurnEnded(_) | Event::Closed);
+                    let active_id = this.chats.get(this.active).map(|c| c.id);
                     if let Some(chat) = this.chats.iter_mut().find(|c| c.id == id) {
+                        if matches!(event, Event::TurnEnded(_)) && active_id != Some(id) {
+                            chat.unread = true;
+                        }
                         apply(chat, event);
                         chat.updated = Local::now();
                     }
@@ -397,11 +416,39 @@ impl AppView {
     }
 
     fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.chats.get_mut(ix) {
+            chat.unread = false;
+        }
         if ix != self.active {
+            self.renaming = false;
             self.save_draft(cx);
             self.active = ix;
             self.load_draft(window, cx);
             self.scroll.scroll_to_bottom();
+        }
+        window.focus(&self.composer.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.chats.get(self.active).map(|c| c.title.clone()) else { return };
+        self.renaming = true;
+        self.rename.update(cx, |s, cx| s.set_value(title, window, cx));
+        window.focus(&self.rename.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.renaming {
+            return;
+        }
+        self.renaming = false;
+        let title = self.rename.read(cx).value().trim().to_string();
+        if let Some(chat) = self.chats.get_mut(self.active)
+            && !title.is_empty()
+        {
+            chat.title = title;
+            self.save_chats();
         }
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
@@ -780,8 +827,12 @@ impl AppView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let accent = accent(&theme);
+        // The counts are the unread chats, as in a mail app.
         let count = |kind: Option<AgentKind>| {
-            self.chats.iter().filter(|c| kind.is_none_or(|k| k == c.kind)).count()
+            self.chats
+                .iter()
+                .filter(|c| c.unread && kind.is_none_or(|k| k == c.kind))
+                .count()
         };
 
         // The app mark, as the logo of a mail app.
@@ -1058,8 +1109,8 @@ impl AppView {
         } else {
             None
         };
-        // A dot before the name, as an unread mark: the chat needs the user.
-        let attention = chat.permission.is_some();
+        // A dot before the name, as an unread mark: the chat has news, or needs the user.
+        let attention = chat.permission.is_some() || chat.unread;
         let preview = match preview(chat) {
             p if p.is_empty() => "No messages yet".to_string(),
             p => p,
@@ -1153,6 +1204,8 @@ impl AppView {
         let installed = self.env.mac.paths().bundle.join(".installed").exists();
         let mut actions = h_flex().gap_0p5();
         match phase {
+            // A Mac that cannot run VMs gets only the note, not a button that does nothing.
+            VmPhase::NotInstalled | VmPhase::Error(_) if !installed && !supported => {}
             VmPhase::NotInstalled | VmPhase::Error(_) if !installed => {
                 actions = actions.child(
                     Button::new("vm-install")
@@ -1161,7 +1214,7 @@ impl AppView {
                         .w_full()
                         .icon(Icon::new(KitIcon::Download))
                         .label("Install macOS")
-                        .disabled(busy || !supported)
+                        .disabled(busy)
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.env.mac.install();
                             cx.notify();
@@ -1726,6 +1779,15 @@ impl Render for AppView {
                     .tooltip_with_action("Delete chat", &CloseChat, None)
                     .on_click(cx.listener(move |this, _, window, cx| this.close_chat(active, window, cx))),
             )
+            .child(
+                Button::new("rename-chat")
+                    .ghost()
+                    .small()
+                    .icon(Icon::new(KitIcon::Pencil))
+                    .tooltip("Rename chat")
+                    .disabled(empty)
+                    .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
+            )
             .when(busy, |el| {
                 el.child(
                     Button::new("stop-turn")
@@ -1781,7 +1843,22 @@ impl Render for AppView {
             .px_6()
             .pt_6()
             .gap_2()
-            .child(div().text_xl().font_semibold().child(title))
+            .child(if self.renaming {
+                div()
+                    .text_xl()
+                    .font_semibold()
+                    .child(Input::new(&self.rename).appearance(false))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("chat-title")
+                    .text_xl()
+                    .font_semibold()
+                    .cursor_text()
+                    .on_double_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx)))
+                    .child(title)
+                    .into_any_element()
+            })
             .child(
                 h_flex().child(
                     h_flex()
