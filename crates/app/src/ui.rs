@@ -83,6 +83,25 @@ struct Chat {
     unread: bool,
 }
 
+impl Chat {
+    /// A chat with no messages and no agent session.
+    fn new(id: u64, kind: AgentKind, title: impl Into<String>) -> Self {
+        Self {
+            id,
+            kind,
+            title: title.into(),
+            items: vec![],
+            session: None,
+            busy: false,
+            closed: false,
+            permission: None,
+            updated: Local::now(),
+            draft: String::new(),
+            unread: false,
+        }
+    }
+}
+
 pub struct AppView {
     env: Env,
     chats: Vec<Chat>,
@@ -90,9 +109,11 @@ pub struct AppView {
     next_id: u64,
     composer: Entity<TextareaState>,
     search: Entity<InputState>,
-    /// The title field while the user renames the active chat.
+    /// The title field while the user renames a chat.
     rename: Entity<InputState>,
-    renaming: bool,
+    /// The id of the chat that the user renames. The new title goes to this chat, also when a
+    /// different chat is active when the rename ends.
+    renaming: Option<u64>,
     /// The chat list shows only the chats of this agent. `None` shows all chats.
     filter: Option<AgentKind>,
     scroll: ScrollHandle,
@@ -167,7 +188,7 @@ impl AppView {
             composer,
             search,
             rename,
-            renaming: false,
+            renaming: None,
             filter: None,
             scroll: ScrollHandle::new(),
             vm_phase,
@@ -187,6 +208,13 @@ impl AppView {
             view.new_chat(agent, window, cx);
         }
         view.scroll.scroll_to_bottom();
+        // Keep the chats when the app quits, and when the window closes before that.
+        cx.on_app_quit(|this, _| {
+            this.save_chats_now();
+            async {}
+        })
+        .detach();
+        cx.on_release(|this, _| this.save_chats_now()).detach();
         view
     }
 
@@ -195,19 +223,7 @@ impl AppView {
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         let id = self.next_id;
         self.next_id += 1;
-        self.chats.push(Chat {
-            id,
-            kind,
-            title: "New chat".into(),
-            items: vec![],
-            session: None,
-            busy: false,
-            closed: false,
-            permission: None,
-            updated: Local::now(),
-            draft: String::new(),
-            unread: false,
-        });
+        self.chats.push(Chat::new(id, kind, "New chat"));
         self.active = self.chats.len() - 1;
         // Show the new chat in the list.
         if self.filter.is_some_and(|f| f != kind) {
@@ -221,6 +237,10 @@ impl AppView {
 
     /// Start an agent session for the chat at `ix`, and show its events in the chat.
     fn connect(&mut self, ix: usize, cx: &mut Context<Self>) {
+        // The demo starts no agents. See `demo`.
+        if demo::enabled() {
+            return;
+        }
         let Some(chat) = self.chats.get_mut(ix) else { return };
         let id = chat.id;
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -237,16 +257,21 @@ impl AppView {
                 let ok = this.update(cx, |this, cx| {
                     // Keep the chats at the end of each turn, and when the agent stops.
                     let save = matches!(event, Event::TurnEnded(_) | Event::Closed);
+                    // Only these events move the chat to the top of the list. Streamed text
+                    // does not, so that the rows stay in place while agents work.
+                    let news = matches!(event, Event::TurnEnded(_) | Event::Permission { .. } | Event::Closed);
                     let active_id = this.chats.get(this.active).map(|c| c.id);
                     if let Some(chat) = this.chats.iter_mut().find(|c| c.id == id) {
                         if matches!(event, Event::TurnEnded(_)) && active_id != Some(id) {
                             chat.unread = true;
                         }
                         apply(chat, event);
-                        chat.updated = Local::now();
+                        if news {
+                            chat.updated = Local::now();
+                        }
                     }
                     if save {
-                        this.save_chats();
+                        this.save_chats(cx);
                     }
                     this.scroll.scroll_to_bottom();
                     cx.notify();
@@ -259,10 +284,20 @@ impl AppView {
         .detach();
     }
 
-    /// Keep the chats in a file. The sample chats are not kept.
-    fn save_chats(&self) {
+    /// Keep the chats in a file. The write runs off the UI thread. The sample chats are not kept.
+    fn save_chats(&self, cx: &mut Context<Self>) {
+        if demo::enabled() {
+            return;
+        }
+        let snapshot = history::snapshot(&self.chats);
+        let path = self.env.chats_file.clone();
+        cx.background_spawn(async move { history::write(&path, snapshot) }).detach();
+    }
+
+    /// Keep the chats in a file before the app stops.
+    fn save_chats_now(&self) {
         if !demo::enabled() {
-            history::save(&self.env.chats_file, &self.chats);
+            history::write(&self.env.chats_file, history::snapshot(&self.chats));
         }
     }
 
@@ -278,6 +313,12 @@ impl AppView {
         }
         // A chat from an earlier start of the app, or a chat whose agent stopped, has no session.
         // A new session starts, and its first prompt has the earlier messages.
+        if chat.session.is_none() && demo::enabled() {
+            let chat = &mut self.chats[ix];
+            chat.items.push(Item::Notice("The sample chats have no agent.".into()));
+            cx.notify();
+            return;
+        }
         let prompt = if chat.session.is_none() {
             let prompt = history::prompt_with_context(chat, &text);
             self.connect(ix, cx);
@@ -296,7 +337,7 @@ impl AppView {
         chat.updated = Local::now();
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.scroll.scroll_to_bottom();
-        self.save_chats();
+        self.save_chats(cx);
         cx.notify();
     }
 
@@ -358,17 +399,29 @@ impl AppView {
         cx.notify();
     }
 
+    /// Delete the chat at `ix`. Dropping its session stops the agent process.
     fn close_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix < self.chats.len() {
-            // Dropping the session stops the agent process.
+        if ix >= self.chats.len() {
+            return;
+        }
+        if ix == self.active {
             self.chats.remove(ix);
             if self.chats.is_empty() {
+                // No chat is active, so `new_chat` keeps no draft.
+                self.active = usize::MAX;
                 self.new_chat(self.agent, window, cx);
             }
             self.active = self.active.min(self.chats.len() - 1);
             self.load_draft(window, cx);
-            self.save_chats();
+            self.scroll.scroll_to_bottom();
+        } else {
+            // The active chat stays active, and the composer keeps its text.
+            self.chats.remove(ix);
+            if ix < self.active {
+                self.active -= 1;
+            }
         }
+        self.save_chats(cx);
         cx.notify();
     }
 
@@ -420,7 +473,6 @@ impl AppView {
             chat.unread = false;
         }
         if ix != self.active {
-            self.renaming = false;
             self.save_draft(cx);
             self.active = ix;
             self.load_draft(window, cx);
@@ -431,26 +483,28 @@ impl AppView {
     }
 
     fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(title) = self.chats.get(self.active).map(|c| c.title.clone()) else { return };
-        self.renaming = true;
+        let Some((id, title)) = self.chats.get(self.active).map(|c| (c.id, c.title.clone())) else {
+            return;
+        };
+        self.renaming = Some(id);
         self.rename.update(cx, |s, cx| s.set_value(title, window, cx));
         window.focus(&self.rename.focus_handle(cx), cx);
         cx.notify();
     }
 
     fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.renaming {
-            return;
-        }
-        self.renaming = false;
+        let Some(id) = self.renaming.take() else { return };
         let title = self.rename.read(cx).value().trim().to_string();
-        if let Some(chat) = self.chats.get_mut(self.active)
+        if let Some(chat) = self.chats.iter_mut().find(|c| c.id == id)
             && !title.is_empty()
         {
             chat.title = title;
-            self.save_chats();
+            self.save_chats(cx);
         }
-        window.focus(&self.composer.focus_handle(cx), cx);
+        // Do not take the focus from a field that the user went to.
+        if self.rename.focus_handle(cx).is_focused(window) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
         cx.notify();
     }
 
@@ -586,12 +640,12 @@ fn agent_key(kind: AgentKind) -> &'static str {
     }
 }
 
+fn agent_from_key(key: &str) -> Option<AgentKind> {
+    AgentKind::ALL.into_iter().find(|&k| agent_key(k) == key.trim())
+}
+
 fn load_agent(path: &std::path::Path) -> AgentKind {
-    let key = std::fs::read_to_string(path).unwrap_or_default();
-    AgentKind::ALL
-        .into_iter()
-        .find(|&k| agent_key(k) == key.trim())
-        .unwrap_or(AgentKind::Claude)
+    agent_from_key(&std::fs::read_to_string(path).unwrap_or_default()).unwrap_or(AgentKind::Claude)
 }
 
 fn save_agent(path: &std::path::Path, kind: AgentKind) {
@@ -1843,7 +1897,7 @@ impl Render for AppView {
             .px_6()
             .pt_6()
             .gap_2()
-            .child(if self.renaming {
+            .child(if self.renaming.is_some() && self.renaming == chat.map(|c| c.id) {
                 div()
                     .text_xl()
                     .font_semibold()

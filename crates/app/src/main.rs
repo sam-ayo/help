@@ -102,7 +102,8 @@ fn main() {
             gpui_component::init(cx);
             cx.bind_keys([
                 KeyBinding::new("cmd-n", ui::NewChat, None),
-                KeyBinding::new("cmd-w", ui::CloseChat, None),
+                // Cmd-Backspace deletes, as in Mail. Cmd-W stays free, so that it does not delete a chat.
+                KeyBinding::new("cmd-backspace", ui::CloseChat, None),
                 KeyBinding::new("cmd-]", ui::NextChat, None),
                 KeyBinding::new("cmd-[", ui::PreviousChat, None),
                 KeyBinding::new("cmd-.", ui::StopAgent, None),

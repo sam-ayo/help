@@ -1,5 +1,5 @@
 //! Sample chats for screenshots and design work. Start the app with `AGENT_DESK_DEMO=1`.
-//! The sample chats have no agent process, so the app sends no prompts.
+//! The sample chats have no agent process. The app starts no agent for them.
 
 use acp_host::{AgentKind, PermissionOptionView, ToolStatus};
 use chrono::{Duration, Local};
@@ -13,19 +13,10 @@ pub fn enabled() -> bool {
 
 /// A sample chat. `minutes` is the time since its last activity.
 fn chat(id: u64, kind: AgentKind, title: &str, minutes: i64, items: Vec<Item>) -> Chat {
-    Chat {
-        id,
-        kind,
-        title: title.into(),
-        items,
-        session: None,
-        busy: false,
-        closed: false,
-        permission: None,
-        updated: Local::now() - Duration::minutes(minutes),
-        draft: String::new(),
-        unread: false,
-    }
+    let mut chat = Chat::new(id, kind, title);
+    chat.items = items;
+    chat.updated = Local::now() - Duration::minutes(minutes);
+    chat
 }
 
 fn tool(id: &str, title: &str, kind: &str, status: ToolStatus, detail: Option<&str>) -> Item {

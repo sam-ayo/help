@@ -2,24 +2,34 @@
 //! A loaded chat has no agent process. When the user sends a message in it, a new agent
 //! session starts and gets the earlier messages as context.
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use acp_host::{AgentKind, ToolStatus};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-use super::{Chat, Item, agent_key};
+use super::{Chat, Item, agent_from_key, agent_key};
 
 /// The app keeps only this number of the newest chats.
 const MAX_CHATS: usize = 200;
 /// The earlier messages that a new session gets, in characters from the end.
 const MAX_CONTEXT: usize = 20_000;
+/// The app keeps this number of characters of a tool output. The chat shows no more.
+const MAX_DETAIL: usize = 4_000;
 
 #[derive(Serialize, Deserialize)]
 struct SavedChat {
     agent: String,
     title: String,
     updated: i64,
+    #[serde(default)]
+    unread: bool,
     items: Vec<SavedItem>,
 }
 
@@ -44,11 +54,13 @@ fn status_key(s: ToolStatus) -> &'static str {
     }
 }
 
-/// A tool that did not finish before the app stopped shows as failed, not as running.
+/// A tool or plan step that was running when the app stopped shows as pending, because no
+/// agent runs it now.
 fn status_from_key(s: &str) -> ToolStatus {
     match s {
         "done" => ToolStatus::Done,
-        _ => ToolStatus::Failed,
+        "failed" => ToolStatus::Failed,
+        _ => ToolStatus::Pending,
     }
 }
 
@@ -61,7 +73,7 @@ fn save_item(item: &Item) -> SavedItem {
             title: title.clone(),
             kind: kind.clone(),
             status: status_key(*status).into(),
-            detail: detail.clone(),
+            detail: detail.as_ref().map(|d| d.chars().take(MAX_DETAIL).collect()),
         },
         Item::Plan(entries) => SavedItem::Plan {
             entries: entries.iter().map(|(t, s)| (t.clone(), status_key(*s).into())).collect(),
@@ -91,24 +103,46 @@ fn load_item(item: SavedItem, ix: usize) -> Item {
     }
 }
 
-/// Write the chats to `path`. A chat in which the user sent no message is not kept.
-pub fn save(path: &Path, chats: &[Chat]) {
+/// The chats to write, made on the UI thread. `write` does the slow part on a different thread.
+pub struct Snapshot {
+    seq: u64,
+    chats: Vec<SavedChat>,
+}
+
+/// Each snapshot gets a number, so that an older snapshot cannot replace a newer one.
+static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+static WRITTEN_SEQ: Mutex<u64> = Mutex::new(0);
+
+/// Take the chats to keep. A chat in which the user sent no message is not kept.
+pub fn snapshot(chats: &[Chat]) -> Snapshot {
     let mut saved: Vec<&Chat> = chats
         .iter()
         .filter(|c| c.items.iter().any(|i| matches!(i, Item::User(_))))
         .collect();
-    saved.sort_by(|a, b| b.updated.cmp(&a.updated));
+    saved.sort_by_key(|c| std::cmp::Reverse(c.updated));
     saved.truncate(MAX_CHATS);
-    let saved: Vec<SavedChat> = saved
-        .into_iter()
-        .map(|c| SavedChat {
-            agent: agent_key(c.kind).into(),
-            title: c.title.clone(),
-            updated: c.updated.timestamp(),
-            items: c.items.iter().map(save_item).collect(),
-        })
-        .collect();
-    let result = serde_json::to_vec(&saved)
+    Snapshot {
+        seq: NEXT_SEQ.fetch_add(1, Ordering::Relaxed),
+        chats: saved
+            .into_iter()
+            .map(|c| SavedChat {
+                agent: agent_key(c.kind).into(),
+                title: c.title.clone(),
+                updated: c.updated.timestamp(),
+                unread: c.unread,
+                items: c.items.iter().map(save_item).collect(),
+            })
+            .collect(),
+    }
+}
+
+/// Write a snapshot to `path`, unless a newer snapshot is there already.
+pub fn write(path: &Path, snapshot: Snapshot) {
+    let mut written = WRITTEN_SEQ.lock().unwrap_or_else(|e| e.into_inner());
+    if snapshot.seq < *written {
+        return;
+    }
+    let result = serde_json::to_vec(&snapshot.chats)
         .map_err(anyhow::Error::from)
         .and_then(|json| {
             // Write a new file, then rename it, so that a crash cannot leave half a file.
@@ -117,8 +151,9 @@ pub fn save(path: &Path, chats: &[Chat]) {
             std::fs::rename(&tmp, path)?;
             Ok(())
         });
-    if let Err(e) = result {
-        tracing::warn!("cannot save the chats: {e:#}");
+    match result {
+        Ok(()) => *written = snapshot.seq,
+        Err(e) => tracing::warn!("cannot save the chats: {e:#}"),
     }
 }
 
@@ -128,30 +163,25 @@ pub fn load(path: &Path, first_id: u64) -> Vec<Chat> {
     let saved: Vec<SavedChat> = match serde_json::from_slice(&json) {
         Ok(saved) => saved,
         Err(e) => {
-            tracing::warn!("cannot read the chats in {}: {e}", path.display());
+            // Keep the file, so that the next save does not write over the history.
+            let bad = path.with_extension("json.bad");
+            tracing::warn!("cannot read the chats in {}: {e}. Moved it to {}.", path.display(), bad.display());
+            let _ = std::fs::rename(path, &bad);
             return vec![];
         }
     };
     saved
         .into_iter()
         .zip(first_id..)
-        .map(|(c, id)| Chat {
-            id,
-            kind: AgentKind::ALL
-                .into_iter()
-                .find(|&k| agent_key(k) == c.agent)
-                .unwrap_or(AgentKind::Claude),
-            title: c.title,
-            items: c.items.into_iter().enumerate().map(|(ix, i)| load_item(i, ix)).collect(),
-            session: None,
-            busy: false,
-            closed: false,
-            permission: None,
-            updated: DateTime::from_timestamp(c.updated, 0)
-                .map(|t| t.with_timezone(&Local))
-                .unwrap_or_else(Local::now),
-            draft: String::new(),
-            unread: false,
+        .map(|(c, id)| {
+            let kind = agent_from_key(&c.agent).unwrap_or(AgentKind::Claude);
+            let mut chat = Chat::new(id, kind, c.title);
+            chat.items = c.items.into_iter().enumerate().map(|(ix, i)| load_item(i, ix)).collect();
+            chat.unread = c.unread;
+            if let Some(t) = DateTime::from_timestamp(c.updated, 0) {
+                chat.updated = t.with_timezone(&Local);
+            }
+            chat
         })
         .collect()
 }
@@ -188,19 +218,9 @@ mod tests {
     use super::*;
 
     fn chat(items: Vec<Item>) -> Chat {
-        Chat {
-            id: 1,
-            kind: AgentKind::Codex,
-            title: "Test".into(),
-            items,
-            session: None,
-            busy: false,
-            closed: false,
-            permission: None,
-            updated: Local::now(),
-            draft: String::new(),
-            unread: false,
-        }
+        let mut chat = Chat::new(1, AgentKind::Codex, "Test");
+        chat.items = items;
+        chat
     }
 
     #[test]
@@ -218,21 +238,30 @@ mod tests {
                     status: ToolStatus::Running,
                     detail: Some("out".into()),
                 },
-                Item::Plan(vec![("step".into(), ToolStatus::Done)]),
+                Item::Plan(vec![("step".into(), ToolStatus::Done), ("next".into(), ToolStatus::Pending)]),
             ]),
             chat(vec![]),
             chat(vec![Item::Error("no npx".into())]),
         ];
-        save(&path, &chats);
+        write(&path, snapshot(&chats));
+        // An older snapshot does not replace a newer one.
+        let old = snapshot(&[]);
+        write(&path, snapshot(&chats));
+        write(&path, old);
         let loaded = load(&path, 7);
+
+        // A file that the app cannot read is moved away, not written over.
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load(&path, 1).is_empty());
+        assert!(!path.exists() && path.with_extension("json.bad").exists());
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.len(), 1, "a chat with no user message is not kept");
         let c = &loaded[0];
         assert_eq!((c.id, c.kind, c.title.as_str()), (7, AgentKind::Codex, "Test"));
         assert!(matches!(&c.items[0], Item::User(t) if t == "hello"));
-        assert!(matches!(&c.items[1], Item::Tool { status: ToolStatus::Failed, detail: Some(d), .. } if d == "out"));
-        assert!(matches!(&c.items[2], Item::Plan(p) if p[0].1 == ToolStatus::Done));
+        assert!(matches!(&c.items[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), .. } if d == "out"));
+        assert!(matches!(&c.items[2], Item::Plan(p) if p[0].1 == ToolStatus::Done && p[1].1 == ToolStatus::Pending));
     }
 
     #[test]
