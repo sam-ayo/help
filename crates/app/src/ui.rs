@@ -1,6 +1,10 @@
-//! The main window: a sidebar, a list of chats, and the chat view, as in a mail app.
+//! The main window: one conversation with the assistant, as in a messages app, and a sidebar.
 
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use acp_host::{AgentKind, Command, Event, PermissionOptionView, Session, ToolStatus};
 use gpui::{
@@ -11,7 +15,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, InteractiveElementExt as _, Sizable as _, StyledExt as _, Theme, h_flex,
     button::{Button, ButtonRounded, ButtonVariants as _},
-    input::{Input, InputEvent, InputState, Textarea, TextareaState},
+    input::{InputEvent, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     progress::Progress,
     spinner::Spinner,
@@ -19,7 +23,6 @@ use gpui_component::{
     v_flex,
 };
 use gpui_kit_assets::IconName as KitIcon;
-use chrono::{DateTime, Local};
 use tokio::sync::{mpsc, oneshot};
 use vm::VmPhase;
 
@@ -28,21 +31,7 @@ use crate::{Env, theme};
 mod demo;
 mod history;
 
-gpui::actions!(
-    agent_desk,
-    [
-        NewChat,
-        CloseChat,
-        NextChat,
-        PreviousChat,
-        StopAgent,
-        FocusSearch,
-        ToggleSidebar,
-        ShowAllChats,
-        ShowClaudeChats,
-        ShowCodexChats,
-    ]
-);
+gpui::actions!(agent_desk, [NewTopic, StopAgent, ToggleSidebar]);
 
 enum Item {
     User(String),
@@ -58,6 +47,9 @@ enum Item {
     Plan(Vec<(String, ToolStatus)>),
     Notice(String),
     Error(String),
+    /// A new topic starts here. A new session gets no messages from before this item. The text
+    /// is the title of the topic, or empty.
+    Topic(String),
 }
 
 struct PendingPermission {
@@ -66,68 +58,59 @@ struct PendingPermission {
     reply: oneshot::Sender<Option<String>>,
 }
 
+/// The one conversation with the assistant.
 struct Chat {
-    id: u64,
     kind: AgentKind,
-    title: String,
     items: Vec<Item>,
     session: Option<Session>,
+    /// Each new session gets a new number. The events of an older session do not apply.
+    generation: u64,
+    /// The session got the earlier messages of the topic, or the topic had none.
+    primed: bool,
     busy: bool,
     closed: bool,
     permission: Option<PendingPermission>,
-    /// The time of the last message or agent event, for the chat list.
-    updated: DateTime<Local>,
-    /// The text in the composer that the user did not send. Each chat keeps its own.
-    draft: String,
-    /// The agent finished a turn while the user looked at a different chat.
-    unread: bool,
+    /// The folder that the agent works in.
+    cwd: PathBuf,
 }
 
 impl Chat {
-    /// A chat with no messages and no agent session.
-    fn new(id: u64, kind: AgentKind, title: impl Into<String>) -> Self {
+    /// A conversation with no agent session.
+    fn new(kind: AgentKind, items: Vec<Item>, cwd: PathBuf) -> Self {
         Self {
-            id,
             kind,
-            title: title.into(),
-            items: vec![],
+            items,
             session: None,
+            generation: 0,
+            primed: false,
             busy: false,
             closed: false,
             permission: None,
-            updated: Local::now(),
-            draft: String::new(),
-            unread: false,
+            cwd,
         }
+    }
+
+    /// The items of the current topic: the items after the last topic divider.
+    fn topic_items(&self) -> &[Item] {
+        let start = self.items.iter().rposition(|i| matches!(i, Item::Topic(_))).map_or(0, |ix| ix + 1);
+        &self.items[start..]
     }
 }
 
 pub struct AppView {
     env: Env,
-    chats: Vec<Chat>,
-    active: usize,
-    next_id: u64,
+    chat: Chat,
     composer: Entity<TextareaState>,
-    search: Entity<InputState>,
-    /// The title field while the user renames a chat.
-    rename: Entity<InputState>,
-    /// The id of the chat that the user renames. The new title goes to this chat, also when a
-    /// different chat is active when the rename ends.
-    renaming: Option<u64>,
-    /// The chat list shows only the chats of this agent. `None` shows all chats.
-    filter: Option<AgentKind>,
     scroll: ScrollHandle,
     vm_phase: VmPhase,
     vm_busy: bool,
     /// The mouse went down on a toolbar. A move then drags the window.
     drag_pending: bool,
-    /// The sidebar shows. The user can hide it to give the chat more room.
+    /// The sidebar shows. The user can hide it to give the conversation more room.
     sidebar_open: bool,
-    /// The tool cards that the user opened or closed, as (chat id, tool id). A card for a failed
-    /// tool starts open. The other cards start closed.
-    toggled_tools: HashSet<(u64, String)>,
-    /// The agent for new chats: the agent that the user picked last.
-    agent: AgentKind,
+    /// The tool cards that the user opened or closed, by tool id. A card for a failed tool
+    /// starts open. The other cards start closed.
+    toggled_tools: HashSet<String>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -135,30 +118,15 @@ impl AppView {
     pub fn new(env: Env, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .placeholder("Ask anything")
+                .placeholder("Message your assistant")
                 .auto_grow(2, 10)
                 .submit_on_enter(true)
         });
-        let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chats"));
-        let rename = cx.new(|cx| InputState::new(window, cx).placeholder("Chat title"));
-        let subs = vec![
-            cx.subscribe_in(&composer, window, |this, _state, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
-                    this.send(window, cx);
-                }
-            }),
-            cx.subscribe(&search, |_, _, ev: &InputEvent, cx| {
-                if let InputEvent::Change = ev {
-                    cx.notify();
-                }
-            }),
-            // Return or a click outside the field keeps the new title.
-            cx.subscribe_in(&rename, window, |this, _, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. } | InputEvent::Blur) {
-                    this.finish_rename(window, cx);
-                }
-            }),
-        ];
+        let subs = vec![cx.subscribe_in(&composer, window, |this, _state, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                this.send(window, cx);
+            }
+        })];
 
         // Follow the VM state.
         cx.spawn(async move |this, cx| {
@@ -179,99 +147,79 @@ impl AppView {
         .detach();
 
         let vm_phase = env.mac.phase();
-        let agent = load_agent(&env.agent_file);
+        let chat = if demo::enabled() {
+            demo::chat()
+        } else {
+            let cwd = std::fs::read_to_string(&env.folder_file)
+                .ok()
+                .map(|s| PathBuf::from(s.trim()))
+                .filter(|p| p.is_dir())
+                .unwrap_or_else(|| env.workspace.clone());
+            let items = history::load(&env.conversation_file, &env.chats_file);
+            Chat::new(load_agent(&env.agent_file), items, cwd)
+        };
         let mut view = Self {
             env,
-            chats: vec![],
-            active: 0,
-            next_id: 1,
+            chat,
             composer,
-            search,
-            rename,
-            renaming: None,
-            filter: None,
             scroll: ScrollHandle::new(),
             vm_phase,
             vm_busy: false,
             drag_pending: false,
             sidebar_open: true,
             toggled_tools: HashSet::new(),
-            agent,
             _subs: subs,
         };
-        if demo::enabled() {
-            view.chats = demo::chats();
-            view.next_id = view.chats.len() as u64 + 1;
-        } else {
-            view.chats = history::load(&view.env.chats_file, 1);
-            view.next_id = view.chats.len() as u64 + 1;
-            view.new_chat(agent, window, cx);
-        }
+        // The agent starts now, so that it is ready for the first message.
+        view.connect(cx);
         view.scroll.scroll_to_bottom();
-        // Keep the chats when the app quits, and when the window closes before that.
+        // The keyboard shortcuts work only when an element in the window has the focus.
+        window.focus(&view.composer.focus_handle(cx), cx);
+        // Keep the conversation when the app quits, and when the window closes before that.
         cx.on_app_quit(|this, _| {
-            this.save_chats_now();
+            this.save_now();
             async {}
         })
         .detach();
-        cx.on_release(|this, _| this.save_chats_now()).detach();
+        cx.on_release(|this, _| this.save_now()).detach();
         view
     }
 
-    fn new_chat(&mut self, kind: AgentKind, window: &mut Window, cx: &mut Context<Self>) {
-        self.save_draft(cx);
-        self.composer.update(cx, |s, cx| s.set_value("", window, cx));
-        let id = self.next_id;
-        self.next_id += 1;
-        self.chats.push(Chat::new(id, kind, "New chat"));
-        self.active = self.chats.len() - 1;
-        // Show the new chat in the list.
-        if self.filter.is_some_and(|f| f != kind) {
-            self.filter = None;
-        }
-        self.connect(self.active, cx);
-        // The user can type at once. The session queues prompts until the agent is ready.
-        window.focus(&self.composer.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    /// Start an agent session for the chat at `ix`, and show its events in the chat.
-    fn connect(&mut self, ix: usize, cx: &mut Context<Self>) {
+    /// Start a new agent session, and show its events in the conversation. Dropping the old
+    /// session stops its agent.
+    fn connect(&mut self, cx: &mut Context<Self>) {
         // The demo starts no agents. See `demo`.
         if demo::enabled() {
             return;
         }
-        let Some(chat) = self.chats.get_mut(ix) else { return };
-        let id = chat.id;
+        let chat = &mut self.chat;
+        chat.generation += 1;
+        let generation = chat.generation;
         let (tx, mut rx) = mpsc::unbounded_channel();
         chat.session = Some(acp_host::start(
             &self.env.runtime,
             chat.kind,
-            self.env.workspace.clone(),
+            chat.cwd.clone(),
             self.env.bridge.clone(),
             tx,
         ));
+        chat.primed = false;
         chat.closed = false;
+        chat.busy = false;
+        if let Some(p) = chat.permission.take() {
+            let _ = p.reply.send(None);
+        }
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
                 let ok = this.update(cx, |this, cx| {
-                    // Keep the chats at the end of each turn, and when the agent stops.
-                    let save = matches!(event, Event::TurnEnded(_) | Event::Closed);
-                    // Only these events move the chat to the top of the list. Streamed text
-                    // does not, so that the rows stay in place while agents work.
-                    let news = matches!(event, Event::TurnEnded(_) | Event::Permission { .. } | Event::Closed);
-                    let active_id = this.chats.get(this.active).map(|c| c.id);
-                    if let Some(chat) = this.chats.iter_mut().find(|c| c.id == id) {
-                        if matches!(event, Event::TurnEnded(_)) && active_id != Some(id) {
-                            chat.unread = true;
-                        }
-                        apply(chat, event);
-                        if news {
-                            chat.updated = Local::now();
-                        }
+                    if this.chat.generation != generation {
+                        return;
                     }
+                    // Keep the conversation at the end of each turn, and when the agent stops.
+                    let save = matches!(event, Event::TurnEnded(_) | Event::Closed);
+                    apply(&mut this.chat, event);
                     if save {
-                        this.save_chats(cx);
+                        this.save(cx);
                     }
                     this.scroll.scroll_to_bottom();
                     cx.notify();
@@ -284,145 +232,134 @@ impl AppView {
         .detach();
     }
 
-    /// Keep the chats in a file. The write runs off the UI thread. The sample chats are not kept.
-    fn save_chats(&self, cx: &mut Context<Self>) {
+    /// Keep the conversation in a file. The write runs off the UI thread. The demo is not kept.
+    fn save(&self, cx: &mut Context<Self>) {
         if demo::enabled() {
             return;
         }
-        let snapshot = history::snapshot(&self.chats);
-        let path = self.env.chats_file.clone();
+        let snapshot = history::snapshot(&self.chat);
+        let path = self.env.conversation_file.clone();
         cx.background_spawn(async move { history::write(&path, snapshot) }).detach();
     }
 
-    /// Keep the chats in a file before the app stops.
-    fn save_chats_now(&self) {
+    /// Keep the conversation in a file before the app stops.
+    fn save_now(&self) {
         if !demo::enabled() {
-            history::write(&self.env.chats_file, history::snapshot(&self.chats));
+            history::write(&self.env.conversation_file, history::snapshot(&self.chat));
         }
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().to_string();
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || self.chat.busy {
             return;
         }
-        let ix = self.active;
-        let Some(chat) = self.chats.get(ix) else { return };
-        if chat.busy {
-            return;
-        }
-        // A chat from an earlier start of the app, or a chat whose agent stopped, has no session.
-        // A new session starts, and its first prompt has the earlier messages.
-        if chat.session.is_none() && demo::enabled() {
-            let chat = &mut self.chats[ix];
-            chat.items.push(Item::Notice("The sample chats have no agent.".into()));
+        if demo::enabled() {
+            self.chat.items.push(Item::Notice("The demo has no agent.".into()));
             cx.notify();
             return;
         }
-        let prompt = if chat.session.is_none() {
-            let prompt = history::prompt_with_context(chat, &text);
-            self.connect(ix, cx);
-            prompt
-        } else {
-            text.clone()
-        };
-        let chat = &mut self.chats[ix];
-        let Some(session) = &chat.session else { return };
-        if chat.items.iter().all(|i| !matches!(i, Item::User(_))) {
-            chat.title = text.lines().next().unwrap_or("").chars().take(40).collect();
+        // An agent that stopped gets a new session.
+        if self.chat.session.is_none() {
+            self.connect(cx);
         }
+        let chat = &mut self.chat;
+        // The first prompt of a session has the earlier messages of the topic.
+        let prompt = if chat.primed { text.clone() } else { history::prompt_with_context(chat, &text) };
+        let Some(session) = &chat.session else { return };
         session.send(Command::Prompt(prompt));
+        chat.primed = true;
         chat.items.push(Item::User(text));
         chat.busy = true;
-        chat.updated = Local::now();
         self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.scroll.scroll_to_bottom();
-        self.save_chats(cx);
+        self.save(cx);
         cx.notify();
     }
 
     fn cancel(&mut self, cx: &mut Context<Self>) {
-        if let Some(chat) = self.chats.get_mut(self.active) {
-            if let Some(p) = chat.permission.take() {
-                let _ = p.reply.send(None);
-            }
-            if let Some(s) = &chat.session {
-                s.send(Command::Cancel);
-            }
+        if let Some(p) = self.chat.permission.take() {
+            let _ = p.reply.send(None);
+        }
+        if let Some(s) = &self.chat.session {
+            s.send(Command::Cancel);
         }
         cx.notify();
     }
 
     fn answer_permission(&mut self, option: Option<String>, cx: &mut Context<Self>) {
-        if let Some(chat) = self.chats.get_mut(self.active) {
-            if let Some(p) = chat.permission.take() {
-                let _ = p.reply.send(option);
-            }
+        if let Some(p) = self.chat.permission.take() {
+            let _ = p.reply.send(option);
         }
         cx.notify();
     }
 
-    /// Use a different agent. A chat with no prompts changes its agent. A chat with prompts keeps
-    /// its agent, because the new agent does not know the conversation, so a new chat starts.
-    fn pick_agent(&mut self, kind: AgentKind, window: &mut Window, cx: &mut Context<Self>) {
-        if kind != self.agent {
-            self.agent = kind;
-            save_agent(&self.env.agent_file, kind);
-        }
-        let Some(chat) = self.chats.get(self.active) else {
-            self.new_chat(kind, window, cx);
-            return;
-        };
-        if chat.kind == kind {
+    /// The conversation has a message in the current topic.
+    fn topic_started(&self) -> bool {
+        self.chat.topic_items().iter().any(|i| matches!(i, Item::User(_)))
+    }
+
+    /// Start a new topic. The agent forgets the earlier messages. The conversation keeps them.
+    fn new_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.chat.busy || !self.topic_started() {
             return;
         }
-        // The text that the user typed is for the new agent. It goes to the new chat.
-        let draft = self.composer.read(cx).value().to_string();
-        if !chat.items.iter().any(|i| matches!(i, Item::User(_))) {
-            // Dropping the session stops the old agent. Keep the chat in the same place in the list.
-            let ix = self.active;
-            self.chats.remove(ix);
-            // No chat is active now, so `new_chat` keeps no draft.
-            self.active = usize::MAX;
-            self.new_chat(kind, window, cx);
-            let chat = self.chats.pop().expect("new_chat adds a chat");
-            self.chats.insert(ix, chat);
-            self.active = ix;
-        } else {
-            if let Some(chat) = self.chats.get_mut(self.active) {
-                chat.draft.clear();
-            }
-            self.active = usize::MAX;
-            self.new_chat(kind, window, cx);
-        }
-        self.composer.update(cx, |s, cx| s.set_value(draft, window, cx));
+        self.chat.items.push(Item::Topic(String::new()));
+        self.connect(cx);
+        self.save(cx);
+        self.scroll.scroll_to_bottom();
+        window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
-    /// Delete the chat at `ix`. Dropping its session stops the agent process.
-    fn close_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if ix >= self.chats.len() {
+    /// Use a different agent. The new agent gets the earlier messages of the topic with the
+    /// next message.
+    fn pick_agent(&mut self, kind: AgentKind, cx: &mut Context<Self>) {
+        if kind == self.chat.kind || self.chat.busy {
             return;
         }
-        if ix == self.active {
-            self.chats.remove(ix);
-            if self.chats.is_empty() {
-                // No chat is active, so `new_chat` keeps no draft.
-                self.active = usize::MAX;
-                self.new_chat(self.agent, window, cx);
-            }
-            self.active = self.active.min(self.chats.len() - 1);
-            self.load_draft(window, cx);
-            self.scroll.scroll_to_bottom();
-        } else {
-            // The active chat stays active, and the composer keeps its text.
-            self.chats.remove(ix);
-            if ix < self.active {
-                self.active -= 1;
-            }
+        save_agent(&self.env.agent_file, kind);
+        self.chat.kind = kind;
+        if self.topic_started() {
+            self.chat.items.push(Item::Notice(format!("{} continues the conversation.", agent_name(kind))));
         }
-        self.save_chats(cx);
+        self.connect(cx);
+        self.scroll.scroll_to_bottom();
         cx.notify();
+    }
+
+    /// Ask for the folder that the agent works in. The agent starts again in the new folder,
+    /// and gets the earlier messages of the topic with the next message.
+    fn pick_folder(&mut self, cx: &mut Context<Self>) {
+        if self.chat.busy {
+            return;
+        }
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let Some(path) = paths.into_iter().next() else { return };
+            let _ = this.update(cx, |this, cx| {
+                if path == this.chat.cwd || this.chat.busy {
+                    return;
+                }
+                if let Err(e) = std::fs::write(&this.env.folder_file, path.to_string_lossy().as_bytes()) {
+                    tracing::warn!("cannot save the folder: {e}");
+                }
+                if !this.chat.items.is_empty() {
+                    this.chat.items.push(Item::Notice(format!("The agent works in {} now.", display_path(&path))));
+                }
+                this.chat.cwd = path;
+                this.connect(cx);
+                this.scroll.scroll_to_bottom();
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Run a slow VM action off the UI thread.
@@ -438,106 +375,12 @@ impl AppView {
             let _ = this.update(cx, |this, cx| {
                 this.vm_busy = false;
                 if let Err(e) = result {
-                    if let Some(chat) = this.chats.get_mut(this.active) {
-                        chat.items.push(Item::Error(format!("Agent Mac: {e:#}")));
-                    }
+                    this.chat.items.push(Item::Error(format!("Agent Mac: {e:#}")));
                 }
                 cx.notify();
             });
         })
         .detach();
-        cx.notify();
-    }
-
-    /// The indexes of the chats that the list shows: the agent filter and the search apply.
-    /// The chat with the newest activity comes first, as in a mail app.
-    fn visible(&self, cx: &Context<Self>) -> Vec<usize> {
-        let query = self.search.read(cx).value().to_lowercase();
-        let query = query.trim();
-        let mut visible: Vec<usize> = self
-            .chats
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| self.filter.is_none_or(|f| f == c.kind))
-            .filter(|(_, c)| {
-                query.is_empty() || c.title.to_lowercase().contains(query) || preview(c).to_lowercase().contains(query)
-            })
-            .map(|(ix, _)| ix)
-            .collect();
-        visible.sort_by(|&a, &b| self.chats[b].updated.cmp(&self.chats[a].updated));
-        visible
-    }
-
-    fn select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(chat) = self.chats.get_mut(ix) {
-            chat.unread = false;
-        }
-        if ix != self.active {
-            self.save_draft(cx);
-            self.active = ix;
-            self.load_draft(window, cx);
-            self.scroll.scroll_to_bottom();
-        }
-        window.focus(&self.composer.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    fn start_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((id, title)) = self.chats.get(self.active).map(|c| (c.id, c.title.clone())) else {
-            return;
-        };
-        self.renaming = Some(id);
-        self.rename.update(cx, |s, cx| s.set_value(title, window, cx));
-        window.focus(&self.rename.focus_handle(cx), cx);
-        cx.notify();
-    }
-
-    fn finish_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.renaming.take() else { return };
-        let title = self.rename.read(cx).value().trim().to_string();
-        if let Some(chat) = self.chats.iter_mut().find(|c| c.id == id)
-            && !title.is_empty()
-        {
-            chat.title = title;
-            self.save_chats(cx);
-        }
-        // Do not take the focus from a field that the user went to.
-        if self.rename.focus_handle(cx).is_focused(window) {
-            window.focus(&self.composer.focus_handle(cx), cx);
-        }
-        cx.notify();
-    }
-
-    /// Keep the composer text in the active chat.
-    fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().to_string();
-        if let Some(chat) = self.chats.get_mut(self.active) {
-            chat.draft = text;
-        }
-    }
-
-    /// Put the draft of the active chat in the composer.
-    fn load_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let draft = self.chats.get(self.active).map(|c| c.draft.clone()).unwrap_or_default();
-        self.composer.update(cx, |s, cx| s.set_value(draft, window, cx));
-    }
-
-    /// Go to the next chat in the list (`step` 1) or the previous chat (`step` -1).
-    fn step(&mut self, step: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let visible = self.visible(cx);
-        let Some(pos) = visible.iter().position(|&ix| ix == self.active) else {
-            if let Some(&first) = visible.first() {
-                self.select(first, window, cx);
-            }
-            return;
-        };
-        if let Some(&ix) = pos.checked_add_signed(step).and_then(|p| visible.get(p)) {
-            self.select(ix, window, cx);
-        }
-    }
-
-    fn set_filter(&mut self, filter: Option<AgentKind>, cx: &mut Context<Self>) {
-        self.filter = filter;
         cx.notify();
     }
 
@@ -628,8 +471,6 @@ const COLUMN: f32 = 760.;
 const TOOLBAR: f32 = 52.;
 /// The width of the sidebar panel.
 const SIDEBAR: f32 = 232.;
-/// The width of the chat list, as the message list in a mail app.
-const LIST: f32 = 340.;
 /// The space between the sidebar panel and the window edges.
 const INSET: f32 = 8.;
 
@@ -788,72 +629,19 @@ fn preset_item(title: &'static str, tint: Hsla, color: Hsla) -> PopupMenuItem {
     })
 }
 
-/// A sidebar row with an icon, a label, and an optional count. The selected row has a tint.
-fn nav_row(
-    id: impl Into<gpui::ElementId>,
-    icon: KitIcon,
-    label: impl Into<SharedString>,
-    count: Option<usize>,
-    selected: bool,
-    theme: &Theme,
-) -> Stateful<Div> {
-    h_flex()
-        .id(id)
-        .mx_2()
-        .px_2()
-        .h(px(32.))
-        .gap_2p5()
-        .rounded(px(8.))
-        .cursor_pointer()
-        .text_sm()
-        .when(selected, |el| el.bg(theme.foreground.opacity(0.07)).font_medium())
-        .when(!selected, |el| el.hover(|el| el.bg(theme.foreground.opacity(0.04))))
-        .child(
-            Icon::new(icon)
-                .size(px(16.))
-                .text_color(if selected { accent(theme) } else { theme.foreground.opacity(0.75) }),
-        )
-        .child(div().flex_1().min_w_0().truncate().child(label.into()))
-        .children(
-            count
-                .filter(|&n| n > 0)
-                .map(|n| div().text_xs().text_color(theme.muted_foreground).child(n.to_string())),
-        )
-}
-
-/// The time of a chat for the list, as in a mail app: the time today, the weekday in the last
-/// week, and the date before that.
-fn short_time(t: DateTime<Local>) -> String {
-    let now = Local::now();
-    let days = (now.date_naive() - t.date_naive()).num_days();
-    if days == 0 {
-        t.format("%-I:%M %p").to_string()
-    } else if days == 1 {
-        "Yesterday".into()
-    } else if days < 7 {
-        t.format("%A").to_string()
-    } else {
-        t.format("%b %-d").to_string()
+/// A path for the user to read: the home folder shows as `~`. The folder picker gives paths
+/// with links resolved, so the home folder with links resolved shows as `~` too.
+fn display_path(path: &Path) -> String {
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from) else {
+        return path.display().to_string();
+    };
+    let resolved = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
+    for home in [home, resolved] {
+        if let Ok(rest) = path.strip_prefix(&home) {
+            return if rest.as_os_str().is_empty() { "~".into() } else { format!("~/{}", rest.display()) };
+        }
     }
-}
-
-/// A short line for the chat list: the last text of the agent, or what it does now.
-fn preview(chat: &Chat) -> String {
-    if chat.permission.is_some() {
-        return "Waiting for your permission".into();
-    }
-    if chat.closed {
-        return "The agent stopped".into();
-    }
-    let last = chat.items.iter().rev().find_map(|i| match i {
-        Item::Agent(t) | Item::User(t) => Some(t.as_str()),
-        _ => None,
-    });
-    match last {
-        Some(t) => t.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(80).collect(),
-        None if chat.busy => "Working…".into(),
-        None => String::new(),
-    }
+    path.display().to_string()
 }
 
 impl AppView {
@@ -881,14 +669,6 @@ impl AppView {
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let accent = accent(&theme);
-        // The counts are the unread chats, as in a mail app.
-        let count = |kind: Option<AgentKind>| {
-            self.chats
-                .iter()
-                .filter(|c| c.unread && kind.is_none_or(|k| k == c.kind))
-                .count()
-        };
-
         // The app mark, as the logo of a mail app.
         let brand = h_flex()
             .gap_2()
@@ -910,38 +690,26 @@ impl AppView {
                     .child(div().text_color(accent).child(".")),
             );
 
-        let new_chat = h_flex()
-            .id("new-chat")
+        let disabled = self.chat.busy || !self.topic_started();
+        let new_topic = h_flex()
+            .id("new-topic")
             .mx_2()
             .px_2()
             .h(px(32.))
             .gap_2p5()
             .rounded(px(8.))
-            .cursor_pointer()
             .text_sm()
             .font_medium()
-            .text_color(accent)
-            .hover(|el| el.bg(accent.opacity(0.08)))
-            .on_click(cx.listener(|this, _, window, cx| this.new_chat(this.agent, window, cx)))
+            .when(disabled, |el| el.text_color(theme.muted_foreground))
+            .when(!disabled, |el| {
+                el.cursor_pointer()
+                    .text_color(accent)
+                    .hover(|el| el.bg(accent.opacity(0.08)))
+                    .on_click(cx.listener(|this, _, window, cx| this.new_topic(window, cx)))
+            })
             .child(Icon::new(KitIcon::SquarePen).size(px(16.)))
-            .child(div().flex_1().child("New chat"))
+            .child(div().flex_1().child("New topic"))
             .child(div().text_xs().text_color(theme.muted_foreground).child("⌘N"));
-
-        let mut filters = vec![nav_row("filter-all", KitIcon::Inbox, "All chats", Some(count(None)), self.filter.is_none(), &theme)
-            .on_click(cx.listener(|this, _, _, cx| this.set_filter(None, cx)))];
-        for kind in AgentKind::ALL {
-            filters.push(
-                nav_row(
-                    SharedString::from(format!("filter-{}", agent_key(kind))),
-                    agent_icon(kind),
-                    agent_name(kind),
-                    Some(count(Some(kind))),
-                    self.filter == Some(kind),
-                    &theme,
-                )
-                .on_click(cx.listener(move |this, _, _, cx| this.set_filter(Some(kind), cx))),
-            );
-        }
 
         // A floating panel inset from the window edges, with a rose tint. The blurred window
         // background shows through a little.
@@ -962,9 +730,7 @@ impl AppView {
                     .child(div().flex_1().child(brand))
                     .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
-            .child(div().pt_2().child(new_chat))
-            .child(section_header("Chats", &theme))
-            .child(v_flex().gap_px().children(filters))
+            .child(div().pt_2().child(new_topic))
             .child(section_header("Agent Mac", &theme))
             .child(self.render_vm_panel(cx))
             .child(div().flex_1())
@@ -1068,188 +834,6 @@ impl AppView {
             .into_any_element()
     }
 
-    /// The middle column: the chats that match the filter and the search, as a message list.
-    fn render_list(&self, visible: &[usize], cx: &mut Context<Self>) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let title = match self.filter {
-            None => "All chats",
-            Some(kind) => agent_name(kind),
-        };
-        let rows: Vec<_> = visible
-            .iter()
-            .map(|&ix| self.render_chat_row(ix, &self.chats[ix], &theme, cx))
-            .collect();
-        let empty = rows.is_empty();
-        v_flex()
-            .w(px(LIST))
-            .h_full()
-            .flex_shrink_0()
-            .bg(theme.background)
-            .border_r_1()
-            .border_color(theme.border)
-            .child(
-                self.toolbar("list-toolbar", cx)
-                    .px_4()
-                    .gap_2()
-                    // Without the sidebar, the traffic lights are on this toolbar.
-                    .when(!self.sidebar_open, |el| {
-                        el.pl(px(84.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx))
-                    })
-                    .child(div().flex_1().text_lg().font_semibold().child(title))
-                    .child(
-                        Button::new("list-new-chat")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(KitIcon::SquarePen))
-                            .tooltip_with_action("New chat", &NewChat, None)
-                            .on_click(cx.listener(|this, _, window, cx| this.new_chat(this.agent, window, cx))),
-                    ),
-            )
-            .child(
-                div().px_4().pb_3().child(
-                    h_flex()
-                        .h(px(36.))
-                        .px_2()
-                        .rounded(px(8.))
-                        .bg(theme.foreground.opacity(0.045))
-                        .child(
-                            Input::new(&self.search)
-                                .appearance(false)
-                                .prefix(Icon::new(KitIcon::Search).size(px(15.)).text_color(theme.muted_foreground))
-                                .cleanable(true),
-                        ),
-                ),
-            )
-            .child(
-                v_flex()
-                    .id("chat-list")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .children(rows)
-                    .when(empty, |el| {
-                        el.child(
-                            div()
-                                .p_6()
-                                .text_center()
-                                .text_sm()
-                                .text_color(theme.muted_foreground)
-                                .child("No chats"),
-                        )
-                    }),
-            )
-            .into_any_element()
-    }
-
-    fn render_chat_row(&self, ix: usize, chat: &Chat, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let active = ix == self.active;
-        let group: SharedString = format!("chat-row-{ix}").into();
-        let trailing = if chat.permission.is_some() {
-            Some(
-                Icon::new(KitIcon::ShieldAlert)
-                    .size(px(14.))
-                    .text_color(theme.warning)
-                    .into_any_element(),
-            )
-        } else if chat.busy {
-            Some(
-                Spinner::new()
-                    .with_size(px(12.))
-                    .color(accent(theme))
-                    .into_any_element(),
-            )
-        } else {
-            None
-        };
-        // A dot before the name, as an unread mark: the chat has news, or needs the user.
-        let attention = chat.permission.is_some() || chat.unread;
-        let preview = match preview(chat) {
-            p if p.is_empty() => "No messages yet".to_string(),
-            p => p,
-        };
-        h_flex()
-            .id(("chat", ix))
-            .group(group.clone())
-            .px_4()
-            .py_3()
-            .gap_3()
-            .items_start()
-            .border_b_1()
-            .border_color(theme.border)
-            .cursor_pointer()
-            .when(active, |el| el.bg(accent(theme).opacity(if theme.is_dark() { 0.14 } else { 0.07 })))
-            .when(!active, |el| el.hover(|el| el.bg(theme.foreground.opacity(0.025))))
-            .on_click(cx.listener(move |this, _, window, cx| this.select(ix, window, cx)))
-            .child(avatar(chat.kind, 36.))
-            .child(
-                v_flex()
-                    .flex_1()
-                    .min_w_0()
-                    .gap_0p5()
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .h(px(20.))
-                            .when(attention, |el| el.child(div().size(px(7.)).rounded_full().bg(accent(theme))))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_sm()
-                                    .font_semibold()
-                                    .child(agent_name(chat.kind)),
-                            )
-                            // The time and the status show until the pointer is on the row. Then the close
-                            // button shows over them. Hover styles change only the visibility, not the
-                            // layout: GPUI lays out without the hover style, and paints with it.
-                            .child(
-                                div()
-                                    .relative()
-                                    .flex_shrink_0()
-                                    .child(
-                                        h_flex()
-                                            .h(px(20.))
-                                            .gap_1p5()
-                                            .group_hover(group.clone(), |s| s.invisible())
-                                            .children(trailing)
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(short_time(chat.updated)),
-                                            ),
-                                    )
-                                    .child(
-                                        h_flex()
-                                            .absolute()
-                                            .top_0()
-                                            .right_0()
-                                            .h(px(20.))
-                                            .invisible()
-                                            .group_hover(group, |s| s.visible())
-                                            .child(
-                                                Button::new(("close", ix))
-                                                    .ghost()
-                                                    .xsmall()
-                                                    .icon(Icon::new(KitIcon::X).text_color(theme.muted_foreground))
-                                                    .tooltip("Delete chat")
-                                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                                        cx.stop_propagation();
-                                                        this.close_chat(ix, window, cx)
-                                                    })),
-                                            ),
-                                    ),
-                            ),
-                    )
-                    .child(div().truncate().text_sm().child(chat.title.clone()))
-                    .child(div().truncate().text_xs().text_color(theme.muted_foreground).child(preview)),
-            )
-            .into_any_element()
-    }
-
     fn render_vm_panel(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let phase = &self.vm_phase;
@@ -1296,9 +880,7 @@ impl AppView {
                             .tooltip("Show screen")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Err(e) = vm::show_window() {
-                                    if let Some(chat) = this.chats.get_mut(this.active) {
-                                        chat.items.push(Item::Error(format!("Agent Mac: {e:#}")));
-                                    }
+                                    this.chat.items.push(Item::Error(format!("Agent Mac: {e:#}")));
                                     cx.notify();
                                 }
                             })),
@@ -1391,7 +973,7 @@ impl AppView {
             .into_any_element()
     }
 
-    fn render_item(&self, ix: usize, item: &Item, chat_id: u64, kind: AgentKind, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_item(&self, ix: usize, item: &Item, kind: AgentKind, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         match item {
             Item::User(text) => h_flex()
@@ -1457,7 +1039,7 @@ impl AppView {
                 detail,
             } => {
                 // A click on the header opens or closes the output. A failed tool starts open.
-                let key = (chat_id, id.clone());
+                let key = id.clone();
                 let open = detail.is_some() && (self.toggled_tools.contains(&key) != (*status == ToolStatus::Failed));
                 v_flex()
                     .ml(px(40.))
@@ -1580,6 +1162,25 @@ impl AppView {
                 .child(Icon::new(KitIcon::CircleAlert).size(px(14.)).mt_0p5())
                 .child(div().flex_1().min_w_0().child(text.clone()))
                 .into_any_element(),
+            // A line across the conversation with the title of the topic in the middle.
+            Item::Topic(title) => {
+                let line = || div().flex_1().h(px(1.)).bg(theme.border);
+                let label = if title.is_empty() { "New topic".to_string() } else { title.clone() };
+                h_flex()
+                    .py_2()
+                    .gap_3()
+                    .child(line())
+                    .child(
+                        div()
+                            .max_w(px(COLUMN / 2.))
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(label),
+                    )
+                    .child(line())
+                    .into_any_element()
+            }
         }
     }
 
@@ -1626,13 +1227,7 @@ impl AppView {
     }
 
     /// The top of a new chat: the agent, a question, and the folder that the agent works in.
-    fn render_greeting(&self, kind: AgentKind, theme: &Theme) -> gpui::AnyElement {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let folder = self.env.workspace.display().to_string();
-        let folder = match folder.strip_prefix(&home) {
-            Some(rest) if !home.is_empty() => format!("~{rest}"),
-            _ => folder,
-        };
+    fn render_greeting(&self, kind: AgentKind, cwd: &Path, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         v_flex()
             .items_center()
             .gap_3()
@@ -1642,15 +1237,24 @@ impl AppView {
                 div()
                     .text_2xl()
                     .font_semibold()
-                    .child(format!("What should {} work on?", agent_name(kind))),
+                    .child("What can I help you with?"),
             )
+            // A click on the folder opens the folder picker.
             .child(
                 h_flex()
+                    .id("pick-folder")
+                    .px_2p5()
+                    .py_1()
                     .gap_1p5()
+                    .rounded_full()
+                    .cursor_pointer()
                     .text_sm()
                     .text_color(theme.muted_foreground)
+                    .hover(|el| el.bg(theme.secondary).text_color(theme.foreground))
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_folder(cx)))
                     .child(Icon::new(KitIcon::Folder).size(px(14.)))
-                    .child(folder),
+                    .child(display_path(cwd))
+                    .child(Icon::new(KitIcon::ChevronDown).size(px(12.))),
             )
             .into_any_element()
     }
@@ -1709,8 +1313,8 @@ impl AppView {
                         PopupMenuItem::new(k.label())
                             .icon(Icon::new(agent_icon(k)).text_color(agent_color(k)))
                             .checked(k == kind)
-                            .on_click(move |_, window, cx| {
-                                let _ = view.update(cx, |this, cx| this.pick_agent(k, window, cx));
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| this.pick_agent(k, cx));
                             }),
                     )
                 })
@@ -1718,8 +1322,7 @@ impl AppView {
             .into_any_element()
     }
 
-    /// `detached` is true for a chat with messages and no agent session: the next message starts one.
-    fn render_composer(&self, kind: AgentKind, busy: bool, detached: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_composer(&self, kind: AgentKind, busy: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let action = if busy {
             Button::new("stop")
@@ -1760,10 +1363,7 @@ impl AppView {
                             .flex_1()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .when(!busy && !detached, |el| el.child("Return to send, Shift-Return for a new line"))
-                            .when(!busy && detached, |el| {
-                                el.child("Send a message to continue. A new session gets the earlier messages.")
-                            }),
+                            .when(!busy, |el| el.child("Return to send, Shift-Return for a new line")),
                     )
                     .child(action),
             )
@@ -1772,23 +1372,28 @@ impl AppView {
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A hot patch can change the type that `render_view` returns, so return `AnyElement`.
+        crate::hotpatch::call(|| self.render_view(window, cx).into_any_element())
+    }
+}
+
+impl AppView {
+    fn render_view(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let visible = self.visible(cx);
-        let chat = self.chats.get(self.active);
-        let kind = chat.map(|c| c.kind).unwrap_or(AgentKind::Claude);
-        let empty = chat.is_none_or(|c| c.items.is_empty());
+        let chat = &self.chat;
+        let kind = chat.kind;
+        let busy = chat.busy;
+        let empty = chat.items.is_empty();
+        let cwd = chat.cwd.clone();
         let mut items: Vec<gpui::AnyElement> = chat
-            .map(|c| {
-                c.items
-                    .iter()
-                    .enumerate()
-                    .map(|(ix, item)| self.render_item(ix, item, c.id, kind, cx))
-                    .collect()
-            })
-            .unwrap_or_default();
+            .items
+            .iter()
+            .enumerate()
+            .map(|(ix, item)| self.render_item(ix, item, kind, cx))
+            .collect();
         // While the agent works, a row at the end shows it. A permission request shows instead.
-        if chat.is_some_and(|c| c.busy && c.permission.is_none()) {
+        if busy && chat.permission.is_none() {
             items.push(
                 h_flex()
                     .gap_3()
@@ -1798,13 +1403,18 @@ impl Render for AppView {
                     .into_any_element(),
             );
         }
-        let permission = chat
-            .and_then(|c| c.permission.as_ref())
-            .map(|p| self.render_permission(p, cx).into_any_element());
-        let busy = chat.is_some_and(|c| c.busy);
-        let detached =
-            chat.is_some_and(|c| c.session.is_none() && c.items.iter().any(|i| matches!(i, Item::User(_))));
-        let title = chat.map(|c| c.title.clone()).unwrap_or_default();
+        let permission = chat.permission.as_ref().map(|p| self.render_permission(p, cx));
+        // The line below the name of the assistant, as the status of a contact in a messages app.
+        let (status, status_color) = if chat.permission.is_some() {
+            ("Waiting for your permission".to_string(), theme.warning)
+        } else if busy {
+            ("Working…".to_string(), theme.muted_foreground)
+        } else if chat.closed {
+            ("Stopped. Send a message to start again.".to_string(), theme.muted_foreground)
+        } else {
+            (format!("{} · {}", kind.label(), display_path(&cwd)), theme.muted_foreground)
+        };
+        let can_start_topic = !busy && self.topic_started();
         let composer = v_flex()
             .w_full()
             .max_w(px(COLUMN))
@@ -1812,35 +1422,30 @@ impl Render for AppView {
             .px_6()
             .gap_2()
             .children(permission)
-            .child(self.render_composer(kind, busy, detached, cx));
+            .child(self.render_composer(kind, busy, cx));
 
-        // The place of the chat in the list, as "1 of 19" in a mail app.
-        let position = visible.iter().position(|&ix| ix == self.active);
-        let prev = position.and_then(|p| p.checked_sub(1)).map(|p| visible[p]);
-        let next = position.and_then(|p| visible.get(p + 1).copied());
-        let active = self.active;
         let toolbar = self
             .toolbar("main-toolbar", cx)
             .px_4()
             .gap_1()
             .border_b_1()
             .border_color(theme.border)
+            // Without the sidebar, the traffic lights are on this toolbar.
+            .when(!self.sidebar_open, |el| {
+                el.pl(px(84.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx))
+            })
             .child(
-                Button::new("close-chat")
-                    .ghost()
-                    .small()
-                    .icon(Icon::new(KitIcon::Trash))
-                    .tooltip_with_action("Delete chat", &CloseChat, None)
-                    .on_click(cx.listener(move |this, _, window, cx| this.close_chat(active, window, cx))),
-            )
-            .child(
-                Button::new("rename-chat")
-                    .ghost()
-                    .small()
-                    .icon(Icon::new(KitIcon::Pencil))
-                    .tooltip("Rename chat")
-                    .disabled(empty)
-                    .on_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx))),
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_2p5()
+                    .child(avatar(kind, 30.))
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().text_sm().font_semibold().child(agent_name(kind)))
+                            .child(div().truncate().text_xs().text_color(status_color).child(status)),
+                    ),
             )
             .when(busy, |el| {
                 el.child(
@@ -1852,83 +1457,26 @@ impl Render for AppView {
                         .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                 )
             })
-            .child(div().flex_1())
-            .when_some(position, |el, p| {
-                el.child(
-                    div()
-                        .pr_1()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{} of {}", p + 1, visible.len())),
-                )
-            })
             .child(
-                Button::new("prev-chat")
+                Button::new("pick-folder-toolbar")
                     .ghost()
                     .small()
-                    .icon(Icon::new(KitIcon::ChevronUp))
-                    .tooltip_with_action("Previous chat", &PreviousChat, None)
-                    .disabled(prev.is_none())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(ix) = prev {
-                            this.select(ix, window, cx)
-                        }
-                    })),
+                    .icon(Icon::new(KitIcon::Folder))
+                    .tooltip("Change the folder")
+                    .disabled(busy)
+                    .on_click(cx.listener(|this, _, _, cx| this.pick_folder(cx))),
             )
             .child(
-                Button::new("next-chat")
+                Button::new("new-topic-toolbar")
                     .ghost()
                     .small()
-                    .icon(Icon::new(KitIcon::ChevronDown))
-                    .tooltip_with_action("Next chat", &NextChat, None)
-                    .disabled(next.is_none())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if let Some(ix) = next {
-                            this.select(ix, window, cx)
-                        }
-                    })),
+                    .icon(Icon::new(KitIcon::SquarePen))
+                    .tooltip_with_action("New topic", &NewTopic, None)
+                    .disabled(!can_start_topic)
+                    .on_click(cx.listener(|this, _, window, cx| this.new_topic(window, cx))),
             );
 
-        // The subject line and a chip with the agent, as a message header.
-        let header = v_flex()
-            .w_full()
-            .max_w(px(COLUMN))
-            .mx_auto()
-            .px_6()
-            .pt_6()
-            .gap_2()
-            .child(if self.renaming.is_some() && self.renaming == chat.map(|c| c.id) {
-                div()
-                    .text_xl()
-                    .font_semibold()
-                    .child(Input::new(&self.rename).appearance(false))
-                    .into_any_element()
-            } else {
-                div()
-                    .id("chat-title")
-                    .text_xl()
-                    .font_semibold()
-                    .cursor_text()
-                    .on_double_click(cx.listener(|this, _, window, cx| this.start_rename(window, cx)))
-                    .child(title)
-                    .into_any_element()
-            })
-            .child(
-                h_flex().child(
-                    h_flex()
-                        .px_2p5()
-                        .py_0p5()
-                        .gap_1p5()
-                        .rounded_full()
-                        .bg(theme.foreground.opacity(0.045))
-                        .text_xs()
-                        .child(div().size(px(6.)).rounded_full().bg(agent_color(kind)))
-                        .child(kind.label())
-                        .child(div().text_color(theme.muted_foreground).child("· ACP")),
-                ),
-            );
-
-        // A new chat shows only the composer, in the middle of the pane, as ChatGPT does.
+        // An empty conversation shows only the composer, in the middle of the pane.
         let body = if empty {
             v_flex()
                 .flex_1()
@@ -1936,7 +1484,7 @@ impl Render for AppView {
                 // Sit a little above the center.
                 .pb(px(TOOLBAR * 2.))
                 .gap_6()
-                .child(self.render_greeting(kind, &theme))
+                .child(self.render_greeting(kind, &cwd, &theme, cx))
                 .child(composer)
                 .child(self.render_suggestions(kind, &theme, cx))
                 .into_any_element()
@@ -1950,7 +1498,6 @@ impl Render for AppView {
                         .flex_1()
                         .overflow_y_scroll()
                         .track_scroll(&self.scroll)
-                        .child(header)
                         .child(
                             v_flex()
                                 .w_full()
@@ -1969,23 +1516,13 @@ impl Render for AppView {
         h_flex()
             .size_full()
             .text_color(theme.foreground)
-            .on_action(cx.listener(|this, _: &NewChat, window, cx| this.new_chat(this.agent, window, cx)))
-            .on_action(cx.listener(|this, _: &CloseChat, window, cx| this.close_chat(this.active, window, cx)))
-            .on_action(cx.listener(|this, _: &NextChat, window, cx| this.step(1, window, cx)))
-            .on_action(cx.listener(|this, _: &PreviousChat, window, cx| this.step(-1, window, cx)))
+            .on_action(cx.listener(|this, _: &NewTopic, window, cx| this.new_topic(window, cx)))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
-            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
-                window.focus(&this.search.focus_handle(cx), cx)
-            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
             }))
-            .on_action(cx.listener(|this, _: &ShowAllChats, _, cx| this.set_filter(None, cx)))
-            .on_action(cx.listener(|this, _: &ShowClaudeChats, _, cx| this.set_filter(Some(AgentKind::Claude), cx)))
-            .on_action(cx.listener(|this, _: &ShowCodexChats, _, cx| this.set_filter(Some(AgentKind::Codex), cx)))
             .when(self.sidebar_open, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
-            .child(self.render_list(&visible, cx))
             .child(
                 v_flex()
                     .flex_1()

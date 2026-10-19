@@ -25,3 +25,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Embed the icons in debug builds too. Without this, rust-embed reads them from the
 # crate source folder, and a copy of the app on another Mac shows no icons.
 rust-embed = { version = "8", features = ["debug-embed"] }
+# Hot patching with `dx serve --hot-patch`. See src/hotpatch.rs and scripts/hot.sh.
+subsecond = { version = "0.7.10", optional = true }
+dioxus-devtools = { version = "0.7.10", optional = true }
+async-channel = { version = "2", optional = true }
+
+[features]
+hotpatch = ["dep:subsecond", "dep:dioxus-devtools", "dep:async-channel"]

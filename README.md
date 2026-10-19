@@ -24,7 +24,7 @@ AgentDesk.app (GPUI)
 
 | Crate | Binary | Purpose |
 |---|---|---|
-| `crates/app` | `agent-desk` | GPUI window, chats, permission prompts, Agent Mac controls, bridge socket |
+| `crates/app` | `agent-desk` | GPUI window, the conversation, permission prompts, Agent Mac controls, bridge socket |
 | `crates/acp_host` | — | Starts an ACP agent and turns its updates into UI events |
 | `crates/vm` | — | Installs, starts, stops, and shows the macOS VM; vsock requests |
 | `crates/mcp_bridge` | `agent-desk-mcp` | MCP server with `vm_shell`, `vm_screenshot`, `vm_click`, `vm_type`, `vm_key`, ... |
