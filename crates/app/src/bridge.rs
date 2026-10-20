@@ -1,4 +1,4 @@
-//! The Unix socket server that the MCP bridge (`agent-desk-mcp`) connects to.
+//! The Unix socket server that the MCP bridge (`help-mcp`) connects to.
 //! Each request goes to the guest agent in the VM.
 
 use std::path::PathBuf;

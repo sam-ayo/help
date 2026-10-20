@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "agent-desk"
+name = "help"
 path = "src/main.rs"
 
 [dependencies]
@@ -25,10 +25,23 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Embed the icons in debug builds too. Without this, rust-embed reads them from the
 # crate source folder, and a copy of the app on another Mac shows no icons.
 rust-embed = { version = "8", features = ["debug-embed"] }
+async-channel = "2"
+# The frames of the moving avatar. The same version as in gpui. See src/ui/avatar.rs.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# The menu bar item and the Option-Space hotkey. See src/presence.rs.
+tray-icon = "0.26.1"
+global-hotkey = "0.9.0"
+# The avatar as the Dock icon. See src/ui/dock.rs.
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-app-kit = "0.3.2"
+# The updater. See src/updater.rs.
+ed25519-dalek = "2"
+base64.workspace = true
+libc = "0.2"
 # Hot patching with `dx serve --hot-patch`. See src/hotpatch.rs and scripts/hot.sh.
 subsecond = { version = "0.7.10", optional = true }
 dioxus-devtools = { version = "0.7.10", optional = true }
-async-channel = { version = "2", optional = true }
 
 [features]
-hotpatch = ["dep:subsecond", "dep:dioxus-devtools", "dep:async-channel"]
+hotpatch = ["dep:subsecond", "dep:dioxus-devtools"]

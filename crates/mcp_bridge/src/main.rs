@@ -1,7 +1,7 @@
 //! MCP server that the app gives to each ACP agent session.
 //!
 //! The agent runs on the user's Mac. These `vm_*` tools let it use its own Mac,
-//! a macOS VM. Each call goes to the app over a Unix socket (`AGENT_DESK_SOCKET`),
+//! a macOS VM. Each call goes to the app over a Unix socket (`HELP_SOCKET`),
 //! and the app sends it on to the guest agent in the VM.
 
 use std::path::PathBuf;
@@ -28,7 +28,7 @@ commands, vm_screenshot to see the screen, and vm_click / vm_type / vm_key / vm_
 vm_drag to use apps. Screenshot pixel coordinates are the same as click coordinates. Take \
 a new screenshot after each action that changes the screen. In the VM, the user's home \
 folder is mounted read-only at '/Volumes/My Shared Files/host-home', and the shared \
-workspace is at '/Volumes/My Shared Files/workspace' (on the user's Mac: ~/AgentDesk/workspace).";
+workspace is at '/Volumes/My Shared Files/workspace' (on the user's Mac: ~/Help/workspace).";
 
 #[derive(Clone)]
 struct Bridge {
@@ -123,7 +123,7 @@ fn text(s: impl Into<String>) -> Result<CallToolResult, McpError> {
 impl Bridge {
     async fn call(&self, op: Op) -> Result<Reply, McpError> {
         let mut stream = UnixStream::connect(&self.socket).await.map_err(|e| {
-            err(format!("cannot reach the Agent Desk app at {}: {e}", self.socket.display()))
+            err(format!("cannot reach the Help app at {}: {e}", self.socket.display()))
         })?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut line = serde_json::to_vec(&Request { id, op }).map_err(err)?;
@@ -243,14 +243,14 @@ impl Bridge {
 impl ServerHandler for Bridge {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("agent-desk", env!("CARGO_PKG_VERSION")))
+            .with_server_info(Implementation::new("help", env!("CARGO_PKG_VERSION")))
             .with_instructions(INSTRUCTIONS)
     }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let socket = std::env::var("AGENT_DESK_SOCKET")
+    let socket = std::env::var("HELP_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(|_| protocol_socket_default());
     let bridge = Bridge {
@@ -264,5 +264,5 @@ async fn main() -> anyhow::Result<()> {
 
 fn protocol_socket_default() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Library/Application Support/AgentDesk/bridge.sock")
+        .join("Library/Application Support/Help/bridge.sock")
 }

@@ -77,11 +77,14 @@ pub enum Event {
     },
     AgentText(String),
     Thought(String),
+    /// A tool call. `kind` is `"subagent"` when the agent delegates work to a subagent.
+    /// `parent` is the ID of the subagent tool call that made this tool call, if a subagent made it.
     ToolCall {
         id: String,
         title: String,
         kind: String,
         status: ToolStatus,
+        parent: Option<String>,
     },
     ToolUpdate {
         id: String,
@@ -196,6 +199,27 @@ fn id_string<T: serde::Serialize>(id: &T) -> String {
     }
 }
 
+/// The tool kind of a tool call that starts a subagent.
+pub const SUBAGENT_KIND: &str = "subagent";
+
+/// Claude Code reports the name of its tool in `_meta.claudeCode`.
+fn claude_meta<'a>(meta: Option<&'a Meta>, key: &str) -> Option<&'a str> {
+    meta?.get("claudeCode")?.get(key)?.as_str()
+}
+
+/// The tool call starts a subagent: the `Agent` or `Task` tool of Claude Code, or the
+/// `spawnAgent` tool of Codex.
+fn is_subagent(tc: &ToolCall) -> bool {
+    matches!(claude_meta(tc.meta.as_ref(), "toolName"), Some("Agent" | "Task")) || tc.title == "spawnAgent"
+}
+
+/// The activity and the name of a Codex subagent tool call: "Start subagent NAME",
+/// "Complete subagent NAME", or "Interrupt subagent NAME".
+fn codex_subagent(title: &str) -> Option<(&str, &str)> {
+    let (activity, name) = title.split_once(" subagent ")?;
+    matches!(activity, "Start" | "Complete" | "Interrupt").then_some((activity, name))
+}
+
 fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
     let event = match update {
         SessionUpdate::AgentMessageChunk(c) => match c.content {
@@ -206,11 +230,29 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
             ContentBlock::Text(t) => Event::Thought(t.text),
             _ => return,
         },
+        // Codex reports the start and the end of a subagent as two tool calls that each end at
+        // once. They become one subagent card, which works until the subagent completes.
+        SessionUpdate::ToolCall(tc) if codex_subagent(&tc.title).is_some() => {
+            let Some((activity, name)) = codex_subagent(&tc.title) else { return };
+            let id = format!("codex-subagent-{name}");
+            match activity {
+                "Start" => Event::ToolCall {
+                    id,
+                    title: name.to_string(),
+                    kind: SUBAGENT_KIND.into(),
+                    status: ToolStatus::Running,
+                    parent: None,
+                },
+                "Complete" => Event::ToolUpdate { id, title: None, status: Some(ToolStatus::Done), detail: None },
+                _ => Event::ToolUpdate { id, title: None, status: Some(ToolStatus::Failed), detail: None },
+            }
+        }
         SessionUpdate::ToolCall(tc) => Event::ToolCall {
             id: id_string(&tc.tool_call_id),
-            title: tc.title.clone(),
-            kind: format!("{:?}", tc.kind),
+            title: if tc.title == "spawnAgent" { "Subagent".into() } else { tc.title.clone() },
+            kind: if is_subagent(&tc) { SUBAGENT_KIND.into() } else { format!("{:?}", tc.kind) },
             status: status(tc.status),
+            parent: claude_meta(tc.meta.as_ref(), "parentToolUseId").map(String::from),
         },
         SessionUpdate::ToolCallUpdate(u) => Event::ToolUpdate {
             id: id_string(&u.tool_call_id),
@@ -247,7 +289,7 @@ async fn run(
     let perm_events = events.clone();
     Client
         .builder()
-        .name("agent-desk")
+        .name("help")
         .on_receive_notification(
             async move |n: SessionNotification, _cx: ConnectionTo<Agent>| {
                 on_update(n.update, &notif_events);
@@ -293,14 +335,14 @@ async fn run(
             cx.send_request(
                 InitializeRequest::new(ProtocolVersion::V1)
                     .client_capabilities(ClientCapabilities::new())
-                    .client_info(Implementation::new("agent-desk", env!("CARGO_PKG_VERSION"))),
+                    .client_info(Implementation::new("help", env!("CARGO_PKG_VERSION"))),
             )
             .block_task()
             .await?;
 
             let mcp = McpServer::Stdio(
-                McpServerStdio::new("agent-desk", bridge.command.clone()).env(vec![EnvVariable::new(
-                    "AGENT_DESK_SOCKET",
+                McpServerStdio::new("help", bridge.command.clone()).env(vec![EnvVariable::new(
+                    "HELP_SOCKET",
                     bridge.socket.to_string_lossy().to_string(),
                 )]),
             );

@@ -17,12 +17,12 @@ use base64::Engine;
 use protocol::{Op, Reply, Request, Response, ResponseBody};
 
 fn main() -> Result<()> {
-    let port = std::env::var("AGENT_DESK_PORT")
+    let port = std::env::var("HELP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(protocol::GUEST_AGENT_PORT);
     let listener = vsock::Listener::bind(port)?;
-    eprintln!("agent-desk-guest: listening on vsock port {port}");
+    eprintln!("help-guest: listening on vsock port {port}");
     let terminals = terminal::Terminals::default();
     loop {
         let stream = match listener.accept() {
@@ -186,14 +186,14 @@ fn run_capture(program: &str, args: &[&str]) -> Result<String> {
 /// screenshot pixel coordinates are the same as click coordinates.
 fn screenshot() -> Result<Reply> {
     let (width, height) = input::display_size_points();
-    let path = std::env::temp_dir().join(format!("agent-desk-shot-{}.png", std::process::id()));
+    let path = std::env::temp_dir().join(format!("help-shot-{}.png", std::process::id()));
     let path_str = path.to_string_lossy().to_string();
     let status = Command::new("/usr/sbin/screencapture")
         .args(["-x", "-C", "-t", "png", &path_str])
         .status()?;
     anyhow::ensure!(
         status.success(),
-        "screencapture failed. Give Screen Recording permission to agent-desk-guest in the VM."
+        "screencapture failed. Give Screen Recording permission to help-guest in the VM."
     );
     Command::new("/usr/bin/sips")
         .args(["-z", &height.to_string(), &width.to_string(), &path_str])

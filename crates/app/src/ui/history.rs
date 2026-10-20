@@ -1,5 +1,5 @@
 //! Keep the conversation in a file, so that it is there after the app starts again.
-//! A new agent session gets the earlier messages of the current topic with its first prompt.
+//! A new agent session gets the earlier messages with its first prompt.
 
 use std::{
     path::Path,
@@ -17,14 +17,21 @@ use super::{Chat, Item};
 /// The app keeps only this number of the newest items.
 const MAX_ITEMS: usize = 5_000;
 /// The earlier messages that a new session gets, in characters from the end.
-const MAX_CONTEXT: usize = 20_000;
+const MAX_CONTEXT: usize = 40_000;
+/// The app compacts the conversation when the messages after the last compaction have this
+/// number of characters.
+pub const COMPACT_AT: usize = 30_000;
+/// A new session gets at least this number of characters of the newest messages, also when the
+/// summary has them, so that it knows what the user and the agent said last.
+const RECENT: usize = 6_000;
+/// The new messages that a compaction gets, in characters from the end.
+const MAX_COMPACT: usize = 80_000;
 /// The app keeps this number of characters of a tool output. The chat shows no more.
 const MAX_DETAIL: usize = 4_000;
 
 /// A chat in the file of an older version of the app, which had many chats.
 #[derive(Deserialize)]
 struct LegacyChat {
-    title: String,
     updated: i64,
     items: Vec<SavedItem>,
 }
@@ -32,14 +39,32 @@ struct LegacyChat {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SavedItem {
-    User { text: String },
+    User {
+        text: String,
+        /// An older version of the app kept no time.
+        #[serde(default)]
+        at: i64,
+    },
     Agent { text: String },
     Thought { text: String },
-    Tool { title: String, kind: String, status: String, detail: Option<String> },
+    Tool {
+        title: String,
+        kind: String,
+        status: String,
+        detail: Option<String>,
+        /// An older version of the app kept no ID and no parent.
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        parent: Option<String>,
+    },
     Plan { entries: Vec<(String, String)> },
     Notice { text: String },
     Error { text: String },
-    Topic { title: String },
+    Compacted {},
+    /// An older version of the app had topics. The app reads them and drops them.
+    #[allow(dead_code)]
+    Topic {},
 }
 
 fn status_key(s: ToolStatus) -> &'static str {
@@ -63,10 +88,12 @@ fn status_from_key(s: &str) -> ToolStatus {
 
 fn save_item(item: &Item) -> SavedItem {
     match item {
-        Item::User(text) => SavedItem::User { text: text.clone() },
+        Item::User { text, at } => SavedItem::User { text: text.clone(), at: *at },
         Item::Agent(text) => SavedItem::Agent { text: text.clone() },
         Item::Thought(text) => SavedItem::Thought { text: text.clone() },
-        Item::Tool { title, kind, status, detail, .. } => SavedItem::Tool {
+        Item::Tool { id, title, kind, status, detail, parent } => SavedItem::Tool {
+            id: Some(id.clone()),
+            parent: parent.clone(),
             title: title.clone(),
             kind: kind.clone(),
             status: status_key(*status).into(),
@@ -77,17 +104,18 @@ fn save_item(item: &Item) -> SavedItem {
         },
         Item::Notice(text) => SavedItem::Notice { text: text.clone() },
         Item::Error(text) => SavedItem::Error { text: text.clone() },
-        Item::Topic(title) => SavedItem::Topic { title: title.clone() },
+        Item::Compacted => SavedItem::Compacted {},
     }
 }
 
-fn load_item(item: SavedItem, ix: usize) -> Item {
-    match item {
-        SavedItem::User { text } => Item::User(text),
+fn load_item(item: SavedItem, ix: usize) -> Option<Item> {
+    Some(match item {
+        SavedItem::User { text, at } => Item::User { text, at },
         SavedItem::Agent { text } => Item::Agent(text),
         SavedItem::Thought { text } => Item::Thought(text),
-        SavedItem::Tool { title, kind, status, detail } => Item::Tool {
-            id: format!("saved-{ix}"),
+        SavedItem::Tool { title, kind, status, detail, id, parent } => Item::Tool {
+            id: id.unwrap_or_else(|| format!("saved-{ix}")),
+            parent,
             title,
             kind,
             status: status_from_key(&status),
@@ -98,8 +126,9 @@ fn load_item(item: SavedItem, ix: usize) -> Item {
         }
         SavedItem::Notice { text } => Item::Notice(text),
         SavedItem::Error { text } => Item::Error(text),
-        SavedItem::Topic { title } => Item::Topic(title),
-    }
+        SavedItem::Compacted {} => Item::Compacted,
+        SavedItem::Topic {} => return None,
+    })
 }
 
 /// The items to write, made on the UI thread. `write` does the slow part on a different thread.
@@ -159,8 +188,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 /// Read the conversation from `path`. If that file is not there, read the chats of an older
-/// version of the app from `legacy`: the oldest chat comes first, and each chat starts a topic
-/// with its title.
+/// version of the app from `legacy`: the oldest chat comes first.
 pub fn load(path: &Path, legacy: &Path) -> Vec<Item> {
     let saved: Vec<SavedItem> = if path.exists() {
         read_json(path).unwrap_or_default()
@@ -169,37 +197,82 @@ pub fn load(path: &Path, legacy: &Path) -> Vec<Item> {
         chats.sort_by_key(|c| c.updated);
         chats
             .into_iter()
-            .flat_map(|c| std::iter::once(SavedItem::Topic { title: c.title }).chain(c.items))
+            .flat_map(|c| c.items)
             .collect()
     };
-    saved.into_iter().enumerate().map(|(ix, i)| load_item(i, ix)).collect()
+    saved.into_iter().enumerate().filter_map(|(ix, i)| load_item(i, ix)).collect()
 }
 
-/// The first prompt of a new session: the earlier messages of the topic, then the new one.
-pub fn prompt_with_context(chat: &Chat, text: &str) -> String {
-    let mut transcript = String::new();
-    for item in chat.topic_items() {
-        match item {
-            Item::User(t) => transcript.push_str(&format!("User: {t}\n\n")),
-            Item::Agent(t) => transcript.push_str(&format!("Assistant: {t}\n\n")),
-            _ => {}
-        }
+/// The user messages and the replies of the agent, one entry for each item. The other items
+/// have no entry.
+fn transcript(items: &[Item]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Item::User { text, at } => Some(match chrono::DateTime::from_timestamp(*at, 0) {
+                Some(t) if *at > 0 => format!("User ({}): {text}\n\n", t.format("%Y-%m-%d %H:%M UTC")),
+                _ => format!("User: {text}\n\n"),
+            }),
+            Item::Agent(text) => Some(format!("Assistant: {text}\n\n")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The index of the first item after the last compaction.
+fn compacted_until(items: &[Item]) -> usize {
+    items.iter().rposition(|i| matches!(i, Item::Compacted)).map_or(0, |ix| ix + 1)
+}
+
+/// Keep the last `max` characters of `text`.
+fn keep_end(text: String, max: usize) -> String {
+    if text.len() <= max {
+        return text;
     }
-    if transcript.is_empty() {
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("[The start of the conversation is not included.]\n\n{}", &text[start..])
+}
+
+/// The messages that the summary does not have yet.
+pub fn uncompacted(chat: &Chat) -> String {
+    keep_end(transcript(&chat.items[compacted_until(&chat.items)..]).concat(), MAX_COMPACT)
+}
+
+/// The conversation is long enough to compact.
+pub fn needs_compaction(chat: &Chat) -> bool {
+    transcript(&chat.items[compacted_until(&chat.items)..]).iter().map(String::len).sum::<usize>() >= COMPACT_AT
+}
+
+/// The first prompt of a new session: the earlier messages, then the new one. After a
+/// compaction the session gets the summary in the preamble, so it gets only the messages after
+/// the compaction, and the newest messages before it.
+pub fn prompt_with_context(chat: &Chat, text: &str) -> String {
+    let until = compacted_until(&chat.items);
+    let mut before = transcript(&chat.items[..until]);
+    let mut entries = transcript(&chat.items[until..]);
+    let summarized = until > 0;
+    let mut recent: usize = entries.iter().map(String::len).sum();
+    while recent < RECENT
+        && let Some(entry) = before.pop()
+    {
+        recent += entry.len();
+        entries.insert(0, entry);
+    }
+    if entries.is_empty() {
         return text.to_string();
     }
-    if transcript.len() > MAX_CONTEXT {
-        let mut start = transcript.len() - MAX_CONTEXT;
-        while !transcript.is_char_boundary(start) {
-            start += 1;
-        }
-        transcript = format!("[The start of the conversation is not included.]\n\n{}", &transcript[start..]);
-    }
-    format!(
+    let transcript = keep_end(entries.concat(), MAX_CONTEXT);
+    let intro = if summarized {
+        "This message continues an earlier conversation with a different session. The summary \
+         above has the start of the conversation. The newest messages of the conversation:"
+    } else {
         "This message continues an earlier conversation with a different session. \
-         The earlier conversation:\n\n<conversation>\n{}</conversation>\n\nThe new message:\n\n{text}",
-        transcript
-    )
+         The earlier conversation:"
+    };
+    format!("{intro}\n\n<conversation>\n{transcript}</conversation>\n\nThe new message:\n\n{text}")
 }
 
 #[cfg(test)]
@@ -215,7 +288,7 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("agent-desk-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("help-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -226,16 +299,16 @@ mod tests {
         let path = dir.join("conversation.json");
         let legacy = dir.join("chats.json");
         let c = chat(vec![
-            Item::User("hello".into()),
+            Item::User { text: "hello".into(), at: 1_700_000_000 },
             Item::Tool {
                 id: "x".into(),
                 title: "ls".into(),
                 kind: "execute".into(),
                 status: ToolStatus::Running,
                 detail: Some("out".into()),
+                parent: Some("task".into()),
             },
             Item::Plan(vec![("step".into(), ToolStatus::Done), ("next".into(), ToolStatus::Pending)]),
-            Item::Topic(String::new()),
         ]);
         write(&path, snapshot(&c));
         // An older snapshot does not replace a newer one.
@@ -250,15 +323,14 @@ mod tests {
         assert!(!path.exists() && dir.join("conversation.json.bad").exists());
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.len(), 4);
-        assert!(matches!(&loaded[0], Item::User(t) if t == "hello"));
-        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), .. } if d == "out"));
+        assert_eq!(loaded.len(), 3);
+        assert!(matches!(&loaded[0], Item::User { text, at: 1_700_000_000 } if text == "hello"));
+        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), parent: Some(p), .. } if d == "out" && p == "task"));
         assert!(matches!(&loaded[2], Item::Plan(p) if p[0].1 == ToolStatus::Done && p[1].1 == ToolStatus::Pending));
-        assert!(matches!(&loaded[3], Item::Topic(t) if t.is_empty()));
     }
 
     #[test]
-    fn old_chats_become_topics() {
+    fn old_chats_become_one_conversation() {
         let dir = temp_dir("legacy");
         let path = dir.join("conversation.json");
         let legacy = dir.join("chats.json");
@@ -271,25 +343,55 @@ mod tests {
         let loaded = load(&path, &legacy);
         std::fs::remove_dir_all(&dir).unwrap();
 
-        assert_eq!(loaded.len(), 4);
-        assert!(matches!(&loaded[0], Item::Topic(t) if t == "Older"));
-        assert!(matches!(&loaded[1], Item::User(t) if t == "a"));
-        assert!(matches!(&loaded[2], Item::Topic(t) if t == "Newer"));
-        assert!(matches!(&loaded[3], Item::User(t) if t == "b"));
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(&loaded[0], Item::User { text, at: 0 } if text == "a"));
+        assert!(matches!(&loaded[1], Item::User { text, .. } if text == "b"));
     }
 
     #[test]
-    fn context_has_the_earlier_messages_of_the_topic() {
-        let c = chat(vec![
-            Item::User("old".into()),
-            Item::Topic(String::new()),
-            Item::User("first".into()),
-            Item::Agent("answer".into()),
-        ]);
+    fn a_file_with_topics_loads_without_them() {
+        let dir = temp_dir("topics");
+        let path = dir.join("conversation.json");
+        std::fs::write(&path, r#"[{"type":"user","text":"a"},{"type":"topic","title":"Old"},{"type":"user","text":"b"}]"#)
+            .unwrap();
+        let loaded = load(&path, &dir.join("chats.json"));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(loaded.len(), 2);
+        assert!(matches!(&loaded[1], Item::User { text, .. } if text == "b"));
+    }
+
+    #[test]
+    fn context_has_the_earlier_messages() {
+        let c = chat(vec![Item::User { text: "first".into(), at: 0 }, Item::Agent("answer".into())]);
         let prompt = prompt_with_context(&c, "second");
         assert!(prompt.contains("User: first") && prompt.contains("Assistant: answer"));
-        assert!(!prompt.contains("old"));
         assert!(prompt.ends_with("second"));
         assert_eq!(prompt_with_context(&chat(vec![]), "only"), "only");
+    }
+
+    #[test]
+    fn compaction_keeps_the_new_messages_and_the_newest_old_ones() {
+        let long = "x".repeat(COMPACT_AT);
+        let mut c = chat(vec![Item::User { text: "old".into(), at: 0 }, Item::Agent(long.clone())]);
+        assert!(needs_compaction(&c));
+        assert!(uncompacted(&c).contains("User: old"));
+
+        c.items.push(Item::Compacted);
+        assert!(!needs_compaction(&c));
+        assert_eq!(uncompacted(&c), "");
+        // The long reply is the newest message, so a new session gets it, but not the old message.
+        let prompt = prompt_with_context(&c, "next");
+        assert!(prompt.contains("summary above") && prompt.contains(&long) && !prompt.contains("User: old"));
+
+        c.items.push(Item::User { text: "new".into(), at: 1_700_000_000 });
+        assert!(uncompacted(&c).starts_with("User (2023-11-14 22:13 UTC): new"));
+
+        // The marker stays in the file. `write` is not used here: its order check is global, so
+        // a test that runs at the same time could skip its write.
+        let json = serde_json::to_string(&save_item(&Item::Compacted)).unwrap();
+        assert_eq!(json, r#"{"type":"compacted"}"#);
+        let saved: SavedItem = serde_json::from_str(&json).unwrap();
+        assert!(matches!(load_item(saved, 0), Some(Item::Compacted)));
     }
 }

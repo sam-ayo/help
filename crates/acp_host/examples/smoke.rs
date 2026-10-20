@@ -1,5 +1,5 @@
 //! Headless test: start an agent, send one prompt, print the events.
-//! Usage: cargo run -p acp_host --example smoke -- claude|codex
+//! Usage: cargo run -p acp_host --example smoke -- claude|codex [prompt]
 
 use acp_host::{AgentKind, BridgeConfig, Command, Event};
 
@@ -11,8 +11,8 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let exe_dir = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().to_path_buf();
     let bridge = BridgeConfig {
-        command: exe_dir.join("agent-desk-mcp"),
-        socket: "/tmp/agent-desk-smoke.sock".into(),
+        command: exe_dir.join("help-mcp"),
+        socket: "/tmp/help-smoke.sock".into(),
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let session = acp_host::start(rt.handle(), kind, std::env::temp_dir(), bridge, tx);
@@ -21,9 +21,11 @@ fn main() {
             match ev {
                 Event::Ready { current_mode } => {
                     println!("READY mode={current_mode:?}");
-                    session.send(Command::Prompt(
-                        "Call the agent-desk vm_status tool once, then reply with the word PONG and the tool's result in one line.".into(),
-                    ));
+                    let prompt = std::env::args().nth(2).unwrap_or_else(|| {
+                        "Call the help vm_status tool once, then reply with the word PONG and the tool's result in one line."
+                            .into()
+                    });
+                    session.send(Command::Prompt(prompt));
                 }
                 Event::Permission { title, options, reply } => {
                     println!("PERMISSION {title} -> {}", options[0].name);

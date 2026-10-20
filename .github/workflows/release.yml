@@ -1,0 +1,137 @@
+# Builds a release when a tag such as v0.2.0 is pushed, and publishes it to the public
+# releases repository. The app looks for updates there.
+#
+# A run on a tag cannot use the cache of a different tag. It can use the cache of main.
+# Thus a push to main that changes the dependencies runs only the compile step, and saves
+# the cache for the next tag. To make this cache manually, run this workflow on main from
+# the Actions tab.
+#
+# Secrets:
+#   UPDATE_SIGNING_KEY: the PEM text of the Ed25519 release key.
+#   RELEASES_TOKEN: a token that can write the contents of sam-ayo/help-releases.
+#   MACOS_CERTIFICATES_P12: the base64 text of a .p12 file with the "Developer ID
+#     Application" certificate and its private key.
+#   MACOS_CERTIFICATES_PASSWORD: the password of the .p12 file.
+#   NOTARY_API_KEY: the text of the App Store Connect API key (.p8 file).
+#   NOTARY_API_KEY_ID: the key ID of the API key.
+#   NOTARY_API_ISSUER: the issuer ID of the API key.
+#
+# The message of an annotated tag becomes the release notes, which the update alert shows.
+#
+# The tag sets the version. The build writes it into Cargo.toml before it compiles, so
+# Cargo.toml in the repository does not need a change.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    # GitHub does not use these paths for tags.
+    paths:
+      - Cargo.lock
+      - Cargo.toml
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+jobs:
+  release:
+    # An Apple silicon runner. Help runs only on Apple silicon.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set the version from the tag
+        if: github.ref_type == 'tag'
+        run: scripts/set-version.sh "${GITHUB_REF_NAME#v}"
+
+      # Only main saves the cache, because other refs cannot use it.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compile
+        if: github.ref_type != 'tag'
+        run: cargo build --release
+
+      # The keychain is temporary. A later step deletes it.
+      - name: Install the certificate
+        if: github.ref_type == 'tag'
+        env:
+          MACOS_CERTIFICATES_P12: ${{ secrets.MACOS_CERTIFICATES_P12 }}
+          MACOS_CERTIFICATES_PASSWORD: ${{ secrets.MACOS_CERTIFICATES_PASSWORD }}
+          NOTARY_API_KEY: ${{ secrets.NOTARY_API_KEY }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -base64 24)"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+
+          printf '%s' "$MACOS_CERTIFICATES_P12" | base64 --decode > "$RUNNER_TEMP/certificates.p12"
+          security import "$RUNNER_TEMP/certificates.p12" -k "$keychain" \
+            -P "$MACOS_CERTIFICATES_PASSWORD" -T /usr/bin/codesign
+          rm "$RUNNER_TEMP/certificates.p12"
+          # The certificate needs the Developer ID intermediate certificate.
+          curl -fsSL -o "$RUNNER_TEMP/DeveloperIDG2CA.cer" \
+            https://www.apple.com/certificateauthority/DeveloperIDG2CA.cer
+          security import "$RUNNER_TEMP/DeveloperIDG2CA.cer" -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" > /dev/null
+          # Each keychain in the list must be a separate argument.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$keychain" \
+            $(security list-keychains -d user | tr -d '"')
+
+          # Give the full name to the package script.
+          application="$(security find-identity -v -p codesigning "$keychain" \
+            | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          if [ -z "$application" ]; then
+            echo "The .p12 file must have the Developer ID Application certificate." >&2
+            security find-identity -v "$keychain" >&2
+            exit 1
+          fi
+          echo "CODESIGN_IDENTITY=$application" >> "$GITHUB_ENV"
+
+          (umask 077; printf '%s\n' "$NOTARY_API_KEY" > "$RUNNER_TEMP/notary-key.p8")
+          echo "NOTARY_KEY_FILE=$RUNNER_TEMP/notary-key.p8" >> "$GITHUB_ENV"
+
+      - name: Build, sign, and notarize
+        if: github.ref_type == 'tag'
+        env:
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_API_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_API_ISSUER }}
+        run: scripts/package.sh
+
+      - name: Delete the certificate
+        if: always() && github.ref_type == 'tag'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/notary-key.p8"
+
+      - name: Get the release notes
+        if: github.ref_type == 'tag'
+        run: |
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git tag -l --format='%(contents)' "$GITHUB_REF_NAME" > "$RUNNER_TEMP/notes.txt"
+
+      - name: Sign the update
+        if: github.ref_type == 'tag'
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
+          mkdir release-files
+          cp target/package/help-*.dmg target/package/help-*.zip release-files/
+          scripts/sign-release.sh release-files "$RUNNER_TEMP/notes.txt"
+
+      - name: Publish
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" release-files/* \
+            --repo sam-ayo/help-releases \
+            --title "Help $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.txt"

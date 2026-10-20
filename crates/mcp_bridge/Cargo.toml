@@ -4,7 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [[bin]]
-name = "agent-desk-mcp"
+name = "help-mcp"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-# Agent Desk
+# Help
 
 A desktop app, written in Rust with GPUI, to talk to coding agents through the
 Agent Client Protocol (ACP):
@@ -14,21 +14,21 @@ otherwise take over your screen.
 ## Architecture
 
 ```
-AgentDesk.app (GPUI)
+Help.app (GPUI)
  ├─ acp_host ── ACP over stdio ──> claude-agent-acp / codex-acp (on this Mac)
- │                                   └─ MCP stdio ──> agent-desk-mcp (vm_* tools)
+ │                                   └─ MCP stdio ──> help-mcp (vm_* tools)
  ├─ bridge.sock  <───── Unix socket ───────────────────┘
  └─ vm (Virtualization.framework)
-      └─ vsock port 7000 ──> agent-desk-guest (inside the agent Mac)
+      └─ vsock port 7000 ──> help-guest (inside the agent Mac)
 ```
 
 | Crate | Binary | Purpose |
 |---|---|---|
-| `crates/app` | `agent-desk` | GPUI window, the conversation, permission prompts, Agent Mac controls, bridge socket |
+| `crates/app` | `help` | GPUI window, the conversation, menu bar item and hotkey, memory, permission prompts, Agent Mac controls, bridge socket |
 | `crates/acp_host` | — | Starts an ACP agent and turns its updates into UI events |
 | `crates/vm` | — | Installs, starts, stops, and shows the macOS VM; vsock requests |
-| `crates/mcp_bridge` | `agent-desk-mcp` | MCP server with `vm_shell`, `vm_screenshot`, `vm_click`, `vm_type`, `vm_key`, ... |
-| `crates/guest_agent` | `agent-desk-guest` | Runs in the VM: shell, files, screenshots, mouse and keyboard input |
+| `crates/mcp_bridge` | `help-mcp` | MCP server with `vm_shell`, `vm_screenshot`, `vm_click`, `vm_type`, `vm_key`, ... |
+| `crates/guest_agent` | `help-guest` | Runs in the VM: shell, files, screenshots, mouse and keyboard input |
 | `crates/protocol` | — | JSON-lines messages between the host and the guest |
 
 ### Shared folders in the agent Mac
@@ -36,8 +36,8 @@ AgentDesk.app (GPUI)
 | In the VM | On this Mac | Access |
 |---|---|---|
 | `/Volumes/My Shared Files/host-home` | your home folder | read-only |
-| `/Volumes/My Shared Files/workspace` | `~/AgentDesk/workspace` | read-write |
-| `/Volumes/My Shared Files/tools` | `~/Library/Application Support/AgentDesk/tools` | read-only |
+| `/Volumes/My Shared Files/workspace` | `~/Help/workspace` | read-write |
+| `/Volumes/My Shared Files/tools` | `~/Library/Application Support/Help/tools` | read-only |
 
 ## Requirements
 
@@ -48,29 +48,45 @@ AgentDesk.app (GPUI)
 ## Build and run
 
 ```sh
-scripts/bundle.sh            # builds target/debug/AgentDesk.app (signed)
-open target/debug/AgentDesk.app
+scripts/bundle.sh            # builds target/debug/Help.app (signed)
+open target/debug/Help.app
 ```
 
 `cargo run -p app` also works. The Cargo runner (`scripts/sign-and-run.sh`)
 signs the binary with the `com.apple.security.virtualization` entitlement,
 because Virtualization.framework does not create a VM without it.
 
+## Your assistant, always there
+
+- **Option-Space** shows the window from any app. Push it again to hide the window.
+- The app has an item in the menu bar: open the window or quit.
+- A close of the window (or Cmd-W) hides the app. The agent keeps its session.
+  To stop the app, use Cmd-Q or **Quit Help** in the menu bar item.
+- **Memory** in the sidebar opens `~/Library/Application Support/Help/memory.md`.
+  Each new session reads this file. The agent adds facts about you to it, and you
+  can change it.
+- **History** in the sidebar opens `~/Library/Application Support/Help/help-memory.md`.
+  This file has a summary of the earlier conversation. When the messages after the
+  last compaction have about 30,000 characters, the app compacts the conversation:
+  the agent writes a new summary, the app saves it to this file, and a new session
+  starts with the summary and the newest messages. Send `/compact` to compact the
+  conversation now.
+
 ## Set up the agent Mac (one time)
 
 1. In the app, click **Install macOS**. The app downloads the latest supported
    restore image (about 15 GB) and installs it. The disk is a 96 GB sparse file
-   in `~/Library/Application Support/AgentDesk/vm`.
+   in `~/Library/Application Support/Help/vm`.
 2. Click **Start**, then **Show screen**. Complete the macOS Setup Assistant.
 3. In the VM, open Terminal and run:
    ```sh
    zsh "/Volumes/My Shared Files/tools/install.sh"
    ```
 4. In the VM, open System Settings > Privacy & Security. Allow
-   `agent-desk-guest` in **Accessibility** and in **Screen & System Audio
+   `help-guest` in **Accessibility** and in **Screen & System Audio
    Recording**. Then run:
    ```sh
-   launchctl kickstart -k gui/$(id -u)/com.agentdesk.guest
+   launchctl kickstart -k gui/$(id -u)/com.help.guest
    ```
 5. Ask the agent: "Use your Mac to check its macOS version." It calls `vm_status`.
 
@@ -89,9 +105,36 @@ cargo build && cargo run -p acp_host --example smoke -- claude
 cargo run -p acp_host --example smoke -- codex
 ```
 
+## Release
+
+Push a tag such as `v0.2.0`. The workflow in `.github/workflows/release.yml` then:
+
+1. Sets the version from the tag (`scripts/set-version.sh`).
+2. Builds `Help.app`, signs it with the Developer ID certificate, and notarizes it
+   (`scripts/package.sh`).
+3. Makes `help-<version>.dmg` and `help-<version>.zip`.
+4. Signs the zip archive with the update key, and writes `latest.json`
+   (`scripts/sign-release.sh`).
+5. Publishes the files to `sam-ayo/help-releases`.
+
+The message of an annotated tag becomes the release notes:
+
+```sh
+git tag -a v0.2.0 -m "Add the updater."
+git push origin v0.2.0
+```
+
+To install, open the disk image and drag Help to Applications. A copy of Help in
+an Applications folder looks for updates at start and each 6 hours. **Check for
+Updates…** in the menu bar item starts a check now.
+
+`scripts/release.sh` makes the same files on this Mac, in `target/release-files`.
+The update key is in `~/.config/help/update-signing-key.pem`. Keep a backup copy
+of it. Without this key, the installed apps cannot accept new updates.
+
 ## Not done yet
 
-- Always-on features: a background daemon, a menu bar icon, a global hotkey, voice, and schedules.
-- Saved chat history across app restarts.
+- Start at login, notifications, voice, and schedules.
+- A setting to change the hotkey.
 - Image (screenshot) display in the chat.
 - Model selection (ACP config options).

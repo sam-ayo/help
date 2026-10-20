@@ -17,3 +17,14 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 base64 = "0.22"
+
+# The avatar renders 180 frames of a blurred SVG at startup (crates/app/src/ui/avatar.rs).
+# Without optimization, that takes about 13 seconds in a debug build.
+[profile.dev.package.tiny-skia]
+opt-level = 3
+[profile.dev.package.tiny-skia-path]
+opt-level = 3
+[profile.dev.package.resvg]
+opt-level = 3
+[profile.dev.package.usvg]
+opt-level = 3

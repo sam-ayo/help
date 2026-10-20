@@ -1,11 +1,13 @@
-//! Agent Desk: a desktop app to talk to Claude Code and Codex through ACP.
+//! Help: a desktop app to talk to Claude Code and Codex through ACP.
 //! The agents run on this Mac. They can also use their own Mac, a macOS VM.
 
 mod bridge;
 mod hotpatch;
+mod presence;
 mod shadcn_themes;
 mod theme;
 mod ui;
+mod updater;
 
 use std::path::{Path, PathBuf};
 
@@ -31,11 +33,34 @@ pub struct Env {
     pub chats_file: PathBuf,
     /// The folder that the user picked last.
     pub folder_file: PathBuf,
+    /// What the assistant knows about the user. Each new session reads it.
+    pub memory_file: PathBuf,
+    /// The summary of the earlier conversation, from the last compaction. Each new session reads it.
+    pub history_file: PathBuf,
+    /// The colors of the avatar that the user picked.
+    pub avatar_file: PathBuf,
 }
 
 fn app_support() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join("Library/Application Support/AgentDesk")
+        .join("Library/Application Support/Help")
+}
+
+/// The app had the name Agent Desk before. Move its folders to the new names once,
+/// so that the VM, the conversation, and the memory stay.
+fn move_old_folders() {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
+    for (old, new) in [
+        ("Library/Application Support/AgentDesk", "Library/Application Support/Help"),
+        ("AgentDesk", "Help"),
+    ] {
+        let (old, new) = (home.join(old), home.join(new));
+        if old.exists() && !new.exists() {
+            if let Err(e) = std::fs::rename(&old, &new) {
+                tracing::warn!("cannot move {} to {}: {e}", old.display(), new.display());
+            }
+        }
+    }
 }
 
 /// An app that starts from Finder gets a short PATH. Use the login shell PATH,
@@ -57,9 +82,9 @@ fn load_login_path() {
 /// Put the guest agent and its install script in the folder that the VM sees.
 fn stage_guest_tools(exe_dir: &Path, tools: &Path) {
     let _ = std::fs::create_dir_all(tools);
-    let guest = exe_dir.join("agent-desk-guest");
+    let guest = exe_dir.join("help-guest");
     if guest.exists() {
-        if let Err(e) = std::fs::copy(&guest, tools.join("agent-desk-guest")) {
+        if let Err(e) = std::fs::copy(&guest, tools.join("help-guest")) {
             tracing::warn!("cannot copy the guest agent: {e}");
         }
     } else {
@@ -83,11 +108,18 @@ fn main() {
         .init();
     load_login_path();
 
+    move_old_folders();
     let support = app_support();
     let _ = std::fs::create_dir_all(&support);
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
+    // The guest agent and the MCP bridge are next to the app. `scripts/hot.sh` runs the app
+    // from a bundle that does not have them, so it sets HELP_HELPERS.
+    let exe_dir = std::env::var_os("HELP_HELPERS")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(Path::to_path_buf))
+        })
         .unwrap_or_default();
 
     let paths = vm::Paths::under(&support);
@@ -110,7 +142,7 @@ fn main() {
         runtime: handle,
         mac,
         bridge: acp_host::BridgeConfig {
-            command: exe_dir.join("agent-desk-mcp"),
+            command: exe_dir.join("help-mcp"),
             socket,
         },
         workspace: PathBuf::from(std::env::var("HOME").unwrap_or_default()),
@@ -118,49 +150,53 @@ fn main() {
         conversation_file: support.join("conversation.json"),
         chats_file: support.join("chats.json"),
         folder_file: support.join("folder"),
+        memory_file: support.join("memory.md"),
+        history_file: support.join("help-memory.md"),
+        avatar_file: support.join("avatar"),
     };
 
-    gpui_platform::application()
-        .with_assets(gpui_kit_assets::AllAssets)
-        .run(move |cx: &mut App| {
-            gpui_component::init(cx);
-            hotpatch::connect(cx);
-            cx.bind_keys([
-                KeyBinding::new("cmd-n", ui::NewTopic, None),
-                KeyBinding::new("cmd-.", ui::StopAgent, None),
-                KeyBinding::new("cmd-ctrl-s", ui::ToggleSidebar, None),
-            ]);
-            cx.set_global(theme::ThemeChoice::load(support.join("theme")));
-            theme::apply(None, cx);
-            cx.on_window_closed(|cx, _| {
-                if cx.windows().is_empty() {
-                    cx.quit()
-                }
-            })
-            .detach();
+    let app = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
+    // A click on the Dock icon shows the hidden window.
+    app.on_reopen(presence::show);
+    app.run(move |cx: &mut App| {
+        gpui_component::init(cx);
+        hotpatch::connect(cx);
+        cx.bind_keys([
+            KeyBinding::new("cmd-.", ui::StopAgent, None),
+            KeyBinding::new("cmd-ctrl-s", ui::ToggleSidebar, None),
+            KeyBinding::new("cmd-w", presence::HideWindow, None),
+            KeyBinding::new("cmd-q", presence::Quit, None),
+        ]);
+        cx.set_global(theme::ThemeChoice::load(support.join("theme")));
+        theme::apply(None, cx);
 
-            let bounds = Bounds::centered(None, size(px(1100.), px(800.)), cx);
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Agent Desk".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(18.), px(18.))),
-                }),
-                // The toolbars move the window. See `AppView::toolbar`.
-                app_owns_titlebar_drag: true,
-                window_background: WindowBackgroundAppearance::Blurred,
-                window_min_size: Some(size(px(640.), px(480.))),
-                ..Default::default()
-            };
-            cx.open_window(options, |window, cx| {
+        let bounds = Bounds::centered(None, size(px(1100.), px(800.)), cx);
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Help".into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(18.), px(18.))),
+            }),
+            // The toolbars move the window. See `AppView::toolbar`.
+            app_owns_titlebar_drag: true,
+            window_background: WindowBackgroundAppearance::Blurred,
+            window_min_size: Some(size(px(640.), px(480.))),
+            ..Default::default()
+        };
+        let mut app_view = None;
+        let window = cx
+            .open_window(options, |window, cx| {
                 window
                     .observe_window_appearance(|window, cx| theme::apply(Some(window), cx))
                     .detach();
                 let view = cx.new(|cx| ui::AppView::new(env, window, cx));
+                app_view = Some(view.clone());
                 cx.new(|cx| Root::new(view, window, cx))
             })
             .expect("open window");
-            cx.activate(true);
-        });
+        presence::install(window, app_view.expect("the window has a view"), cx);
+        updater::init(cx);
+        cx.activate(true);
+    });
 }

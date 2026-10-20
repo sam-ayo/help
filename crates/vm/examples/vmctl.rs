@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 fn main() {
     let cmd = std::env::args().nth(1).unwrap_or_else(|| "info".into());
-    let support = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/AgentDesk");
+    let support = PathBuf::from(std::env::var("HOME").unwrap()).join("Library/Application Support/Help");
     let mac = vm::AgentMac::new(vm::Paths::under(&support));
     std::thread::spawn(move || {
         let code = match run(&cmd, &mac) {

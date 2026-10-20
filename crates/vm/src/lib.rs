@@ -87,7 +87,7 @@ impl Paths {
         let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
         Self {
             bundle: app_support.join("vm"),
-            workspace: home.join("AgentDesk/workspace"),
+            workspace: home.join("Help/workspace"),
             tools: app_support.join("tools"),
         }
     }
@@ -327,13 +327,13 @@ impl AgentMac {
             })
         });
         if !started {
-            bail!("the agent Mac is not running. Start it in Agent Desk first.");
+            bail!("the agent Mac is not running. Start it in Help first.");
         }
         rx.recv_timeout(Duration::from_secs(5))
             .map_err(|_| {
                 anyhow!(
                     "the guest agent did not answer on vsock port {port}. \
-                     Install agent-desk-guest in the VM (see the setup steps)."
+                     Install help-guest in the VM (see the setup steps)."
                 )
             })?
             .map_err(|e| anyhow!(e))

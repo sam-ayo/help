@@ -1,4 +1,4 @@
-//! The color themes: the Agent Desk rose palette and the shadcn/ui themes.
+//! The color themes: the Help rose palette and the shadcn/ui themes.
 //! A theme is a base color, an optional accent color, and an appearance.
 
 use std::path::PathBuf;
@@ -28,9 +28,9 @@ impl ThemeDef {
 }
 
 /// The default base color: a warm rose palette with a pink accent.
-const AGENT_DESK: ThemeDef = ThemeDef {
-    key: "agent-desk",
-    title: "Agent Desk",
+const HELP: ThemeDef = ThemeDef {
+    key: "help",
+    title: "Help",
     light: &[
         ("background", 0xfdf9faff),
         ("foreground", 0x1f1a1cff),
@@ -83,9 +83,9 @@ const AGENT_DESK: ThemeDef = ThemeDef {
     ],
 };
 
-/// All the base colors: Agent Desk first, then the shadcn/ui base colors.
+/// All the base colors: Help first, then the shadcn/ui base colors.
 pub fn bases() -> impl Iterator<Item = &'static ThemeDef> {
-    std::iter::once(&AGENT_DESK).chain(shadcn_themes::BASES)
+    std::iter::once(&HELP).chain(shadcn_themes::BASES)
 }
 
 pub fn accents() -> impl Iterator<Item = &'static ThemeDef> {
@@ -102,7 +102,7 @@ pub struct Preset {
 
 /// The themes at the top of the theme menu. Each accent matches the tint of its base color.
 pub const PRESETS: &[Preset] = &[
-    Preset { title: "Agent Desk", base: "agent-desk", accent: None },
+    Preset { title: "Help", base: "help", accent: None },
     Preset { title: "Graphite", base: "neutral", accent: None },
     Preset { title: "Cobalt", base: "zinc", accent: Some("blue") },
     Preset { title: "Midnight", base: "zinc", accent: Some("indigo") },
@@ -120,7 +120,7 @@ pub const PRESETS: &[Preset] = &[
 impl Preset {
     /// The two colors that show this preset in a menu: the tint of the base, and the accent.
     pub fn swatches(&self) -> (Hsla, Hsla) {
-        let base = bases().find(|t| t.key == self.base).unwrap_or(&AGENT_DESK);
+        let base = bases().find(|t| t.key == self.base).unwrap_or(&HELP);
         let accent = self
             .accent
             .and_then(|k| accents().find(|t| t.key == k))
@@ -180,7 +180,7 @@ impl ThemeChoice {
         };
         let base = get("base")
             .and_then(|k| bases().find(|t| t.key == k))
-            .unwrap_or(&AGENT_DESK)
+            .unwrap_or(&HELP)
             .key;
         let accent = get("accent").and_then(|k| accents().find(|t| t.key == k)).map(|t| t.key);
         let appearance = get("appearance")
@@ -233,7 +233,7 @@ pub fn apply(window: Option<&mut Window>, cx: &mut App) {
         Appearance::Dark => Theme::change(ThemeMode::Dark, window, cx),
     }
     let dark = Theme::global(cx).is_dark();
-    let base = bases().find(|t| t.key == choice.base).unwrap_or(&AGENT_DESK);
+    let base = bases().find(|t| t.key == choice.base).unwrap_or(&HELP);
     let accent = choice.accent.and_then(|k| accents().find(|t| t.key == k));
     // The accent colors go on top of the base colors. `lookup` finds the last value.
     let vars: Vec<(&str, u32)> = base
