@@ -2,9 +2,9 @@
 # releases repository. The app looks for updates there.
 #
 # A run on a tag cannot use the cache of a different tag. It can use the cache of main.
-# Thus a push to main that changes the dependencies runs only the compile step, and saves
-# the cache for the next tag. To make this cache manually, run this workflow on main from
-# the Actions tab.
+# A run on main only compiles, and saves the cache for the next tag. After a change to the
+# dependencies, run this workflow on main from the Actions tab. A run on a tag from the
+# Actions tab makes a release, the same as a push of the tag.
 #
 # Secrets:
 #   UPDATE_SIGNING_KEY: the PEM text of the Ed25519 release key.
@@ -23,15 +23,11 @@
 
 name: Release
 
+# Do not add a `paths` filter to `push`. With a `paths` filter, a push of a tag does not
+# start the workflow.
 on:
   push:
     tags: ["v*"]
-    branches: [main]
-    # GitHub does not use these paths for tags.
-    paths:
-      - Cargo.lock
-      - Cargo.toml
-      - .github/workflows/release.yml
   workflow_dispatch:
 
 jobs:
