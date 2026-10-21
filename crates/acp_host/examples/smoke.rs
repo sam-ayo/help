@@ -1,5 +1,6 @@
 //! Headless test: start an agent, send one prompt, print the events.
-//! Usage: cargo run -p acp_host --example smoke -- claude|codex [prompt]
+//! Usage: cargo run -p acp_host --example smoke -- claude|codex [prompt] [session-id]
+//! With a session ID, a new agent process continues that session.
 
 use acp_host::{AgentKind, BridgeConfig, Command, Event};
 
@@ -15,12 +16,12 @@ fn main() {
         socket: "/tmp/help-smoke.sock".into(),
     };
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let session = acp_host::start(rt.handle(), kind, std::env::temp_dir(), bridge, tx);
+    let session = acp_host::start(rt.handle(), kind, std::env::temp_dir(), bridge, std::env::args().nth(3), tx);
     rt.block_on(async {
         while let Some(ev) = rx.recv().await {
             match ev {
-                Event::Ready { current_mode } => {
-                    println!("READY mode={current_mode:?}");
+                Event::Ready { session_id, current_mode, resumed } => {
+                    println!("READY session={session_id} resumed={resumed} mode={current_mode:?}");
                     let prompt = std::env::args().nth(2).unwrap_or_else(|| {
                         "Call the help vm_status tool once, then reply with the word PONG and the tool's result in one line."
                             .into()

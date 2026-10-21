@@ -1,11 +1,16 @@
 //! Runs an ACP agent (Claude Code or Codex) as a subprocess on the host Mac and
 //! turns its session updates into simple [`Event`]s for the UI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use tokio::sync::{mpsc, oneshot};
+
+mod mcp_config;
+pub use mcp_config::McpConfigWatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -72,8 +77,12 @@ pub struct PermissionOptionView {
 #[derive(Debug)]
 pub enum Event {
     /// The session is ready. `current_mode` is the agent mode that the session runs in.
+    /// `resumed` is true when the agent continues the session that `start` got in `resume`,
+    /// so it has the earlier messages.
     Ready {
+        session_id: String,
         current_mode: Option<String>,
+        resumed: bool,
     },
     AgentText(String),
     Thought(String),
@@ -121,12 +130,15 @@ impl Session {
     }
 }
 
-/// Start an agent session on `runtime`. Events go to `events`.
+/// Start an agent session on `runtime`. Events go to `events`. With `resume`, a new agent
+/// process continues that session, if the agent can. The agent reads its MCP servers again
+/// when its process starts, so this gives an earlier session the new tools.
 pub fn start(
     runtime: &tokio::runtime::Handle,
     kind: AgentKind,
     cwd: PathBuf,
     bridge: BridgeConfig,
+    resume: Option<String>,
     events: mpsc::UnboundedSender<Event>,
 ) -> Session {
     let (tx, rx) = mpsc::unbounded_channel();
@@ -146,7 +158,7 @@ pub fn start(
                 bridge.command.display()
             )));
         }
-        if let Err(e) = run(kind, cwd, bridge, events, rx).await {
+        if let Err(e) = run(kind, cwd, bridge, resume, events, rx).await {
             let mut msg = e.to_string();
             if msg.to_lowercase().contains("auth") {
                 msg = format!("{msg}\n\n{}", kind.login_hint());
@@ -278,21 +290,67 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
     let _ = events.send(event);
 }
 
+/// Open the session: continue `resume` if the agent can, or else start a new session.
+/// `session/resume` comes first, because `session/load` sends all the earlier messages
+/// again. The UI has them already, so `replaying` drops them.
+async fn open_session(
+    cx: &ConnectionTo<Agent>,
+    caps: &AgentCapabilities,
+    cwd: &Path,
+    mcp: Vec<McpServer>,
+    resume: Option<String>,
+    replaying: &AtomicBool,
+) -> agent_client_protocol::Result<(String, Option<SessionModeState>, bool)> {
+    if let Some(id) = resume {
+        let result = if caps.session_capabilities.resume.is_some() {
+            cx.send_request(ResumeSessionRequest::new(id.clone(), cwd).mcp_servers(mcp.clone()))
+                .block_task()
+                .await
+                .map(|r| r.modes)
+        } else if caps.load_session {
+            replaying.store(true, Ordering::SeqCst);
+            let r = cx
+                .send_request(LoadSessionRequest::new(id.clone(), cwd).mcp_servers(mcp.clone()))
+                .block_task()
+                .await
+                .map(|r| r.modes);
+            replaying.store(false, Ordering::SeqCst);
+            r
+        } else {
+            Err(agent_client_protocol::Error::method_not_found())
+        };
+        match result {
+            Ok(modes) => return Ok((id, modes, true)),
+            Err(e) => tracing::warn!("cannot continue the session {id}, so a new session starts: {e}"),
+        }
+    }
+    let session = cx
+        .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp))
+        .block_task()
+        .await?;
+    Ok((id_string(&session.session_id), session.modes, false))
+}
+
 async fn run(
     kind: AgentKind,
     cwd: PathBuf,
     bridge: BridgeConfig,
+    resume: Option<String>,
     events: mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<Command>,
 ) -> agent_client_protocol::Result<()> {
     let notif_events = events.clone();
     let perm_events = events.clone();
+    let replaying = Arc::new(AtomicBool::new(false));
+    let notif_replaying = replaying.clone();
     Client
         .builder()
         .name("help")
         .on_receive_notification(
             async move |n: SessionNotification, _cx: ConnectionTo<Agent>| {
-                on_update(n.update, &notif_events);
+                if !notif_replaying.load(Ordering::SeqCst) {
+                    on_update(n.update, &notif_events);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -332,13 +390,14 @@ async fn run(
             agent_client_protocol::on_receive_request!(),
         )
         .connect_with(kind.transport(), async move |cx: ConnectionTo<Agent>| {
-            cx.send_request(
-                InitializeRequest::new(ProtocolVersion::V1)
-                    .client_capabilities(ClientCapabilities::new())
-                    .client_info(Implementation::new("help", env!("CARGO_PKG_VERSION"))),
-            )
-            .block_task()
-            .await?;
+            let init = cx
+                .send_request(
+                    InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(ClientCapabilities::new())
+                        .client_info(Implementation::new("help", env!("CARGO_PKG_VERSION"))),
+                )
+                .block_task()
+                .await?;
 
             let mcp = McpServer::Stdio(
                 McpServerStdio::new("help", bridge.command.clone()).env(vec![EnvVariable::new(
@@ -346,16 +405,12 @@ async fn run(
                     bridge.socket.to_string_lossy().to_string(),
                 )]),
             );
-            let session = cx
-                .send_request(NewSessionRequest::new(cwd).mcp_servers(vec![mcp]))
-                .block_task()
-                .await?;
-            let session_id = session.session_id.clone();
+            let (session_id, modes, resumed) =
+                open_session(&cx, &init.agent_capabilities, &cwd, vec![mcp], resume, &replaying).await?;
             // The app does not let the user change the mode. Every session runs in the default mode.
-            let mut current_mode = session.modes.as_ref().map(|m| id_string(&m.current_mode_id));
+            let mut current_mode = modes.as_ref().map(|m| id_string(&m.current_mode_id));
             let default_mode = kind.default_mode();
-            let offered = session
-                .modes
+            let offered = modes
                 .as_ref()
                 .is_some_and(|m| m.available_modes.iter().any(|m| id_string(&m.id) == default_mode));
             if current_mode.as_deref() != Some(default_mode) && offered {
@@ -370,7 +425,7 @@ async fn run(
                     }
                 }
             }
-            let _ = events.send(Event::Ready { current_mode });
+            let _ = events.send(Event::Ready { session_id: session_id.clone(), current_mode, resumed });
 
             while let Some(command) = commands.recv().await {
                 match command {

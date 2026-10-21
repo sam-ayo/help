@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use acp_host::{AgentKind, Command, Event, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
+use acp_host::{AgentKind, Command, Event, McpConfigWatch, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
 use gpui::{
     AppContext as _, Context, Div, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StyleRefinement, Stateful, StatefulInteractiveElement as _, Styled as _,
@@ -34,6 +34,9 @@ mod history;
 mod memory;
 
 gpui::actions!(help, [StopAgent, ToggleSidebar]);
+
+/// The app looks for a change to the MCP servers of the agent at this interval.
+const MCP_POLL: Duration = Duration::from_secs(3);
 
 enum Item {
     /// `at` is the time that the user sent the message, in seconds since 1970, or 0 if the
@@ -70,6 +73,13 @@ struct Chat {
     kind: AgentKind,
     items: Vec<Item>,
     session: Option<Session>,
+    /// The ID of the agent session. A refresh of the tools continues this session.
+    session_id: Option<String>,
+    /// The tools refresh, and the new session is not ready yet. It has the names of the new
+    /// MCP servers, for the notice.
+    refreshing: Option<Vec<String>>,
+    /// The tools must refresh when the turn ends. It has the names of the new MCP servers.
+    refresh_due: Option<Vec<String>>,
     /// Each new session gets a new number. The events of an older session do not apply.
     generation: u64,
     /// The session got the earlier messages, or the conversation had none.
@@ -91,6 +101,9 @@ impl Chat {
             kind,
             items,
             session: None,
+            session_id: None,
+            refreshing: None,
+            refresh_due: None,
             generation: 0,
             primed: false,
             busy: false,
@@ -119,6 +132,8 @@ pub struct AppView {
     toggled_tools: HashSet<String>,
     /// The turns that show their steps, by the index of the user message of the turn.
     open_steps: HashSet<usize>,
+    /// The files where the agent reads its MCP servers. See `poll_mcp_config`.
+    mcp_watch: Option<McpConfigWatch>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -160,6 +175,7 @@ impl AppView {
             sidebar_open: true,
             toggled_tools: HashSet::new(),
             open_steps: HashSet::new(),
+            mcp_watch: None,
             _subs: subs,
         };
         // Render the frames of the avatar in the colors that the user picked, then show them.
@@ -170,7 +186,19 @@ impl AppView {
             dock::set_moving(this.chat.busy && this.chat.permission.is_none(), cx)
         }));
         // The agent starts now, so that it is ready for the first message.
-        view.connect(cx);
+        view.poll_mcp_config(cx);
+        view.connect(None, cx);
+        // The agent reads its MCP servers only when its session starts. When the user adds or
+        // removes a server, the session starts again, so that the agent gets the new tools.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(MCP_POLL).await;
+                if this.update(cx, |this, cx| this.poll_mcp_config(cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         // The keyboard shortcuts work only when an element in the window has the focus.
         window.focus(&view.composer.focus_handle(cx), cx);
         // Keep the conversation when the app quits, and when the window closes before that.
@@ -184,8 +212,8 @@ impl AppView {
     }
 
     /// Start a new agent session, and show its events in the conversation. Dropping the old
-    /// session stops its agent.
-    fn connect(&mut self, cx: &mut Context<Self>) {
+    /// session stops its agent. With `resume`, the new agent process continues that session.
+    fn connect(&mut self, resume: Option<String>, cx: &mut Context<Self>) {
         // The demo starts no agents. See `demo`.
         if demo::enabled() {
             return;
@@ -194,14 +222,20 @@ impl AppView {
         chat.generation += 1;
         let generation = chat.generation;
         let (tx, mut rx) = mpsc::unbounded_channel();
+        // A continued session has the earlier messages. If the agent cannot continue it, the
+        // `Ready` event tells, and the next message gets them. See `apply`.
+        chat.primed = resume.is_some();
+        chat.session_id = resume.clone();
         chat.session = Some(acp_host::start(
             &self.env.runtime,
             chat.kind,
             chat.cwd.clone(),
             self.env.bridge.clone(),
+            resume,
             tx,
         ));
-        chat.primed = false;
+        // A new agent process reads the MCP servers again.
+        chat.refresh_due = None;
         chat.closed = false;
         chat.busy = false;
         chat.compaction = None;
@@ -214,7 +248,7 @@ impl AppView {
                     if this.chat.generation != generation {
                         return;
                     }
-                    if this.chat.compaction.is_some() {
+                    if this.chat.compaction.is_some() && !matches!(event, Event::Ready { .. }) {
                         this.apply_compaction(event, cx);
                     } else {
                         // Keep the conversation at the end of each turn, and when the agent stops.
@@ -227,6 +261,10 @@ impl AppView {
                         // A long conversation gets a summary, and the agent starts again with it.
                         if ended && history::needs_compaction(&this.chat) {
                             this.compact(cx);
+                        }
+                        // A change to the MCP servers during the turn refreshes the tools now.
+                        if ended && let Some(servers) = this.chat.refresh_due.take() {
+                            this.refresh_tools(servers, cx);
                         }
                     }
                     // The conversation follows the new text only when it shows the end. The user
@@ -272,6 +310,13 @@ impl AppView {
             self.scroll_to_end(cx);
             return;
         }
+        // The app cannot see each change to the MCP servers, for example a completed login.
+        if text.trim() == "/refresh" && !demo::enabled() {
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            self.refresh_tools(Vec::new(), cx);
+            self.scroll_to_end(cx);
+            return;
+        }
         if demo::live() {
             self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp() });
             self.chat.busy = true;
@@ -302,7 +347,7 @@ impl AppView {
         }
         // An agent that stopped gets a new session.
         if self.chat.session.is_none() {
-            self.connect(cx);
+            self.connect(None, cx);
         }
         let chat = &mut self.chat;
         // The first prompt of a session has the earlier messages of the conversation.
@@ -339,7 +384,7 @@ impl AppView {
             return;
         }
         if self.chat.session.is_none() {
-            self.connect(cx);
+            self.connect(None, cx);
         }
         let Some(session) = &self.chat.session else { return };
         session.send(Command::Prompt(memory::compact_prompt(&self.env.history_file, &transcript)));
@@ -366,7 +411,7 @@ impl AppView {
                     self.chat.items.push(Item::Compacted);
                     self.save(cx);
                     // The new session has a small context: the summary and the newest messages.
-                    self.connect(cx);
+                    self.connect(None, cx);
                 } else if reason != "Cancelled" {
                     self.chat.items.push(Item::Error(format!(
                         "Cannot compact the conversation ({reason}). Send /compact to try again."
@@ -383,6 +428,46 @@ impl AppView {
                 apply(chat, event);
             }
             _ => {}
+        }
+    }
+
+    /// Start the agent again in the same session, so that it reads its MCP servers again and
+    /// gets their tools. The conversation stays. During a turn, the refresh waits for the end
+    /// of the turn. `servers` has the names of the new MCP servers.
+    fn refresh_tools(&mut self, servers: Vec<String>, cx: &mut Context<Self>) {
+        if demo::enabled() {
+            return;
+        }
+        let chat = &mut self.chat;
+        if chat.busy {
+            chat.refresh_due.get_or_insert_default().extend(servers);
+            return;
+        }
+        // An agent that does not run reads the MCP servers when its next session starts.
+        if chat.session.is_none() {
+            return;
+        }
+        let resume = chat.session_id.clone();
+        chat.refreshing = Some(servers);
+        self.connect(resume, cx);
+        self.rows_changed(cx);
+        cx.notify();
+    }
+
+    /// Refresh the tools when the MCP servers of the agent change. A different agent or folder
+    /// gets a new watch: its session reads the MCP servers when it starts.
+    fn poll_mcp_config(&mut self, cx: &mut Context<Self>) {
+        if demo::enabled() {
+            return;
+        }
+        let chat = &self.chat;
+        match &mut self.mcp_watch {
+            Some(watch) if watch.is_for(chat.kind, &chat.cwd) => {
+                if let Some(servers) = watch.poll() {
+                    self.refresh_tools(servers, cx);
+                }
+            }
+            _ => self.mcp_watch = Some(McpConfigWatch::new(chat.kind, chat.cwd.clone())),
         }
     }
 
@@ -453,7 +538,7 @@ impl AppView {
         if self.started() {
             self.chat.items.push(Item::Notice(format!("{} continues the conversation.", agent_name(kind))));
         }
-        self.connect(cx);
+        self.connect(None, cx);
         self.scroll_to_end(cx);
         cx.notify();
     }
@@ -484,7 +569,7 @@ impl AppView {
                     this.chat.items.push(Item::Notice(format!("The agent works in {} now.", display_path(&path))));
                 }
                 this.chat.cwd = path;
-                this.connect(cx);
+                this.connect(None, cx);
                 this.scroll_to_end(cx);
                 cx.notify();
             });
@@ -640,7 +725,24 @@ fn build_rows(chat: &Chat, open_steps: &HashSet<usize>) -> Vec<Row> {
 
 fn apply(chat: &mut Chat, event: Event) {
     match event {
-        Event::Ready { .. } => {}
+        Event::Ready { session_id, resumed, .. } => {
+            chat.session_id = Some(session_id);
+            // A prompt that the user sent before this event did not get the earlier messages.
+            if !resumed && !chat.busy {
+                chat.primed = false;
+            }
+            if let Some(servers) = chat.refreshing.take() {
+                let mut notice = if servers.is_empty() {
+                    "Tools refreshed.".to_string()
+                } else {
+                    format!("Tools refreshed: {}.", servers.join(", "))
+                };
+                if !resumed {
+                    notice.push_str(" The agent gets the earlier messages with your next message.");
+                }
+                chat.items.push(Item::Notice(notice));
+            }
+        }
         Event::AgentText(t) => match chat.items.last_mut() {
             Some(Item::Agent(s)) => s.push_str(&t),
             _ => chat.items.push(Item::Agent(t)),
@@ -709,6 +811,7 @@ fn apply(chat: &mut Chat, event: Event) {
             chat.closed = true;
             chat.busy = false;
             chat.session = None;
+            chat.refreshing = None;
             chat.items.push(Item::Notice("The agent process stopped.".into()));
         }
     }
@@ -1009,6 +1112,22 @@ impl AppView {
             .on_click(cx.listener(|this, _, _, _| this.open_history()))
             .child(Icon::new(KitIcon::BookOpen).size(px(16.)).text_color(theme.muted_foreground))
             .child(div().flex_1().child("History"));
+        // Start the agent again in the same session, so that it gets new MCP tools. The app
+        // does this itself when it sees a change. See `AppView::refresh_tools`.
+        let refresh = h_flex()
+            .id("refresh-tools")
+            .mx_2()
+            .px_2()
+            .h(px(32.))
+            .gap_2p5()
+            .rounded(px(8.))
+            .text_sm()
+            .font_medium()
+            .cursor_pointer()
+            .hover(|el| el.bg(accent.opacity(0.08)))
+            .on_click(cx.listener(|this, _, _, cx| this.refresh_tools(Vec::new(), cx)))
+            .child(Icon::new(KitIcon::RefreshCw).size(px(16.)).text_color(theme.muted_foreground))
+            .child(div().flex_1().child("Refresh tools"));
 
         // A floating panel inset from the window edges, with a rose tint. The blurred window
         // background shows through a little.
@@ -1029,7 +1148,7 @@ impl AppView {
                     .child(div().flex_1().child(brand))
                     .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
-            .child(div().pt_2().child(memory).child(history))
+            .child(div().pt_2().child(memory).child(history).child(refresh))
             .child(div().flex_1())
             .child(self.render_theme_footer(cx));
         div()

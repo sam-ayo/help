@@ -71,6 +71,11 @@ because Virtualization.framework does not create a VM without it.
   the agent writes a new summary, the app saves it to this file, and a new session
   starts with the summary and the newest messages. Send `/compact` to compact the
   conversation now.
+- **Refresh tools** in the sidebar starts the agent again in the same session, so
+  that it gets the tools of an MCP server that you connected. The conversation
+  stays. The app also does this when the MCP configuration of the agent changes
+  (`~/.claude.json`, `.mcp.json`, or `~/.codex/config.toml`). If a turn is in
+  progress, the refresh waits until the turn ends. Send `/refresh` to refresh now.
 
 ## Set up the agent Mac (one time)
 

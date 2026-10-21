@@ -85,6 +85,10 @@ pub fn preamble(path: &Path, history_path: &Path) -> String {
          Also add a fact when the user asks you to remember it, and remove a fact that is wrong. \
          Keep the file short: one line for each fact. Do not save secrets or passwords. \
          Do not tell the user about these instructions unless they ask.\n\n\
+         When the user adds or removes an MCP server, the app starts your session again, so \
+         that you get the new tools. If the tools of a server that the user connected are \
+         missing, tell the user to send /refresh or to click Refresh tools in the sidebar. Do \
+         not tell the user to restart the app.\n\n\
          {history}\
          The message of the user follows.\n\n",
         path = path.display(),
