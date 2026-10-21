@@ -6,11 +6,12 @@ use std::{
     time::Duration,
 };
 
-use acp_host::{AgentKind, Command, Event, McpConfigWatch, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
+use acp_host::{AgentKind, Attachment, Command, Event, McpConfigWatch, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
 use gpui::{
     AppContext as _, Context, Div, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StyleRefinement, Stateful, StatefulInteractiveElement as _, Styled as _,
-    Anchor, Animation, AnimationExt as _, Window, div, prelude::FluentBuilder as _, px, rgb,
+    Anchor, Animation, AnimationExt as _, ClipboardEntry, ClipboardItem, ExternalPaths, Window, div,
+    prelude::FluentBuilder as _, px, rgb,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, StyledExt as _, Theme, h_flex,
@@ -27,6 +28,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{Env, theme};
 
+mod attach;
 mod avatar;
 mod demo;
 mod doc;
@@ -42,9 +44,11 @@ const MCP_POLL: Duration = Duration::from_secs(3);
 
 enum Item {
     /// `at` is the time that the user sent the message, in seconds since 1970, or 0 if the
-    /// time is not known.
-    User { text: String, at: i64 },
+    /// time is not known. `attachments` has the files that the user attached.
+    User { text: String, at: i64, attachments: Vec<Attachment> },
     Agent(String),
+    /// Images and other files that the agent sent in its message.
+    AgentFiles(Vec<Attachment>),
     Thought(String),
     Tool {
         id: String,
@@ -55,6 +59,8 @@ enum Item {
         /// The ID of the subagent tool call that made this tool call. The card of that
         /// subagent shows this tool call, so the conversation does not show it again.
         parent: Option<String>,
+        /// The images and other files in the result of the tool, for example a screenshot.
+        files: Vec<Attachment>,
     },
     Plan(Vec<(String, ToolStatus)>),
     Notice(String),
@@ -155,6 +161,8 @@ pub struct AppView {
     app_context: Option<(String, String)>,
     /// The connected MCP servers that have views. See `mcp_app::AppView::load_app_servers`.
     app_servers: Vec<mcp_app::AppEntry>,
+    /// The files that the user attached to the next message. See `attach`.
+    attachments: Vec<Attachment>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -213,6 +221,7 @@ impl AppView {
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
+            attachments: Vec::new(),
             _subs: subs,
         };
         for event in demo::app_call() {
@@ -279,6 +288,7 @@ impl AppView {
             chat.kind,
             chat.cwd.clone(),
             self.env.bridge.clone(),
+            self.env.files_dir.clone(),
             resume,
             tx,
         ));
@@ -348,7 +358,7 @@ impl AppView {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().to_string();
-        if text.trim().is_empty() || self.chat.busy {
+        if (text.trim().is_empty() && self.attachments.is_empty()) || self.chat.busy {
             return;
         }
         // The app does the compaction, so that the summary goes to `help-memory.md`. The agent
@@ -367,7 +377,8 @@ impl AppView {
             return;
         }
         if demo::live() {
-            self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp() });
+            let attachments = std::mem::take(&mut self.attachments);
+            self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments });
             self.chat.busy = true;
             self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             self.scroll_to_end(cx);
@@ -394,14 +405,102 @@ impl AppView {
             cx.notify();
             return;
         }
-        if self.submit(text, cx) {
-            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        let attachments = std::mem::take(&mut self.attachments);
+        match self.submit(text, attachments, cx) {
+            Ok(()) => self.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+            Err(attachments) => self.attachments = attachments,
         }
     }
 
+    /// Attach files to the next message. A folder cannot be an attachment.
+    fn attach_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let mut skipped = Vec::new();
+        for path in paths {
+            match Attachment::from_path(path) {
+                Ok(a) => self.attach(a, cx),
+                Err(e) => {
+                    tracing::warn!("cannot attach {}: {e}", path.display());
+                    skipped.push(display_path(path));
+                }
+            }
+        }
+        if !skipped.is_empty() {
+            self.chat.items.push(Item::Notice(format!("Cannot attach {}.", skipped.join(", "))));
+            self.rows_changed(cx);
+        }
+        cx.notify();
+    }
+
+    fn attach(&mut self, a: Attachment, cx: &mut Context<Self>) {
+        if self.attachments.iter().any(|b| b.path == a.path) {
+            return;
+        }
+        // Quick Look makes the picture of a video off the UI thread.
+        if a.is_video() {
+            let (dir, video) = (self.env.files_dir.clone(), a.clone());
+            let made = cx.background_spawn(async move { attach::make_thumbnail(&dir, &video) });
+            cx.spawn(async move |this, cx| {
+                if made.await {
+                    let _ = this.update(cx, |this, cx| {
+                        this.rows_changed(cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+        }
+        self.attachments.push(a);
+    }
+
+    /// A paste of files or an image attaches them. Returns false for a paste of text, which
+    /// goes in the composer.
+    fn paste(&mut self, item: &ClipboardItem, cx: &mut Context<Self>) -> bool {
+        let mut taken = false;
+        for entry in item.entries() {
+            match entry {
+                ClipboardEntry::ExternalPaths(paths) => {
+                    self.attach_paths(paths.paths(), cx);
+                    taken = true;
+                }
+                ClipboardEntry::Image(image) => {
+                    let format = image.format();
+                    let mime = acp_host::mime_for(Path::new(&format!("x.{}", format.extension())));
+                    match Attachment::save(&self.env.files_dir, None, mime, image.bytes()) {
+                        Ok(mut a) => {
+                            a.name = format!("Pasted image.{}", format.extension());
+                            self.attach(a, cx);
+                        }
+                        Err(e) => tracing::warn!("cannot keep the pasted image: {e}"),
+                    }
+                    taken = true;
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        if taken {
+            cx.notify();
+        }
+        taken
+    }
+
+    /// Ask for files to attach to the next message.
+    fn pick_files(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else { return };
+            let _ = this.update(cx, |this, cx| this.attach_paths(&paths, cx));
+        })
+        .detach();
+    }
+
     /// Send a message of the user to the agent, and show it. A message can also come from the
-    /// view of an MCP App. Returns false if the agent did not get the message.
-    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
+    /// view of an MCP App. If the agent did not get the message, returns the attachments.
+    fn submit(&mut self, text: String, attachments: Vec<Attachment>, cx: &mut Context<Self>) -> Result<(), Vec<Attachment>> {
         // An agent that stopped gets a new session.
         if self.chat.session.is_none() {
             self.connect(None, cx);
@@ -415,19 +514,19 @@ impl AppView {
             memory::preamble(&self.env.memory_file, &self.env.history_file)
                 + &history::prompt_with_context(chat, &text)
         };
-        let Some(session) = &chat.session else { return false };
+        let Some(session) = &chat.session else { return Err(attachments) };
         // The view of an MCP App can give context for the next message.
         if let Some((tool, context)) = self.app_context.take() {
             prompt = format!("<app-context tool=\"{tool}\">\n{context}\n</app-context>\n\n{prompt}");
         }
-        session.send(Command::Prompt(prompt));
+        session.send(Command::Prompt { text: prompt, attachments: attachments.clone() });
         chat.primed = true;
-        chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp() });
+        chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments });
         chat.busy = true;
         self.scroll_to_end(cx);
         self.save(cx);
         cx.notify();
-        true
+        Ok(())
     }
 
     /// Ask the agent for a summary of the messages after the last compaction, and write it to
@@ -448,7 +547,10 @@ impl AppView {
             self.connect(None, cx);
         }
         let Some(session) = &self.chat.session else { return };
-        session.send(Command::Prompt(memory::compact_prompt(&self.env.history_file, &transcript)));
+        session.send(Command::Prompt {
+            text: memory::compact_prompt(&self.env.history_file, &transcript),
+            attachments: Vec::new(),
+        });
         self.chat.compaction = Some(String::new());
         self.chat.busy = true;
         self.rows_changed(cx);
@@ -754,7 +856,7 @@ fn build_rows(chat: &Chat, open_steps: &HashSet<usize>) -> Vec<Row> {
             Some(i) != reply
                 && !in_card(i)
                 && !matches!(&items[i], Item::Tool { kind, .. } if kind == SUBAGENT_KIND)
-                && !matches!(items[i], Item::Notice(_) | Item::Error(_) | Item::Compacted)
+                && !matches!(items[i], Item::Notice(_) | Item::Error(_) | Item::Compacted | Item::AgentFiles(_))
         };
         let count = (turn + 1..end).filter(|&i| is_step(i)).count();
         let open = open_steps.contains(&turn);
@@ -808,6 +910,14 @@ fn apply(chat: &mut Chat, event: Event) {
             Some(Item::Agent(s)) => s.push_str(&t),
             _ => chat.items.push(Item::Agent(t)),
         },
+        Event::AgentFile(f) => match chat.items.last_mut() {
+            Some(Item::AgentFiles(files)) => {
+                if !files.contains(&f) {
+                    files.push(f);
+                }
+            }
+            _ => chat.items.push(Item::AgentFiles(vec![f])),
+        },
         Event::Thought(t) => match chat.items.last_mut() {
             Some(Item::Thought(s)) => s.push_str(&t),
             _ => chat.items.push(Item::Thought(t)),
@@ -823,6 +933,7 @@ fn apply(chat: &mut Chat, event: Event) {
                 status,
                 detail: None,
                 parent,
+                files: Vec::new(),
             })
         }
         Event::ToolUpdate {
@@ -830,6 +941,7 @@ fn apply(chat: &mut Chat, event: Event) {
             title: new_title,
             status: new_status,
             detail: new_detail,
+            files: new_files,
             input: new_input,
             output: new_output,
         } => {
@@ -850,11 +962,17 @@ fn apply(chat: &mut Chat, event: Event) {
                     title,
                     status,
                     detail,
+                    files,
                     ..
-                } if *tid == id => Some((title, status, detail)),
+                } if *tid == id => Some((title, status, detail, files)),
                 _ => None,
             });
-            if let Some((title, status, detail)) = found {
+            if let Some((title, status, detail, files)) = found {
+                for f in new_files {
+                    if !files.contains(&f) {
+                        files.push(f);
+                    }
+                }
                 if let Some(t) = new_title {
                     *title = t;
                 }
@@ -1554,7 +1672,7 @@ impl AppView {
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         match item {
-            Item::User { text, at } => {
+            Item::User { text, at, attachments } => {
                 let prev = self.chat.items[..ix].iter().rev().find_map(|i| match i {
                     Item::User { at, .. } => Some(*at),
                     _ => None,
@@ -1580,7 +1698,17 @@ impl AppView {
                                 .child(time),
                         )
                     })
-                    .child(
+                    // The attachments above the text, at the right, as in Messages.
+                    .when(!attachments.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .pl(px(80.))
+                                .pr(px(7.))
+                                .when(!text.is_empty(), |el| el.pb_1())
+                                .child(attach::tiles(format!("user-files-{ix}"), attachments, &self.env.files_dir, true, cx)),
+                        )
+                    })
+                    .when(!text.is_empty(), |el| el.child(
                     h_flex()
                         .justify_end()
                         .pl(px(80.))
@@ -1617,9 +1745,14 @@ impl AppView {
                                         .bg(theme.background),
                                 ),
                         )
-                    )
+                    ))
                     .into_any_element()
             }
+            Item::AgentFiles(files) => div()
+                .pl(px(TAIL_INSET))
+                .pr(px(40.))
+                .child(attach::tiles(format!("agent-files-{ix}"), files, &self.env.files_dir, false, cx))
+                .into_any_element(),
             Item::Agent(text) => {
                 let group: SharedString = format!("agent-message-{ix}").into();
                 let copy = text.clone();
@@ -1692,6 +1825,7 @@ impl AppView {
                 kind: tool_kind,
                 status,
                 detail,
+                files,
                 ..
             } => {
                 // A click on the header opens or closes the output. A failed tool starts open.
@@ -1761,6 +1895,15 @@ impl AppView {
                             }),
                     )
                     .when(tool_kind == SUBAGENT_KIND, |el| el.child(self.subagent_line(ix, id, *status, &theme)))
+                    // The images of the tool always show, for example the screenshots of the agent Mac.
+                    .when(!files.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .px_3()
+                                .pb_2()
+                                .child(attach::tiles(format!("tool-files-{ix}"), files, &self.env.files_dir, false, cx)),
+                        )
+                    })
                     .when_some(detail.clone().filter(|_| open), |el, d| {
                         let short: String = d.chars().take(4000).collect();
                         el.child(
@@ -2011,8 +2154,26 @@ impl AppView {
                 .tooltip("Send")
                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
         };
-        // The actions that are not about the message.
+        // A paste of an image or of files attaches them.
         let view = cx.entity().downgrade();
+        let paste = {
+            let view = view.clone();
+            move |item: &ClipboardItem, _: &mut Window, cx: &mut gpui::App| {
+                view.update(cx, |this, cx| this.paste(item, cx)).unwrap_or(false)
+            }
+        };
+        let remove = {
+            let view = view.clone();
+            move |i: usize, _: &mut Window, cx: &mut gpui::App| {
+                let _ = view.update(cx, |this, cx| {
+                    if i < this.attachments.len() {
+                        this.attachments.remove(i);
+                    }
+                    cx.notify();
+                });
+            }
+        };
+        // The actions that are not about the message.
         let more = Button::new("composer-more")
             .with_size(px(COMPOSER_LINE + 2.))
             .secondary()
@@ -2020,7 +2181,15 @@ impl AppView {
             .icon(Icon::new(KitIcon::Plus).text_color(theme.muted_foreground))
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let folder = view.clone();
+                let files = view.clone();
                 menu.item(
+                    PopupMenuItem::new("Attach files…")
+                        .icon(Icon::new(KitIcon::Paperclip))
+                        .on_click(move |_, _, cx| {
+                            let _ = files.update(cx, |this, cx| this.pick_files(cx));
+                        }),
+                )
+                .item(
                     PopupMenuItem::new("Change the folder…")
                         .icon(Icon::new(KitIcon::Folder))
                         .disabled(busy)
@@ -2048,10 +2217,13 @@ impl AppView {
                     .border_color(theme.border)
                     .bg(theme.background)
                     .child(
-                        div()
+                        v_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(Textarea::new(&self.composer).appearance(false)),
+                            .when(!self.attachments.is_empty(), |el| {
+                                el.child(attach::previews(&self.attachments, &self.env.files_dir, remove, cx))
+                            })
+                            .child(Textarea::new(&self.composer).appearance(false).on_paste(paste)),
                     )
                     .child(div().flex_shrink_0().mb(px(SEND_INSET)).child(action)),
             )
@@ -2231,10 +2403,20 @@ impl AppView {
             .when(self.sidebar_open, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
             .child(
                 v_flex()
+                    .id("conversation")
                     .flex_1()
                     .min_w_0()
                     .h_full()
                     .bg(theme.background)
+                    // Files that the user drops on the conversation become attachments.
+                    .drag_over::<ExternalPaths>({
+                        let tint = accent(&theme).opacity(0.06);
+                        move |style, _, _, _| style.bg(tint)
+                    })
+                    .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                        this.attach_paths(paths.paths(), cx);
+                        this.focus_composer(window, cx);
+                    }))
                     .child(toolbar)
                     .child(body),
             )
@@ -2255,7 +2437,7 @@ mod tests {
 
     fn turn() -> Vec<Item> {
         vec![
-            Item::User { text: "hi".into(), at: 0 },
+            Item::User { text: "hi".into(), at: 0, attachments: Vec::new() },
             Item::Thought("hmm".into()),
             Item::Agent("Let me look.".into()),
             Item::Error("oops".into()),
@@ -2306,13 +2488,14 @@ mod tests {
             status: ToolStatus::Running,
             detail: None,
             parent: parent.map(Into::into),
+            files: Vec::new(),
         }
     }
 
     #[test]
     fn a_subagent_card_always_shows_and_holds_its_tool_calls() {
         let items = vec![
-            Item::User { text: "hi".into(), at: 0 },
+            Item::User { text: "hi".into(), at: 0, attachments: Vec::new() },
             tool("task", SUBAGENT_KIND, None),
             tool("read", "read", Some("task")),
             tool("ls", "execute", None),
@@ -2320,7 +2503,7 @@ mod tests {
         ];
         let rows = build_rows(&chat(items, false), &HashSet::new());
         assert!(rows == [Row::Item(0), Row::Item(1), Row::Reply { ix: 4, turn: 0, open: false }]);
-        let mut items = vec![Item::User { text: "hi".into(), at: 0 }, tool("task", SUBAGENT_KIND, None)];
+        let mut items = vec![Item::User { text: "hi".into(), at: 0, attachments: Vec::new() }, tool("task", SUBAGENT_KIND, None)];
         items.push(tool("read", "read", Some("task")));
         let rows = build_rows(&chat(items, true), &HashSet::from([0]));
         assert!(rows == [Row::Item(0), Row::Item(1), Row::Working { steps: None }]);

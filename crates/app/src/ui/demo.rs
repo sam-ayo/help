@@ -36,6 +36,7 @@ pub fn app_call() -> Vec<Event> {
             title: None,
             status: Some(ToolStatus::Done),
             detail: Some(time.clone()),
+            files: Vec::new(),
             input: None,
             output: Some(serde_json::json!({
                 "content": [{ "type": "text", "text": time }],
@@ -63,12 +64,13 @@ fn child(id: &str, title: &str, kind: &str, status: ToolStatus, detail: Option<&
         status,
         detail: detail.map(Into::into),
         parent: parent.map(Into::into),
+        files: Vec::new(),
     }
 }
 
 /// A message from the user, `ago` minutes before now.
 fn user(text: &str, ago: i64) -> Item {
-    Item::User { text: text.into(), at: chrono::Utc::now().timestamp() - ago * 60 }
+    Item::User { text: text.into(), at: chrono::Utc::now().timestamp() - ago * 60, attachments: Vec::new() }
 }
 
 /// Four turns over some days. The agent waits for a permission in the last turn.
@@ -159,6 +161,7 @@ fn done(id: &str, detail: Option<&str>) -> Event {
         title: None,
         status: Some(ToolStatus::Done),
         detail: detail.map(Into::into),
+        files: Vec::new(),
         input: None,
         output: None,
     }

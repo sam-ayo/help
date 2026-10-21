@@ -479,7 +479,7 @@ impl AppView {
                     Err("The message has no text.".into())
                 } else if self.chat.busy {
                     Err("The agent is busy. Send the message again when the turn ends.".into())
-                } else if self.submit(text, cx) {
+                } else if self.submit(text, Vec::new(), cx).is_ok() {
                     Ok(json!({}))
                 } else {
                     Err("The agent does not run. Send the message again later.".into())

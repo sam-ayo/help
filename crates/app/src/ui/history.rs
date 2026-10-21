@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use acp_host::ToolStatus;
+use acp_host::{Attachment, ToolStatus};
 use serde::{Deserialize, Serialize};
 
 use super::{Chat, Item};
@@ -44,8 +44,11 @@ enum SavedItem {
         /// An older version of the app kept no time.
         #[serde(default)]
         at: i64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
     },
     Agent { text: String },
+    AgentFiles { files: Vec<Attachment> },
     Thought { text: String },
     Tool {
         title: String,
@@ -57,6 +60,8 @@ enum SavedItem {
         id: Option<String>,
         #[serde(default)]
         parent: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<Attachment>,
     },
     Plan { entries: Vec<(String, String)> },
     Notice { text: String },
@@ -88,12 +93,16 @@ fn status_from_key(s: &str) -> ToolStatus {
 
 fn save_item(item: &Item) -> SavedItem {
     match item {
-        Item::User { text, at } => SavedItem::User { text: text.clone(), at: *at },
+        Item::User { text, at, attachments } => {
+            SavedItem::User { text: text.clone(), at: *at, attachments: attachments.clone() }
+        }
         Item::Agent(text) => SavedItem::Agent { text: text.clone() },
+        Item::AgentFiles(files) => SavedItem::AgentFiles { files: files.clone() },
         Item::Thought(text) => SavedItem::Thought { text: text.clone() },
-        Item::Tool { id, title, kind, status, detail, parent } => SavedItem::Tool {
+        Item::Tool { id, title, kind, status, detail, parent, files } => SavedItem::Tool {
             id: Some(id.clone()),
             parent: parent.clone(),
+            files: files.clone(),
             title: title.clone(),
             kind: kind.clone(),
             status: status_key(*status).into(),
@@ -110,12 +119,14 @@ fn save_item(item: &Item) -> SavedItem {
 
 fn load_item(item: SavedItem, ix: usize) -> Option<Item> {
     Some(match item {
-        SavedItem::User { text, at } => Item::User { text, at },
+        SavedItem::User { text, at, attachments } => Item::User { text, at, attachments },
         SavedItem::Agent { text } => Item::Agent(text),
+        SavedItem::AgentFiles { files } => Item::AgentFiles(files),
         SavedItem::Thought { text } => Item::Thought(text),
-        SavedItem::Tool { title, kind, status, detail, id, parent } => Item::Tool {
+        SavedItem::Tool { title, kind, status, detail, id, parent, files } => Item::Tool {
             id: id.unwrap_or_else(|| format!("saved-{ix}")),
             parent,
+            files,
             title,
             kind,
             status: status_from_key(&status),
@@ -209,14 +220,28 @@ fn transcript(items: &[Item]) -> Vec<String> {
     items
         .iter()
         .filter_map(|item| match item {
-            Item::User { text, at } => Some(match chrono::DateTime::from_timestamp(*at, 0) {
-                Some(t) if *at > 0 => format!("User ({}): {text}\n\n", t.format("%Y-%m-%d %H:%M UTC")),
-                _ => format!("User: {text}\n\n"),
-            }),
+            Item::User { text, at, attachments } => {
+                let text = format!("{text}{}", files_note(attachments));
+                Some(match chrono::DateTime::from_timestamp(*at, 0) {
+                    Some(t) if *at > 0 => format!("User ({}): {text}\n\n", t.format("%Y-%m-%d %H:%M UTC")),
+                    _ => format!("User: {text}\n\n"),
+                })
+            }
             Item::Agent(text) => Some(format!("Assistant: {text}\n\n")),
+            Item::AgentFiles(files) => Some(format!("Assistant:{}\n\n", files_note(files))),
             _ => None,
         })
         .collect()
+}
+
+/// The paths of the files of a message, for the transcript. A new session cannot see the
+/// earlier files, but it can read them at these paths.
+fn files_note(files: &[Attachment]) -> String {
+    if files.is_empty() {
+        return String::new();
+    }
+    let paths: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
+    format!(" [Attached files: {}]", paths.join(", "))
 }
 
 /// The index of the first item after the last compaction.
@@ -287,6 +312,16 @@ mod tests {
         Chat::new(AgentKind::Codex, items, PathBuf::from("/tmp/project"))
     }
 
+    fn file() -> Attachment {
+        Attachment { path: "/tmp/shot.png".into(), name: "shot.png".into(), mime: "image/png".into(), size: 3 }
+    }
+
+    #[test]
+    fn the_transcript_has_the_paths_of_the_files() {
+        let c = chat(vec![Item::User { text: "see".into(), at: 0, attachments: vec![file()] }]);
+        assert!(prompt_with_context(&c, "next").contains("User: see [Attached files: /tmp/shot.png]"));
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("help-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -299,7 +334,7 @@ mod tests {
         let path = dir.join("conversation.json");
         let legacy = dir.join("chats.json");
         let c = chat(vec![
-            Item::User { text: "hello".into(), at: 1_700_000_000 },
+            Item::User { text: "hello".into(), at: 1_700_000_000, attachments: vec![file()] },
             Item::Tool {
                 id: "x".into(),
                 title: "ls".into(),
@@ -307,6 +342,7 @@ mod tests {
                 status: ToolStatus::Running,
                 detail: Some("out".into()),
                 parent: Some("task".into()),
+                files: vec![file()],
             },
             Item::Plan(vec![("step".into(), ToolStatus::Done), ("next".into(), ToolStatus::Pending)]),
         ]);
@@ -324,8 +360,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.len(), 3);
-        assert!(matches!(&loaded[0], Item::User { text, at: 1_700_000_000 } if text == "hello"));
-        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), parent: Some(p), .. } if d == "out" && p == "task"));
+        assert!(matches!(&loaded[0], Item::User { text, at: 1_700_000_000, attachments } if text == "hello" && attachments == &[file()]));
+        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), parent: Some(p), files, .. } if d == "out" && p == "task" && files == &[file()]));
         assert!(matches!(&loaded[2], Item::Plan(p) if p[0].1 == ToolStatus::Done && p[1].1 == ToolStatus::Pending));
     }
 
@@ -344,7 +380,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
 
         assert_eq!(loaded.len(), 2);
-        assert!(matches!(&loaded[0], Item::User { text, at: 0 } if text == "a"));
+        assert!(matches!(&loaded[0], Item::User { text, at: 0, .. } if text == "a"));
         assert!(matches!(&loaded[1], Item::User { text, .. } if text == "b"));
     }
 
@@ -363,7 +399,7 @@ mod tests {
 
     #[test]
     fn context_has_the_earlier_messages() {
-        let c = chat(vec![Item::User { text: "first".into(), at: 0 }, Item::Agent("answer".into())]);
+        let c = chat(vec![Item::User { text: "first".into(), at: 0, attachments: Vec::new() }, Item::Agent("answer".into())]);
         let prompt = prompt_with_context(&c, "second");
         assert!(prompt.contains("User: first") && prompt.contains("Assistant: answer"));
         assert!(prompt.ends_with("second"));
@@ -373,7 +409,7 @@ mod tests {
     #[test]
     fn compaction_keeps_the_new_messages_and_the_newest_old_ones() {
         let long = "x".repeat(COMPACT_AT);
-        let mut c = chat(vec![Item::User { text: "old".into(), at: 0 }, Item::Agent(long.clone())]);
+        let mut c = chat(vec![Item::User { text: "old".into(), at: 0, attachments: Vec::new() }, Item::Agent(long.clone())]);
         assert!(needs_compaction(&c));
         assert!(uncompacted(&c).contains("User: old"));
 
@@ -384,7 +420,7 @@ mod tests {
         let prompt = prompt_with_context(&c, "next");
         assert!(prompt.contains("summary above") && prompt.contains(&long) && !prompt.contains("User: old"));
 
-        c.items.push(Item::User { text: "new".into(), at: 1_700_000_000 });
+        c.items.push(Item::User { text: "new".into(), at: 1_700_000_000, attachments: Vec::new() });
         assert!(uncompacted(&c).starts_with("User (2023-11-14 22:13 UTC): new"));
 
         // The marker stays in the file. `write` is not used here: its order check is global, so

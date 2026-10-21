@@ -9,6 +9,10 @@ use agent_client_protocol::schema::{ProtocolVersion, v1::*};
 use agent_client_protocol::{AcpAgent, Agent, Client, ConnectionTo, Responder};
 use tokio::sync::{mpsc, oneshot};
 
+use attachment::Received;
+
+mod attachment;
+pub use attachment::{Attachment, file_uri, mime_for};
 mod mcp_config;
 pub use mcp_config::McpConfigWatch;
 mod mcp_servers;
@@ -95,6 +99,8 @@ pub enum Event {
         resumed: bool,
     },
     AgentText(String),
+    /// A file in a message of the agent, for example an image.
+    AgentFile(Attachment),
     Thought(String),
     /// A tool call. `kind` is `"subagent"` when the agent delegates work to a subagent.
     /// `parent` is the ID of the subagent tool call that made this tool call, if a subagent made it.
@@ -109,12 +115,14 @@ pub enum Event {
         mcp: Option<McpCall>,
         input: Option<serde_json::Value>,
     },
-    /// `output` is the result of the tool in the form of an MCP `CallToolResult`.
+    /// `output` is the result of the tool in the form of an MCP `CallToolResult`. `files` has
+    /// the images and other files in the content of the tool call, for example a screenshot.
     ToolUpdate {
         id: String,
         title: Option<String>,
         status: Option<ToolStatus>,
         detail: Option<String>,
+        files: Vec<Attachment>,
         input: Option<serde_json::Value>,
         output: Option<serde_json::Value>,
     },
@@ -132,7 +140,8 @@ pub enum Event {
 
 #[derive(Debug)]
 pub enum Command {
-    Prompt(String),
+    /// A message with the files that the user attached.
+    Prompt { text: String, attachments: Vec<Attachment> },
     Cancel,
 }
 
@@ -149,12 +158,14 @@ impl Session {
 
 /// Start an agent session on `runtime`. Events go to `events`. With `resume`, a new agent
 /// process continues that session, if the agent can. The agent reads its MCP servers again
-/// when its process starts, so this gives an earlier session the new tools.
+/// when its process starts, so this gives an earlier session the new tools. The images and
+/// other files that the agent sends go to the folder `files`.
 pub fn start(
     runtime: &tokio::runtime::Handle,
     kind: AgentKind,
     cwd: PathBuf,
     bridge: BridgeConfig,
+    files: PathBuf,
     resume: Option<String>,
     events: mpsc::UnboundedSender<Event>,
 ) -> Session {
@@ -175,7 +186,7 @@ pub fn start(
                 bridge.command.display()
             )));
         }
-        if let Err(e) = run(kind, cwd, bridge, resume, events, rx).await {
+        if let Err(e) = run(kind, cwd, bridge, files, resume, events, rx).await {
             let mut msg = e.to_string();
             if msg.to_lowercase().contains("auth") {
                 msg = format!("{msg}\n\n{}", kind.login_hint());
@@ -202,21 +213,25 @@ fn status(s: ToolCallStatus) -> ToolStatus {
     }
 }
 
-fn content_text(content: &[ToolCallContent]) -> Option<String> {
+/// The text and the files of the content of a tool call. The files go to the folder `dir`.
+fn tool_content(content: Vec<ToolCallContent>, dir: &Path) -> (Option<String>, Vec<Attachment>) {
     let mut out = String::new();
+    let mut files = Vec::new();
     for c in content {
         match c {
-            ToolCallContent::Content(c) => {
-                if let ContentBlock::Text(t) = &c.content {
-                    out.push_str(&t.text);
+            ToolCallContent::Content(c) => match attachment::receive(c.content, dir) {
+                Some(Received::Text(t)) => {
+                    out.push_str(&t);
                     out.push('\n');
                 }
-            }
+                Some(Received::File(f)) => files.push(f),
+                None => {}
+            },
             ToolCallContent::Diff(d) => out.push_str(&format!("edited {}\n", d.path.display())),
             _ => {}
         }
     }
-    (!out.is_empty()).then_some(out)
+    ((!out.is_empty()).then_some(out), files)
 }
 
 /// Turn ID newtypes into plain strings through their JSON form.
@@ -288,11 +303,12 @@ fn codex_subagent(title: &str) -> Option<(&str, &str)> {
     matches!(activity, "Start" | "Complete" | "Interrupt").then_some((activity, name))
 }
 
-fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
+fn on_update(update: SessionUpdate, files: &Path, events: &mpsc::UnboundedSender<Event>) {
     let event = match update {
-        SessionUpdate::AgentMessageChunk(c) => match c.content {
-            ContentBlock::Text(t) => Event::AgentText(t.text),
-            _ => return,
+        SessionUpdate::AgentMessageChunk(c) => match attachment::receive(c.content, files) {
+            Some(Received::Text(t)) => Event::AgentText(t),
+            Some(Received::File(f)) => Event::AgentFile(f),
+            None => return,
         },
         SessionUpdate::AgentThoughtChunk(c) => match c.content {
             ContentBlock::Text(t) => Event::Thought(t.text),
@@ -318,6 +334,7 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
                     title: None,
                     status: Some(if activity == "Complete" { ToolStatus::Done } else { ToolStatus::Failed }),
                     detail: None,
+                    files: Vec::new(),
                     input: None,
                     output: None,
                 },
@@ -332,14 +349,18 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
             mcp: mcp_call(&tc),
             input: tool_input(tc.raw_input.as_ref()),
         },
-        SessionUpdate::ToolCallUpdate(u) => Event::ToolUpdate {
-            id: id_string(&u.tool_call_id),
-            title: u.fields.title.clone(),
-            status: u.fields.status.map(status),
-            detail: u.fields.content.as_deref().and_then(content_text),
-            input: tool_input(u.fields.raw_input.as_ref()),
-            output: tool_output(u.fields.raw_output.as_ref()),
-        },
+        SessionUpdate::ToolCallUpdate(u) => {
+            let (detail, files) = u.fields.content.map(|c| tool_content(c, files)).unwrap_or_default();
+            Event::ToolUpdate {
+                id: id_string(&u.tool_call_id),
+                title: u.fields.title,
+                status: u.fields.status.map(status),
+                detail,
+                files,
+                input: tool_input(u.fields.raw_input.as_ref()),
+                output: tool_output(u.fields.raw_output.as_ref()),
+            }
+        }
         SessionUpdate::Plan(p) => Event::Plan(
             p.entries
                 .into_iter()
@@ -403,6 +424,7 @@ async fn run(
     kind: AgentKind,
     cwd: PathBuf,
     bridge: BridgeConfig,
+    files: PathBuf,
     resume: Option<String>,
     events: mpsc::UnboundedSender<Event>,
     mut commands: mpsc::UnboundedReceiver<Command>,
@@ -417,7 +439,7 @@ async fn run(
         .on_receive_notification(
             async move |n: SessionNotification, _cx: ConnectionTo<Agent>| {
                 if !notif_replaying.load(Ordering::SeqCst) {
-                    on_update(n.update, &notif_events);
+                    on_update(n.update, &files, &notif_events);
                 }
                 Ok(())
             },
@@ -473,6 +495,8 @@ async fn run(
                     bridge.socket.to_string_lossy().to_string(),
                 )]),
             );
+            // The agent tells which content blocks it takes in a prompt. See `attachment`.
+            let prompt_caps = init.agent_capabilities.prompt_capabilities.clone();
             let (session_id, modes, resumed) =
                 open_session(&cx, &init.agent_capabilities, &cwd, vec![mcp], resume, &replaying).await?;
             // The app does not let the user change the mode. Every session runs in the default mode.
@@ -497,10 +521,10 @@ async fn run(
 
             while let Some(command) = commands.recv().await {
                 match command {
-                    Command::Prompt(text) => {
+                    Command::Prompt { text, attachments } => {
+                        let blocks = attachment::prompt_blocks(text, &attachments, &prompt_caps);
                         let mut turn = std::pin::pin!(
-                            cx.send_request(PromptRequest::new(session_id.clone(), vec![text.into()]))
-                                .block_task()
+                            cx.send_request(PromptRequest::new(session_id.clone(), blocks)).block_task()
                         );
                         // Keep reading commands during the turn, so that Cancel works.
                         let result = loop {
@@ -510,7 +534,7 @@ async fn run(
                                     Some(Command::Cancel) => {
                                         let _ = cx.send_notification(CancelNotification::new(session_id.clone()));
                                     }
-                                    Some(Command::Prompt(_)) => {}
+                                    Some(Command::Prompt { .. }) => {}
                                     None => return Ok(()),
                                 },
                             }
