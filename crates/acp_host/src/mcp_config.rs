@@ -67,7 +67,7 @@ fn modified(path: &Path) -> Option<SystemTime> {
 }
 
 /// The files of the agent, as `read` expects them: for Claude Code, `.claude.json` comes first.
-fn config_files(kind: AgentKind, cwd: &Path, home: &Path) -> Vec<PathBuf> {
+pub(crate) fn config_files(kind: AgentKind, cwd: &Path, home: &Path) -> Vec<PathBuf> {
     match kind {
         AgentKind::Claude => {
             let (state, settings) = match std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from) {

@@ -2,16 +2,47 @@
 //! The sample conversation has no agent process. The app starts no agent for it.
 //! With `HELP_DEMO=live`, a message from the user plays a sample turn in which the agent
 //! delegates work to subagents.
+//! With `HELP_DEMO_APP=<server>/<tool>`, the sample conversation ends with a call of that MCP
+//! tool. The app connects to the MCP server, and shows the view of the tool if it has one.
 
 use std::time::Duration;
 
-use acp_host::{AgentKind, Event, PermissionOptionView, SUBAGENT_KIND, ToolStatus};
+use acp_host::{AgentKind, Event, McpCall, PermissionOptionView, SUBAGENT_KIND, ToolStatus};
 use tokio::sync::oneshot;
 
 use super::{Chat, Item, PendingPermission};
 
 pub fn enabled() -> bool {
     std::env::var_os("HELP_DEMO").is_some()
+}
+
+/// The events of the MCP tool call of `HELP_DEMO_APP`. The result is a sample: the time now.
+pub fn app_call() -> Vec<Event> {
+    let Some(name) = std::env::var("HELP_DEMO_APP").ok().filter(|_| enabled()) else { return Vec::new() };
+    let Some((server, tool)) = name.split_once('/') else { return Vec::new() };
+    let time = chrono::Utc::now().to_rfc3339();
+    vec![
+        Event::ToolCall {
+            id: "app1".into(),
+            title: format!("mcp__{server}__{tool}"),
+            kind: "Other".into(),
+            status: ToolStatus::Running,
+            parent: None,
+            mcp: Some(McpCall { server: server.into(), tool: tool.into() }),
+            input: Some(serde_json::json!({})),
+        },
+        Event::ToolUpdate {
+            id: "app1".into(),
+            title: None,
+            status: Some(ToolStatus::Done),
+            detail: Some(time.clone()),
+            input: None,
+            output: Some(serde_json::json!({
+                "content": [{ "type": "text", "text": time }],
+                "structuredContent": { "time": time },
+            })),
+        },
+    ]
 }
 
 /// A message from the user plays the sample turn of `delegation`.
@@ -117,11 +148,20 @@ fn call(id: &str, title: &str, kind: &str, parent: Option<&str>) -> Event {
         kind: kind.into(),
         status: ToolStatus::Running,
         parent: parent.map(Into::into),
+        mcp: None,
+        input: None,
     }
 }
 
 fn done(id: &str, detail: Option<&str>) -> Event {
-    Event::ToolUpdate { id: id.into(), title: None, status: Some(ToolStatus::Done), detail: detail.map(Into::into) }
+    Event::ToolUpdate {
+        id: id.into(),
+        title: None,
+        status: Some(ToolStatus::Done),
+        detail: detail.map(Into::into),
+        input: None,
+        output: None,
+    }
 }
 
 /// A sample turn: the agent delegates a review to three subagents, and each event comes after

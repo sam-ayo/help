@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 acp_host.workspace = true
+mcp_apps.workspace = true
 vm.workspace = true
 protocol.workspace = true
 anyhow.workspace = true
@@ -42,6 +43,7 @@ libc = "0.2"
 # Hot patching with `dx serve --hot-patch`. See src/hotpatch.rs and scripts/hot.sh.
 subsecond = { version = "0.7.10", optional = true }
 dioxus-devtools = { version = "0.7.10", optional = true }
+wry = "0.57.0"
 
 [features]
 hotpatch = ["dep:subsecond", "dep:dioxus-devtools"]

@@ -11,6 +11,8 @@ use tokio::sync::{mpsc, oneshot};
 
 mod mcp_config;
 pub use mcp_config::McpConfigWatch;
+mod mcp_servers;
+pub use mcp_servers::{McpServerSpec, McpTransport, mcp_servers};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -67,6 +69,14 @@ pub enum ToolStatus {
     Failed,
 }
 
+/// A tool call to an MCP server, with the names that the agent uses. Claude Code changes the
+/// characters of a server name that are not letters, digits, `_`, or `-` to `_`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpCall {
+    pub server: String,
+    pub tool: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct PermissionOptionView {
     pub id: String,
@@ -88,18 +98,25 @@ pub enum Event {
     Thought(String),
     /// A tool call. `kind` is `"subagent"` when the agent delegates work to a subagent.
     /// `parent` is the ID of the subagent tool call that made this tool call, if a subagent made it.
+    /// `mcp` tells the MCP server and tool, if the tool is an MCP tool. `input` has the arguments
+    /// of the tool.
     ToolCall {
         id: String,
         title: String,
         kind: String,
         status: ToolStatus,
         parent: Option<String>,
+        mcp: Option<McpCall>,
+        input: Option<serde_json::Value>,
     },
+    /// `output` is the result of the tool in the form of an MCP `CallToolResult`.
     ToolUpdate {
         id: String,
         title: Option<String>,
         status: Option<ToolStatus>,
         detail: Option<String>,
+        input: Option<serde_json::Value>,
+        output: Option<serde_json::Value>,
     },
     Plan(Vec<(String, ToolStatus)>),
     /// The agent asks for permission. Send the chosen option ID, or `None` to reject.
@@ -225,6 +242,45 @@ fn is_subagent(tc: &ToolCall) -> bool {
     matches!(claude_meta(tc.meta.as_ref(), "toolName"), Some("Agent" | "Task")) || tc.title == "spawnAgent"
 }
 
+/// The MCP server and tool of a tool call. Claude Code names an MCP tool
+/// `mcp__<server>__<tool>`. Codex gives the title `Tool: <server>/<tool>`.
+fn mcp_call(tc: &ToolCall) -> Option<McpCall> {
+    let name = claude_meta(tc.meta.as_ref(), "toolName").unwrap_or(&tc.title);
+    if let Some((server, tool)) = name.strip_prefix("mcp__").and_then(|rest| rest.split_once("__")) {
+        return Some(McpCall { server: server.into(), tool: tool.into() });
+    }
+    let (server, tool) = tc.title.strip_prefix("Tool: ")?.split_once('/')?;
+    Some(McpCall { server: server.into(), tool: tool.into() })
+}
+
+/// The arguments of a tool. Codex puts the arguments of an MCP tool in `arguments`, next to
+/// `server` and `tool`.
+fn tool_input(raw: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    let raw = raw?;
+    match raw.get("arguments") {
+        Some(args) if raw.get("server").is_some() && raw.get("tool").is_some() => Some(args.clone()),
+        _ => Some(raw.clone()),
+    }
+}
+
+/// The result of a tool as an MCP `CallToolResult`. Codex sends the full result, sometimes in
+/// `Ok` or `Err`. Claude Code sends only the content blocks, or a string.
+fn tool_output(raw: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+    use serde_json::{Value, json};
+    let raw = raw?;
+    Some(match raw {
+        Value::Object(o) if o.contains_key("content") || o.contains_key("structuredContent") => raw.clone(),
+        Value::Object(o) if o.len() == 1 && o.contains_key("Ok") => return tool_output(o.get("Ok")),
+        Value::Object(o) if o.len() == 1 && o.contains_key("Err") => {
+            json!({ "content": [{ "type": "text", "text": o["Err"].as_str().map(String::from).unwrap_or_else(|| o["Err"].to_string()) }], "isError": true })
+        }
+        Value::Array(blocks) => json!({ "content": blocks }),
+        Value::String(text) => json!({ "content": [{ "type": "text", "text": text }] }),
+        Value::Null => return None,
+        other => json!({ "content": [{ "type": "text", "text": other.to_string() }] }),
+    })
+}
+
 /// The activity and the name of a Codex subagent tool call: "Start subagent NAME",
 /// "Complete subagent NAME", or "Interrupt subagent NAME".
 fn codex_subagent(title: &str) -> Option<(&str, &str)> {
@@ -254,9 +310,17 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
                     kind: SUBAGENT_KIND.into(),
                     status: ToolStatus::Running,
                     parent: None,
+                    mcp: None,
+                    input: None,
                 },
-                "Complete" => Event::ToolUpdate { id, title: None, status: Some(ToolStatus::Done), detail: None },
-                _ => Event::ToolUpdate { id, title: None, status: Some(ToolStatus::Failed), detail: None },
+                activity => Event::ToolUpdate {
+                    id,
+                    title: None,
+                    status: Some(if activity == "Complete" { ToolStatus::Done } else { ToolStatus::Failed }),
+                    detail: None,
+                    input: None,
+                    output: None,
+                },
             }
         }
         SessionUpdate::ToolCall(tc) => Event::ToolCall {
@@ -265,12 +329,16 @@ fn on_update(update: SessionUpdate, events: &mpsc::UnboundedSender<Event>) {
             kind: if is_subagent(&tc) { SUBAGENT_KIND.into() } else { format!("{:?}", tc.kind) },
             status: status(tc.status),
             parent: claude_meta(tc.meta.as_ref(), "parentToolUseId").map(String::from),
+            mcp: mcp_call(&tc),
+            input: tool_input(tc.raw_input.as_ref()),
         },
         SessionUpdate::ToolCallUpdate(u) => Event::ToolUpdate {
             id: id_string(&u.tool_call_id),
             title: u.fields.title.clone(),
             status: u.fields.status.map(status),
             detail: u.fields.content.as_deref().and_then(content_text),
+            input: tool_input(u.fields.raw_input.as_ref()),
+            output: tool_output(u.fields.raw_output.as_ref()),
         },
         SessionUpdate::Plan(p) => Event::Plan(
             p.entries
@@ -463,4 +531,38 @@ async fn run(
             Ok(())
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_tools_get_their_server_and_tool() {
+        let claude = ToolCall::new("1", "mcp__basic__get-time");
+        assert_eq!(mcp_call(&claude), Some(McpCall { server: "basic".into(), tool: "get-time".into() }));
+        let codex = ToolCall::new("2", "Tool: basic/get-time");
+        assert_eq!(mcp_call(&codex), Some(McpCall { server: "basic".into(), tool: "get-time".into() }));
+        assert_eq!(mcp_call(&ToolCall::new("3", "Read file")), None);
+    }
+
+    #[test]
+    fn codex_input_is_the_arguments() {
+        let raw = json!({ "server": "basic", "tool": "get-time", "arguments": { "zone": "UTC" } });
+        assert_eq!(tool_input(Some(&raw)), Some(json!({ "zone": "UTC" })));
+        assert_eq!(tool_input(Some(&json!({ "path": "a" }))), Some(json!({ "path": "a" })));
+    }
+
+    #[test]
+    fn tool_output_becomes_a_call_tool_result() {
+        let blocks = json!([{ "type": "text", "text": "hi" }]);
+        assert_eq!(tool_output(Some(&blocks)), Some(json!({ "content": blocks })));
+        let full = json!({ "content": [], "structuredContent": { "a": 1 } });
+        assert_eq!(tool_output(Some(&json!({ "Ok": full }))), Some(full.clone()));
+        assert_eq!(tool_output(Some(&json!("x"))), Some(json!({ "content": [{ "type": "text", "text": "x" }] })));
+        assert_eq!(tool_output(Some(&json!({ "Err": "no" })))
+            .and_then(|v| v.get("isError").cloned()), Some(json!(true)));
+        assert_eq!(tool_output(Some(&serde_json::Value::Null)), None);
+    }
 }

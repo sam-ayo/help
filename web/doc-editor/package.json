@@ -1,0 +1,15 @@
+{
+  "name": "doc-editor",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@milkdown/crepe": "^7.22.3",
+    "@milkdown/kit": "^7.22.3"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2"
+  }
+}

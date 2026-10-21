@@ -1,7 +1,7 @@
 //! The main window: one conversation with the assistant, as in a messages app, and a sidebar.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -29,8 +29,10 @@ use crate::{Env, theme};
 
 mod avatar;
 mod demo;
+mod doc;
 mod dock;
 mod history;
+mod mcp_app;
 mod memory;
 
 gpui::actions!(help, [StopAgent, ToggleSidebar]);
@@ -92,6 +94,8 @@ struct Chat {
     /// The text of the summary that the agent writes in a compaction turn, or `None` when the
     /// turn is a usual turn. See `AppView::compact`.
     compaction: Option<String>,
+    /// The calls of MCP tools in this run of the app, by tool call ID. See `mcp_app`.
+    mcp_calls: HashMap<String, mcp_app::McpCallState>,
 }
 
 impl Chat {
@@ -111,6 +115,7 @@ impl Chat {
             permission: None,
             cwd,
             compaction: None,
+            mcp_calls: HashMap::new(),
         }
     }
 }
@@ -134,6 +139,22 @@ pub struct AppView {
     open_steps: HashSet<usize>,
     /// The files where the agent reads its MCP servers. See `poll_mcp_config`.
     mcp_watch: Option<McpConfigWatch>,
+    /// The MCP connections of the app, for MCP Apps, with the agent and the folder that they
+    /// are for. See `mcp_app`.
+    apps: Option<(AgentKind, PathBuf, mcp_apps::Apps)>,
+    /// The view of an MCP App, at the right side of the window.
+    panel: Option<mcp_app::Panel>,
+    panel_generation: u64,
+    /// The memory file or the conversation summary, at the right side of the window. It
+    /// shows instead of the view of an MCP App.
+    doc: Option<doc::Doc>,
+    /// The views send their messages here, with the generation of their panel.
+    app_messages: async_channel::Sender<(u64, String)>,
+    /// The context that a view gave for the next message to the agent: the name of the tool,
+    /// and the text.
+    app_context: Option<(String, String)>,
+    /// The connected MCP servers that have views. See `mcp_app::AppView::load_app_servers`.
+    app_servers: Vec<mcp_app::AppEntry>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -165,6 +186,15 @@ impl AppView {
         let rows = build_rows(&chat, &HashSet::new());
         let count = rows.len();
         let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        let (app_messages, app_inbox) = async_channel::unbounded::<(u64, String)>();
+        cx.spawn(async move |this, cx| {
+            while let Ok((generation, text)) = app_inbox.recv().await {
+                if this.update(cx, |this, cx| this.on_app_message(generation, text, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut view = Self {
             env,
             chat,
@@ -176,8 +206,20 @@ impl AppView {
             toggled_tools: HashSet::new(),
             open_steps: HashSet::new(),
             mcp_watch: None,
+            apps: None,
+            panel: None,
+            panel_generation: 0,
+            doc: None,
+            app_messages,
+            app_context: None,
+            app_servers: Vec::new(),
             _subs: subs,
         };
+        for event in demo::app_call() {
+            apply(&mut view.chat, event);
+        }
+        view.sync_mcp(cx);
+        view.rows_changed(cx);
         // Render the frames of the avatar in the colors that the user picked, then show them.
         avatar::load(&view.env.avatar_file, cx);
         // The Dock icon moves while the agent works, as the "working" row does. This is not in
@@ -193,7 +235,11 @@ impl AppView {
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(MCP_POLL).await;
-                if this.update(cx, |this, cx| this.poll_mcp_config(cx)).is_err() {
+                let ok = this.update(cx, |this, cx| {
+                    this.poll_mcp_config(cx);
+                    this.reload_doc(cx);
+                });
+                if ok.is_err() {
                     break;
                 }
             }
@@ -214,6 +260,8 @@ impl AppView {
     /// Start a new agent session, and show its events in the conversation. Dropping the old
     /// session stops its agent. With `resume`, the new agent process continues that session.
     fn connect(&mut self, resume: Option<String>, cx: &mut Context<Self>) {
+        // A new session can have different MCP servers.
+        self.load_app_servers(cx);
         // The demo starts no agents. See `demo`.
         if demo::enabled() {
             return;
@@ -267,6 +315,7 @@ impl AppView {
                             this.refresh_tools(servers, cx);
                         }
                     }
+                    this.sync_mcp(cx);
                     // The conversation follows the new text only when it shows the end. The user
                     // can scroll up to read while the agent works.
                     this.rows_changed(cx);
@@ -345,6 +394,14 @@ impl AppView {
             cx.notify();
             return;
         }
+        if self.submit(text, cx) {
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+    }
+
+    /// Send a message of the user to the agent, and show it. A message can also come from the
+    /// view of an MCP App. Returns false if the agent did not get the message.
+    fn submit(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         // An agent that stopped gets a new session.
         if self.chat.session.is_none() {
             self.connect(None, cx);
@@ -352,21 +409,25 @@ impl AppView {
         let chat = &mut self.chat;
         // The first prompt of a session has the earlier messages of the conversation.
         // It also has the memory about the user.
-        let prompt = if chat.primed {
+        let mut prompt = if chat.primed {
             text.clone()
         } else {
             memory::preamble(&self.env.memory_file, &self.env.history_file)
                 + &history::prompt_with_context(chat, &text)
         };
-        let Some(session) = &chat.session else { return };
+        let Some(session) = &chat.session else { return false };
+        // The view of an MCP App can give context for the next message.
+        if let Some((tool, context)) = self.app_context.take() {
+            prompt = format!("<app-context tool=\"{tool}\">\n{context}\n</app-context>\n\n{prompt}");
+        }
         session.send(Command::Prompt(prompt));
         chat.primed = true;
         chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp() });
         chat.busy = true;
-        self.composer.update(cx, |s, cx| s.set_value("", window, cx));
         self.scroll_to_end(cx);
         self.save(cx);
         cx.notify();
+        true
     }
 
     /// Ask the agent for a summary of the messages after the last compaction, and write it to
@@ -449,6 +510,8 @@ impl AppView {
         }
         let resume = chat.session_id.clone();
         chat.refreshing = Some(servers);
+        // The MCP connections of the app read the new servers too.
+        self.reset_apps();
         self.connect(resume, cx);
         self.rows_changed(cx);
         cx.notify();
@@ -582,20 +645,18 @@ impl AppView {
         window.focus(&self.composer.focus_handle(cx), cx);
     }
 
-    /// Open the memory file in the default text editor.
-    fn open_memory(&self) {
+    /// Show the memory file in the panel.
+    fn open_memory(&mut self, cx: &mut Context<Self>) {
         memory::ensure(&self.env.memory_file);
-        if let Err(e) = std::process::Command::new("open").arg("-t").arg(&self.env.memory_file).spawn() {
-            tracing::warn!("cannot open the memory file: {e}");
-        }
+        let path = self.env.memory_file.clone();
+        self.open_doc("Memory", KitIcon::Brain, &path, cx);
     }
 
-    /// Open the summary of the earlier conversation in the default text editor.
-    fn open_history(&self) {
+    /// Show the summary of the earlier conversation in the panel.
+    fn open_history(&mut self, cx: &mut Context<Self>) {
         memory::ensure_history(&self.env.history_file);
-        if let Err(e) = std::process::Command::new("open").arg("-t").arg(&self.env.history_file).spawn() {
-            tracing::warn!("cannot open the conversation summary: {e}");
-        }
+        let path = self.env.history_file.clone();
+        self.open_doc("History", KitIcon::BookOpen, &path, cx);
     }
 
     /// Put a suggested prompt in the composer, for the user to change or send.
@@ -751,20 +812,38 @@ fn apply(chat: &mut Chat, event: Event) {
             Some(Item::Thought(s)) => s.push_str(&t),
             _ => chat.items.push(Item::Thought(t)),
         },
-        Event::ToolCall { id, title, kind, status, parent } => chat.items.push(Item::Tool {
-            id,
-            title,
-            kind,
-            status,
-            detail: None,
-            parent,
-        }),
+        Event::ToolCall { id, title, kind, status, parent, mcp, input } => {
+            if let Some(call) = mcp {
+                chat.mcp_calls.insert(id.clone(), mcp_app::McpCallState::new(call, input, status));
+            }
+            chat.items.push(Item::Tool {
+                id,
+                title,
+                kind,
+                status,
+                detail: None,
+                parent,
+            })
+        }
         Event::ToolUpdate {
             id,
             title: new_title,
             status: new_status,
             detail: new_detail,
+            input: new_input,
+            output: new_output,
         } => {
+            if let Some(state) = chat.mcp_calls.get_mut(&id) {
+                if let Some(s) = new_status {
+                    state.status = s;
+                }
+                if new_input.is_some() {
+                    state.input = new_input;
+                }
+                if new_output.is_some() {
+                    state.output = new_output;
+                }
+            }
             let found = chat.items.iter_mut().rev().find_map(|i| match i {
                 Item::Tool {
                     id: tid,
@@ -1094,7 +1173,8 @@ impl AppView {
             .font_medium()
             .cursor_pointer()
             .hover(|el| el.bg(accent.opacity(0.08)))
-            .on_click(cx.listener(|this, _, _, _| this.open_memory()))
+            .when(self.doc.as_ref().is_some_and(|d| d.path == self.env.memory_file), |el| el.bg(accent.opacity(0.12)))
+            .on_click(cx.listener(|this, _, _, cx| this.open_memory(cx)))
             .child(Icon::new(KitIcon::Brain).size(px(16.)).text_color(theme.muted_foreground))
             .child(div().flex_1().child("Memory"));
         // The summary of the earlier conversation. See `AppView::compact`.
@@ -1109,7 +1189,8 @@ impl AppView {
             .font_medium()
             .cursor_pointer()
             .hover(|el| el.bg(accent.opacity(0.08)))
-            .on_click(cx.listener(|this, _, _, _| this.open_history()))
+            .when(self.doc.as_ref().is_some_and(|d| d.path == self.env.history_file), |el| el.bg(accent.opacity(0.12)))
+            .on_click(cx.listener(|this, _, _, cx| this.open_history(cx)))
             .child(Icon::new(KitIcon::BookOpen).size(px(16.)).text_color(theme.muted_foreground))
             .child(div().flex_1().child("History"));
         // Start the agent again in the same session, so that it gets new MCP tools. The app
@@ -1149,6 +1230,7 @@ impl AppView {
                     .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
             .child(div().pt_2().child(memory).child(history).child(refresh))
+            .children(self.render_app_list(cx))
             .child(div().flex_1())
             .child(self.render_theme_footer(cx));
         div()
@@ -1159,6 +1241,69 @@ impl AppView {
             .py(px(INSET))
             .child(panel)
             .into_any_element()
+    }
+
+    /// The connected MCP Apps with their logos, or nothing if no server has views.
+    fn render_app_list(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.app_servers.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let dark = theme.is_dark();
+        let rows = self.app_servers.iter().enumerate().map(|(ix, app)| {
+            let initial = app.title.chars().next().unwrap_or('?').to_uppercase().to_string();
+            let fallback = {
+                let theme = theme.clone();
+                move || {
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.))
+                        .bg(theme.secondary)
+                        .text_color(theme.muted_foreground)
+                        .text_xs()
+                        .font_semibold()
+                        .child(initial.clone())
+                        .into_any_element()
+                }
+            };
+            let logo = match app.logo(dark) {
+                Some(image) => gpui::StyledImage::with_fallback(gpui::img(image).size_full().rounded(px(4.)), fallback).into_any_element(),
+                None => fallback(),
+            };
+            h_flex()
+                .id(("app-server", ix))
+                .mx_2()
+                .px_2()
+                .h(px(32.))
+                .gap_2p5()
+                .rounded(px(8.))
+                .text_sm()
+                .font_medium()
+                .child(div().size(px(16.)).flex_shrink_0().child(logo))
+                .child(div().flex_1().min_w_0().truncate().child(app.title.clone()))
+                .tooltip({
+                    let server = app.server.clone();
+                    move |window, cx| gpui_component::tooltip::Tooltip::new(server.clone()).build(window, cx)
+                })
+        });
+        Some(
+            v_flex()
+                .pt_3()
+                .child(
+                    div()
+                        .px_4()
+                        .pb_1()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(theme.muted_foreground)
+                        .child("Apps"),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
     }
 
     /// The bottom of the sidebar: a menu to pick the theme, and a button for light or dark.
@@ -1582,6 +1727,22 @@ impl AppView {
                             })
                             .child(Icon::new(tool_icon(tool_kind)).size(px(14.)).text_color(theme.muted_foreground))
                             .child(div().flex_1().min_w_0().truncate().text_sm().child(title.clone()))
+                            // The tool has the view of an MCP App.
+                            .when(self.chat.mcp_calls.get(id).is_some_and(|s| s.view().is_some()), |el| {
+                                let showing = self.panel.as_ref().is_some_and(|p| p.tool_id == *id);
+                                let id = id.clone();
+                                el.child(
+                                    Button::new(("open-app", ix))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(KitIcon::AppWindow)
+                                        .label(if showing { "Showing" } else { "Open" })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.open_app(id.clone(), cx);
+                                        })),
+                                )
+                            })
                             // Claude Code keeps a subagent call pending while the subagent works.
                             .child(status_icon(
                                 if tool_kind == SUBAGENT_KIND && *status == ToolStatus::Pending && self.chat.busy {
@@ -1687,7 +1848,7 @@ impl AppView {
                         .gap_1p5()
                         .cursor_pointer()
                         .hover(|el| el.text_color(theme.foreground))
-                        .on_click(cx.listener(|this, _, _, _| this.open_history()))
+                        .on_click(cx.listener(|this, _, _, cx| this.open_history(cx)))
                         .child(Icon::new(KitIcon::Brain).size(px(12.)))
                         .child("The summary in help-memory.md has the messages above"),
                 )
@@ -1906,7 +2067,64 @@ impl Render for AppView {
 }
 
 impl AppView {
-    fn render_view(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The panel with the view of an MCP App, if a view shows.
+    fn render_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (webview, bounds) = self.prepare_panel(window, cx)?;
+        let panel = self.panel.as_ref()?;
+        let theme = cx.theme().clone();
+        let tool = &panel.ui.tool;
+        let title = tool
+            .get("title")
+            .or_else(|| tool.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("App")
+            .to_string();
+        Some(
+            v_flex()
+                .w(px(mcp_app::PANEL))
+                .h_full()
+                .flex_shrink_0()
+                .border_l_1()
+                .border_color(theme.border)
+                .bg(theme.background)
+                .child(
+                    self.toolbar("app-toolbar", cx)
+                        .h(px(TOOLBAR))
+                        .px_3()
+                        .gap_2()
+                        .child(Icon::new(KitIcon::AppWindow).size(px(14.)).text_color(theme.muted_foreground))
+                        .child(div().flex_1().min_w_0().truncate().text_sm().font_medium().child(title))
+                        .child(div().text_xs().text_color(theme.muted_foreground).child(panel.ui.server.clone()))
+                        .child(
+                            Button::new("close-app")
+                                .ghost()
+                                .small()
+                                .icon(KitIcon::PanelRightClose)
+                                .tooltip("Close the app")
+                                .on_click(cx.listener(|this, _, _, cx| this.close_app(cx))),
+                        ),
+                )
+                .child(
+                    div().flex_1().min_h_0().child(
+                        // The web view is a native view on top of the window. It follows the place
+                        // of this element.
+                        gpui::canvas(
+                            move |b, _, _| {
+                                bounds.set(Some(b));
+                                mcp_app::place(&webview, b);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .size_full(),
+                    ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let app_panel = self.render_panel(window, cx);
+        let doc_panel = self.render_doc(window, cx);
         let theme = cx.theme().clone();
         let chat = &self.chat;
         let kind = chat.kind;
@@ -2002,6 +2220,9 @@ impl AppView {
         h_flex()
             .size_full()
             .text_color(theme.foreground)
+            // A click outside the editor of the panel gives the keys back to the app. The editor
+            // is a native view, so its own clicks do not come here.
+            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.unfocus_doc()))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
@@ -2017,6 +2238,8 @@ impl AppView {
                     .child(toolbar)
                     .child(body),
             )
+            .children(app_panel)
+            .children(doc_panel)
     }
 }
 
