@@ -1,0 +1,104 @@
+# Makes a release from the Actions tab with one button. Open Actions > New release >
+# Run workflow, select the version change, and optionally type the release notes.
+#
+# The workflow makes an annotated tag on main, pushes it, and starts the Release workflow
+# on the tag. A tag push with GITHUB_TOKEN does not start other workflows, so this
+# workflow starts the Release workflow directly.
+#
+# If the notes are empty, the notes are the subjects of the commits since the last tag.
+
+name: New release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "The version change"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "An exact version such as 1.2.3. This replaces the version change."
+        type: string
+        required: false
+      notes:
+        description: "The release notes. The update alert shows them."
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  actions: write
+
+# Two runs at the same time can make the same tag.
+concurrency:
+  group: new-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Find the version
+        env:
+          BUMP: ${{ inputs.bump }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          last="$(git tag -l 'v*' --sort=-v:refname | head -1)"
+          if [ -n "$VERSION" ]; then
+            version="${VERSION#v}"
+          else
+            IFS=. read -r major minor patch <<< "${last#v}"
+            major="${major:-0}" minor="${minor:-0}" patch="${patch:-0}"
+            case "$BUMP" in
+              major) version="$((major + 1)).0.0" ;;
+              minor) version="$major.$((minor + 1)).0" ;;
+              patch) version="$major.$minor.$((patch + 1))" ;;
+            esac
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The version must have the form 1.2.3, not \"$version\"." >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
+            echo "The tag v$version exists." >&2
+            exit 1
+          fi
+          echo "LAST_TAG=$last" >> "$GITHUB_ENV"
+          echo "TAG=v$version" >> "$GITHUB_ENV"
+
+      - name: Write the release notes
+        env:
+          NOTES: ${{ inputs.notes }}
+        run: |
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > "$RUNNER_TEMP/notes.txt"
+          elif [ -n "$LAST_TAG" ]; then
+            git log --no-merges --format='- %s' "$LAST_TAG..HEAD" > "$RUNNER_TEMP/notes.txt"
+          else
+            git log --no-merges --format='- %s' > "$RUNNER_TEMP/notes.txt"
+          fi
+          if [ ! -s "$RUNNER_TEMP/notes.txt" ]; then
+            echo "main has no commits after $LAST_TAG." >&2
+            exit 1
+          fi
+          cat "$RUNNER_TEMP/notes.txt"
+
+      - name: Make and push the tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -F "$RUNNER_TEMP/notes.txt"
+          git push origin "refs/tags/$TAG"
+
+      - name: Start the Release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref "$TAG"
+          echo "Started the Release workflow for $TAG." >> "$GITHUB_STEP_SUMMARY"
