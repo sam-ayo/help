@@ -1,37 +1,27 @@
 //! A Markdown file in a panel at the right side of the window: the memory file, the
 //! conversation summary, or a document that the agent wrote for a long reply. The user edits
-//! the Markdown as formatted text, as in Notion. The editor is a web page
-//! (see `web/doc-editor`) in a web view. The page sends each change, and the app saves it.
+//! the Markdown as formatted text, as in Notion. The editor is the native editor of the crate
+//! `md_editor`. The editor tells each change, and the app saves it.
 
 use std::{
-    borrow::Cow,
     path::{Path, PathBuf},
-    rc::Rc,
+    sync::Arc,
     time::SystemTime,
 };
 
-use gpui::{ClipboardItem, prelude::FluentBuilder as _, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Task, Window, div, px};
+use gpui::{AppContext as _, ClipboardItem, Entity, prelude::FluentBuilder as _, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Subscription, Window, div, px};
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
     v_flex,
 };
 use gpui_kit_assets::IconName as KitIcon;
-use serde_json::{Value, json};
-use wry::{
-    NewWindowResponse, Rect, WebView, WebViewBuilder,
-    dpi::{LogicalPosition, LogicalSize},
-    http::{Response, header::CONTENT_TYPE},
-};
+use md_editor::{MarkdownEditor, MarkdownEditorEnvironment, MarkdownEditorEvent, MarkdownEditorOptions, MarkdownEditorTheme};
 
 use super::{AppView, Context, INSET, Item, TOOLBAR, accent, mcp_app};
 
 /// The width of the panel.
 pub(super) const WIDTH: f32 = 480.;
-/// The scheme of the address of the editor page.
-const SCHEME: &str = "helpdoc";
-/// The editor page, built from `web/doc-editor` with `npm run build`.
-const EDITOR: &str = include_str!("../../web/doc-editor.html");
 
 /// A Markdown file in the panel.
 pub(super) struct Doc {
@@ -42,22 +32,13 @@ pub(super) struct Doc {
     text: String,
     /// The time of the last change to the file, when the app read it or saved it.
     modified: Option<SystemTime>,
-    /// The app makes the web view when it renders the panel the first time, because the web
-    /// view needs the window.
-    webview: Option<Rc<WebView>>,
-    /// The place of the web view in the window.
-    bounds: mcp_app::PanelBounds,
-    /// The page can get the text. The app sends nothing before that.
-    ready: bool,
+    /// The app makes the editor when it renders the panel the first time.
+    editor: Option<Entity<MarkdownEditor>>,
     /// The app saved a change from the editor.
     saved: bool,
-    /// The colors and fonts that the page has.
-    theme: Option<Value>,
-    /// The editor got the keyboard focus. The next render takes the focus from the elements of
-    /// the app, so that the keys of the app, such as Command-Z, do not go to the composer.
-    blur: bool,
-    /// The task that gets the messages of the page.
-    _inbox: Option<Task<()>>,
+    /// The colors of the app that the editor has. See `theme_key`.
+    theme: Option<[Hsla; 4]>,
+    _events: Option<Subscription>,
 }
 
 impl Doc {
@@ -68,13 +49,10 @@ impl Doc {
             path: path.to_path_buf(),
             text: String::new(),
             modified: None,
-            webview: None,
-            bounds: Default::default(),
-            ready: false,
+            editor: None,
             saved: false,
             theme: None,
-            blur: false,
-            _inbox: None,
+            _events: None,
         };
         doc.read();
         doc
@@ -107,26 +85,6 @@ impl Doc {
         self.text = text;
         self.modified = modified(&self.path);
         self.saved = true;
-    }
-
-    /// Call a function of the page with one argument.
-    fn call(&self, function: &str, arg: &Value) {
-        if let Some(webview) = &self.webview
-            && let Err(e) = webview.evaluate_script(&format!("window.helpDoc.{function}({arg})"))
-        {
-            tracing::warn!("cannot send to the editor: {e}");
-        }
-    }
-
-    fn load(&self) {
-        self.call("load", &json!(self.text));
-    }
-
-    /// Hide the web view now. The web view goes when the panel goes.
-    fn hide(&self) {
-        if let Some(webview) = &self.webview {
-            let _ = webview.set_visible(false);
-        }
     }
 }
 
@@ -355,79 +313,55 @@ fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// A color as CSS.
-fn css(color: Hsla) -> String {
-    let c = gpui::Rgba::from(color);
-    let byte = |v: f32| (v * 255.).round() as u8;
-    format!("rgba({}, {}, {}, {:.3})", byte(c.r), byte(c.g), byte(c.b), c.a)
+/// The colors of the app that the editor theme comes from. A change of the theme of the app
+/// changes one of them.
+fn theme_key(theme: &Theme) -> [Hsla; 4] {
+    [theme.background, theme.foreground, accent(theme), theme.border]
 }
 
-/// The colors and fonts of the app, for the page.
-fn page_theme(theme: &Theme) -> Value {
+/// The theme of the editor, with the colors of the app, and sizes for the narrow panel.
+fn editor_theme(theme: &Theme) -> MarkdownEditorTheme {
+    let mut t = if theme.is_dark() { MarkdownEditorTheme::default_theme() } else { MarkdownEditorTheme::light_theme() };
     let accent = accent(theme);
-    // A font of the system has a name that starts with a period. The page uses the system font.
-    let font = |name: &str, fallback: &str| {
-        if name.is_empty() || name.starts_with('.') { fallback.to_string() } else { format!("\"{name}\", {fallback}") }
-    };
-    json!({
-        "background": css(theme.background),
-        "foreground": css(theme.foreground),
-        "muted": css(theme.muted),
-        "muted-foreground": css(theme.muted_foreground),
-        "border": css(theme.border),
-        "popover": css(theme.popover),
-        "accent": css(accent),
-        "selection": css(accent.opacity(0.2)),
-        "font": font(&theme.font_family, "-apple-system, BlinkMacSystemFont, system-ui, sans-serif"),
-        "mono": font(&theme.mono_font_family, "ui-monospace, Menlo, monospace"),
-    })
-}
-
-/// A script that gives the page the colors of the app before the page draws. Without it, the
-/// page is white until it gets the colors from the app.
-fn theme_script(theme: &Value) -> String {
-    let rules: String = theme
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter_map(|(name, value)| Some(format!("--help-{name}: {};", value.as_str()?)))
-        .collect();
-    format!(
-        "(() => {{ const sheet = new CSSStyleSheet(); sheet.replaceSync({}); \
-         document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet]; }})();",
-        json!(format!(":root {{ {rules} }}"))
-    )
-}
-
-fn build_webview(messages: async_channel::Sender<String>, theme: &Value, window: &Window) -> wry::Result<WebView> {
-    WebViewBuilder::new()
-        .with_incognito(true)
-        .with_devtools(cfg!(debug_assertions))
-        // The web view does not draw white before the page draws. The card shows below it.
-        .with_transparent(true)
-        // The web view shows when the editor has the text. See `on_doc_message`.
-        .with_visible(false)
-        .with_initialization_script(theme_script(theme))
-        .with_bounds(Rect { position: LogicalPosition::new(0., 0.).into(), size: LogicalSize::new(0., 0.).into() })
-        .with_custom_protocol(SCHEME.into(), |_, request| {
-            let found = matches!(request.uri().path(), "" | "/" | "/index.html");
-            Response::builder()
-                .status(if found { 200 } else { 404 })
-                .header(CONTENT_TYPE, "text/html; charset=utf-8")
-                .body(Cow::Borrowed(if found { EDITOR.as_bytes() } else { &[][..] }))
-                .unwrap_or_default()
-        })
-        .with_ipc_handler(move |request| {
-            let _ = messages.try_send(request.into_body());
-        })
-        // The page stays on its page. A link that opens a window opens in the browser.
-        .with_navigation_handler(|url| url.starts_with(&format!("{SCHEME}://")) || url == "about:blank")
-        .with_new_window_req_handler(|url, _| {
-            let _ = mcp_app::open_link(&url);
-            NewWindowResponse::Deny
-        })
-        .with_url(format!("{SCHEME}://localhost/"))
-        .build_as_child(window)
+    let c = &mut t.colors;
+    c.editor_background = theme.background;
+    c.text_default = theme.foreground;
+    for h in [&mut c.text_h1, &mut c.text_h2, &mut c.text_h3, &mut c.text_h4, &mut c.text_h5, &mut c.text_h6] {
+        *h = theme.foreground;
+    }
+    c.text_link = accent;
+    c.text_placeholder = theme.muted_foreground;
+    c.text_quote = theme.muted_foreground;
+    for b in [&mut c.border_h1, &mut c.border_h2, &mut c.border_quote, &mut c.separator_color, &mut c.table_border] {
+        *b = theme.border;
+    }
+    c.code_bg = theme.muted;
+    c.code_text = theme.foreground;
+    c.table_header_bg = theme.muted;
+    c.table_cell_bg = theme.background;
+    c.cursor = theme.caret;
+    c.selection = accent.opacity(0.2);
+    c.scrollbar_thumb = theme.scrollbar_thumb;
+    c.dialog_surface = theme.popover;
+    c.dialog_border = theme.border;
+    c.dialog_title = theme.popover_foreground;
+    c.dialog_body = theme.popover_foreground;
+    c.dialog_muted = theme.muted_foreground;
+    c.dialog_primary_button_bg = accent;
+    c.dialog_primary_button_hover = theme.primary_hover;
+    c.dialog_primary_button_text = theme.primary_foreground;
+    // The panel is narrower than a window, so the text is smaller than in Velotype.
+    let ty = &mut t.typography;
+    ty.text_size = 15.;
+    ty.h1_size = 24.;
+    ty.h2_size = 20.;
+    ty.h3_size = 17.;
+    ty.h4_size = 15.;
+    ty.h5_size = 14.;
+    ty.h6_size = 13.;
+    ty.code_size = 13.;
+    t.dimensions.editor_padding = 20.;
+    t
 }
 
 impl AppView {
@@ -442,90 +376,73 @@ impl AppView {
         cx.notify();
     }
 
-    /// Close the panel. The page sent each change already, so the file has all of them.
+    /// Close the panel. The editor told each change already, so the file has all of them.
     pub(super) fn close_doc(&mut self, cx: &mut Context<Self>) {
-        if let Some(doc) = self.doc.take() {
-            doc.hide();
-        }
+        self.doc = None;
         cx.notify();
-    }
-
-    /// The user clicked the app outside the editor. The keys go to the app again.
-    pub(super) fn unfocus_doc(&self) {
-        if let Some(webview) = self.doc.as_ref().and_then(|d| d.webview.as_ref()) {
-            let _ = webview.focus_parent();
-        }
     }
 
     /// Show the new text of the file in the editor, if the file changed.
     pub(super) fn reload_doc(&mut self, cx: &mut Context<Self>) {
         let Some(doc) = &mut self.doc else { return };
-        if doc.reload() && doc.ready {
-            doc.load();
+        if doc.reload()
+            && let Some(editor) = &doc.editor
+        {
+            let text = doc.text.clone();
+            editor.update(cx, |editor, cx| editor.replace_markdown(text, cx));
             cx.notify();
         }
     }
 
-    /// A message from the page.
-    fn on_doc_message(&mut self, text: String, cx: &mut Context<Self>) {
-        let Some(doc) = &mut self.doc else { return };
-        let Ok(message) = serde_json::from_str::<Value>(&text) else { return };
-        match message.get("type").and_then(Value::as_str) {
-            Some("ready") => {
-                doc.ready = true;
-                doc.theme = None;
-                doc.load();
-            }
-            Some("loaded") => {
-                if let Some(webview) = &doc.webview {
-                    let _ = webview.set_visible(true);
+    fn on_doc_event(&mut self, editor: Entity<MarkdownEditor>, event: &MarkdownEditorEvent, cx: &mut Context<Self>) {
+        match event {
+            MarkdownEditorEvent::Changed { .. } => {
+                let markdown = editor.read(cx).markdown(cx);
+                if let Some(doc) = &mut self.doc {
+                    doc.save(markdown);
+                    cx.notify();
                 }
             }
-            Some("change") => {
-                let Some(markdown) = message.get("markdown").and_then(Value::as_str) else { return };
-                doc.save(markdown.to_string());
+            MarkdownEditorEvent::OpenLinkRequested(link) => {
+                let _ = mcp_app::open_link(&link.open_target);
             }
-            Some("focus") => doc.blur = true,
-            Some("paste") => {
-                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else { return };
-                doc.call("paste", &json!(text));
-                return;
-            }
-            _ => return,
+            MarkdownEditorEvent::Error { message } => tracing::warn!("the editor: {message}"),
+            _ => {}
         }
-        cx.notify();
     }
 
-    /// Make the web view if the panel has none, and give the page a change of the theme.
-    fn prepare_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<(Rc<WebView>, mcp_app::PanelBounds)> {
-        let theme = page_theme(cx.theme());
+    /// Make the editor if the panel has none, and give the editor a change of the theme.
+    fn prepare_doc(&mut self, cx: &mut Context<Self>) -> Option<Entity<MarkdownEditor>> {
+        let key = theme_key(cx.theme());
+        let theme = Arc::new(editor_theme(cx.theme()));
         let doc = self.doc.as_mut()?;
-        if std::mem::take(&mut doc.blur) {
-            window.blur(cx);
-        }
-        if doc.webview.is_none() {
-            let (tx, rx) = async_channel::unbounded::<String>();
-            match build_webview(tx, &theme, window) {
-                Ok(webview) => doc.webview = Some(Rc::new(webview)),
-                Err(e) => {
-                    tracing::warn!("cannot show the editor: {e}");
-                    self.doc = None;
-                    return None;
+        let editor = match &doc.editor {
+            Some(editor) => {
+                if doc.theme != Some(key) {
+                    editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
                 }
+                editor.clone()
             }
-            doc._inbox = Some(cx.spawn(async move |this, cx| {
-                while let Ok(text) = rx.recv().await {
-                    if this.update(cx, |this, cx| this.on_doc_message(text, cx)).is_err() {
-                        break;
-                    }
-                }
-            }));
-        }
-        if doc.ready && doc.theme.as_ref() != Some(&theme) {
-            doc.call("theme", &theme);
-            doc.theme = Some(theme);
-        }
-        Some((doc.webview.clone()?, doc.bounds.clone()))
+            None => {
+                let options = MarkdownEditorOptions {
+                    environment: MarkdownEditorEnvironment {
+                        theme,
+                        document_base_dir: doc.path.parent().map(Path::to_path_buf),
+                        ..MarkdownEditorEnvironment::default()
+                    },
+                    // The panel can open at the end of a turn. The keys stay in the composer.
+                    autofocus: false,
+                    ..MarkdownEditorOptions::default()
+                };
+                let text = doc.text.clone();
+                let editor = cx.new(|cx| MarkdownEditor::new(text, options, cx));
+                doc._events = Some(cx.subscribe(&editor, Self::on_doc_event));
+                doc.editor = Some(editor.clone());
+                editor
+            }
+        };
+        doc.theme = Some(key);
+        Some(editor)
     }
 
     /// Show a document that the agent wrote in the panel.
@@ -562,7 +479,7 @@ impl AppView {
     /// The panel with the Markdown file. It floats inset from the window edges, as the
     /// sidebar does.
     pub(super) fn render_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        let (webview, bounds) = self.prepare_doc(window, cx)?;
+        let editor = self.prepare_doc(cx)?;
         let doc = self.doc.as_ref()?;
         let theme = cx.theme().clone();
         let accent = accent(&theme);
@@ -611,18 +528,8 @@ impl AppView {
                     .on_click(cx.listener(|this, _, _, cx| this.close_doc(cx))),
             );
 
-        // The web view is a native view on top of the window. It follows the place of this
-        // element. The space below it keeps the round corners of the card.
-        let body = div().flex_1().min_h_0().pb_3().child(
-            gpui::canvas(
-                move |b, _, _| {
-                    bounds.set(Some(b));
-                    mcp_app::place(&webview, b);
-                },
-                |_, _, _, _| {},
-            )
-            .size_full(),
-        );
+        // The space below the editor keeps the round corners of the card.
+        let body = div().flex_1().min_h_0().pb_3().child(editor);
 
         let card = v_flex()
             .size_full()
@@ -734,13 +641,6 @@ mod tests {
         let title = prompt_title(&"word ".repeat(30)).unwrap();
         assert!(title.ends_with("word…") && title.chars().count() <= TITLE + 1);
         assert_eq!(prompt_title("\n \n"), None);
-    }
-
-    #[test]
-    fn the_page_gets_the_colors_before_it_draws() {
-        let script = theme_script(&json!({ "background": "rgba(1, 2, 3, 1.000)", "font": "\"Inter\", sans-serif" }));
-        assert!(script.contains(r#"--help-background: rgba(1, 2, 3, 1.000);"#));
-        assert!(script.contains(r#"--help-font: \"Inter\", sans-serif;"#));
     }
 
     #[test]

@@ -2776,9 +2776,6 @@ impl AppView {
         h_flex()
             .size_full()
             .text_color(theme.foreground)
-            // A click outside the editor of the panel gives the keys back to the app. The editor
-            // is a native view, so its own clicks do not come here.
-            .capture_any_mouse_down(cx.listener(|this, _, _, _| this.unfocus_doc()))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .when(sidebar, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))

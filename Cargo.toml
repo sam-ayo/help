@@ -11,6 +11,7 @@ protocol = { path = "crates/protocol" }
 vm = { path = "crates/vm" }
 acp_host = { path = "crates/acp_host" }
 mcp_apps = { path = "crates/mcp_apps" }
+md_editor = { path = "crates/md_editor" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
