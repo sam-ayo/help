@@ -42,6 +42,12 @@ pub struct Env {
     /// The images that the user pastes, and the files that the agent sends. The conversation
     /// keeps the paths of these files.
     pub files_dir: PathBuf,
+    /// The Markdown documents that the agent writes for its long replies. See `ui::doc`.
+    pub docs_dir: PathBuf,
+    /// The conversation and the summary of the test thread. The test thread lets the user
+    /// try the app without a change to the main conversation. See `ui::Thread`.
+    pub test_conversation_file: PathBuf,
+    pub test_history_file: PathBuf,
 }
 
 fn app_support() -> PathBuf {
@@ -157,7 +163,11 @@ fn main() {
         history_file: support.join("help-memory.md"),
         avatar_file: support.join("avatar"),
         files_dir: support.join("files"),
+        docs_dir: support.join("documents"),
+        test_conversation_file: support.join("test-conversation.json"),
+        test_history_file: support.join("test-memory.md"),
     };
+    let _ = std::fs::create_dir_all(&env.docs_dir);
 
     let app = gpui_platform::application().with_assets(gpui_kit_assets::AllAssets);
     // A click on the Dock icon shows the hidden window.

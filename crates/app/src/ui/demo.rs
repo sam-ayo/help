@@ -73,8 +73,27 @@ fn user(text: &str, ago: i64) -> Item {
     Item::User { text: text.into(), at: chrono::Utc::now().timestamp() - ago * 60, attachments: Vec::new() }
 }
 
-/// Four turns over some days. The agent waits for a permission in the last turn.
+/// A sample document for the long reply of the demo. See `doc::links`.
+const REVIEW: &str = "# Settings review\n\n\
+## Summary\n\nThe settings code works, but two options have no checks.\n\n\
+## Findings\n\n\
+1. **`theme`** — the app accepts any string. Accept only `light`, `dark`, and `system`.\n\
+2. **`timeout`** — a negative value stops all requests. Set a minimum of 1 second.\n\n\
+## Next steps\n\n- Add a schema for the settings file.\n- Add a test for each option.\n";
+
+/// Write the sample document if it is not there, and give its path.
+fn review(home: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(home).join("Library/Application Support/Help/documents/settings-review.md");
+    if !path.exists() {
+        let _ = path.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&path, REVIEW);
+    }
+    path
+}
+
+/// Five turns over some days. The agent waits for a permission in the last turn.
 pub fn chat() -> Chat {
+    let home = std::env::var("HOME").unwrap_or_default();
     let items = vec![
         user("Summarize the README in three points.", 9 * 24 * 60),
         Item::Agent(
@@ -87,6 +106,12 @@ pub fn chat() -> Chat {
         user("Deploy the preview build to staging.", 26 * 60),
         tool("d1", "./scripts/deploy.sh staging", "execute", ToolStatus::Failed, Some("error: no credentials for staging")),
         Item::Error("The deploy script stopped: no credentials for staging.".into()),
+        user("Review the settings code and write a report.", 5 * 60),
+        Item::Agent(format!(
+            "The settings code works, but two options have no checks: `theme` and `timeout`. \
+             The report has the findings and the next steps.\n\n[Settings review](<{}>)",
+            review(&home).display()
+        )),
         user("The login test fails about one time in five on CI. Can you find out why and fix it?", 3 * 60),
         Item::Thought("The test probably races with the session cookie. Look at the setup first.".into()),
         tool(
@@ -122,7 +147,6 @@ pub fn chat() -> Chat {
         Item::Agent("I will add a `ThemeSwitch` component and a `useTheme` hook. First I need to install a package.".into()),
         tool("w1", "Search for \"settings\" in src/", "search", ToolStatus::Done, None),
     ];
-    let home = std::env::var("HOME").unwrap_or_default();
     let mut chat = Chat::new(AgentKind::Claude, items, std::path::PathBuf::from(home).join("Projects/web-app"));
     if live() {
         // The live demo waits for a message, so the last turn and its permission request go.

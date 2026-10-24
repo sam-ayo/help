@@ -8,7 +8,7 @@ use std::{
 
 use acp_host::{AgentKind, Attachment, Command, Event, McpConfigWatch, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
 use gpui::{
-    AppContext as _, Context, Div, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    AppContext as _, Context, Div, ElementId, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StyleRefinement, Stateful, StatefulInteractiveElement as _, Styled as _,
     Anchor, Animation, AnimationExt as _, ClipboardEntry, ClipboardItem, ExternalPaths, Window, div,
     prelude::FluentBuilder as _, px, rgb,
@@ -126,8 +126,47 @@ impl Chat {
     }
 }
 
+/// The threads in the sidebar of a dev build. Each thread has its own conversation and
+/// summary. The memory about the user is the same for the two threads. A release build has
+/// only the main thread.
+#[derive(Clone, Copy, PartialEq)]
+enum Thread {
+    /// The conversation that the user has each day.
+    Main,
+    /// A conversation to try the app in, without a change to the main conversation.
+    Test,
+}
+
+impl Thread {
+    fn conversation_file(self, env: &Env) -> &Path {
+        match self {
+            Thread::Main => &env.conversation_file,
+            Thread::Test => &env.test_conversation_file,
+        }
+    }
+
+    fn history_file(self, env: &Env) -> &Path {
+        match self {
+            Thread::Main => &env.history_file,
+            Thread::Test => &env.test_history_file,
+        }
+    }
+
+    /// The saved conversation of the thread. Only the main thread starts with the chats of an
+    /// older version of the app.
+    fn load(self, env: &Env) -> Vec<Item> {
+        let legacy = match self {
+            Thread::Main => &env.chats_file,
+            Thread::Test => &env.test_conversation_file,
+        };
+        history::load(self.conversation_file(env), legacy)
+    }
+}
+
 pub struct AppView {
     env: Env,
+    /// The thread that shows. The app always starts with the main thread.
+    thread: Thread,
     chat: Chat,
     composer: Entity<TextareaState>,
     /// The rows that the conversation shows. See `build_rows`.
@@ -163,6 +202,8 @@ pub struct AppView {
     app_servers: Vec<mcp_app::AppEntry>,
     /// The files that the user attached to the next message. See `attach`.
     attachments: Vec<Attachment>,
+    /// A click on a link to a document in a message sends the path here. See `doc::links`.
+    doc_clicks: async_channel::Sender<PathBuf>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -188,7 +229,7 @@ impl AppView {
                 .map(|s| PathBuf::from(s.trim()))
                 .filter(|p| p.is_dir())
                 .unwrap_or_else(|| env.workspace.clone());
-            let items = history::load(&env.conversation_file, &env.chats_file);
+            let items = Thread::Main.load(&env);
             Chat::new(load_agent(&env.agent_file), items, cwd)
         };
         let rows = build_rows(&chat, &HashSet::new());
@@ -203,8 +244,18 @@ impl AppView {
             }
         })
         .detach();
+        let (doc_clicks, doc_inbox) = async_channel::unbounded::<PathBuf>();
+        cx.spawn(async move |this, cx| {
+            while let Ok(path) = doc_inbox.recv().await {
+                if this.update(cx, |this, cx| this.open_document(&path, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
         let mut view = Self {
             env,
+            thread: Thread::Main,
             chat,
             composer,
             rows,
@@ -222,6 +273,7 @@ impl AppView {
             app_context: None,
             app_servers: Vec::new(),
             attachments: Vec::new(),
+            doc_clicks,
             _subs: subs,
         };
         for event in demo::app_call() {
@@ -313,6 +365,9 @@ impl AppView {
                         let ended = matches!(event, Event::TurnEnded(_));
                         let save = ended || matches!(event, Event::Closed);
                         apply(&mut this.chat, event);
+                        if ended {
+                            this.finish_reply(cx);
+                        }
                         if save {
                             this.save(cx);
                         }
@@ -345,14 +400,14 @@ impl AppView {
             return;
         }
         let snapshot = history::snapshot(&self.chat);
-        let path = self.env.conversation_file.clone();
+        let path = self.thread.conversation_file(&self.env).to_path_buf();
         cx.background_spawn(async move { history::write(&path, snapshot) }).detach();
     }
 
     /// Keep the conversation in a file before the app stops.
     fn save_now(&self) {
         if !demo::enabled() {
-            history::write(&self.env.conversation_file, history::snapshot(&self.chat));
+            history::write(self.thread.conversation_file(&self.env), history::snapshot(&self.chat));
         }
     }
 
@@ -511,7 +566,7 @@ impl AppView {
         let mut prompt = if chat.primed {
             text.clone()
         } else {
-            memory::preamble(&self.env.memory_file, &self.env.history_file)
+            memory::preamble(&self.env.memory_file, self.thread.history_file(&self.env), &self.env.docs_dir)
                 + &history::prompt_with_context(chat, &text)
         };
         let Some(session) = &chat.session else { return Err(attachments) };
@@ -548,7 +603,7 @@ impl AppView {
         }
         let Some(session) = &self.chat.session else { return };
         session.send(Command::Prompt {
-            text: memory::compact_prompt(&self.env.history_file, &transcript),
+            text: memory::compact_prompt(self.thread.history_file(&self.env), &transcript),
             attachments: Vec::new(),
         });
         self.chat.compaction = Some(String::new());
@@ -570,7 +625,7 @@ impl AppView {
             Event::TurnEnded(reason) => {
                 let summary = chat.compaction.take().unwrap_or_default();
                 chat.busy = false;
-                if reason == "EndTurn" && memory::write_history(&self.env.history_file, &summary) {
+                if reason == "EndTurn" && memory::write_history(self.thread.history_file(&self.env), &summary) {
                     self.chat.items.push(Item::Compacted);
                     self.save(cx);
                     // The new session has a small context: the summary and the newest messages.
@@ -708,43 +763,41 @@ impl AppView {
         cx.notify();
     }
 
-    /// Ask for the folder that the agent works in. The agent starts again in the new folder,
-    /// and gets the earlier messages with the next message.
-    fn pick_folder(&mut self, cx: &mut Context<Self>) {
-        if self.chat.busy {
-            return;
-        }
-        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose".into()),
-        });
-        cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else { return };
-            let Some(path) = paths.into_iter().next() else { return };
-            let _ = this.update(cx, |this, cx| {
-                if path == this.chat.cwd || this.chat.busy {
-                    return;
-                }
-                if let Err(e) = std::fs::write(&this.env.folder_file, path.to_string_lossy().as_bytes()) {
-                    tracing::warn!("cannot save the folder: {e}");
-                }
-                if !this.chat.items.is_empty() {
-                    this.chat.items.push(Item::Notice(format!("The agent works in {} now.", display_path(&path))));
-                }
-                this.chat.cwd = path;
-                this.connect(None, cx);
-                this.scroll_to_end(cx);
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     /// Put the keyboard focus in the composer.
     pub(crate) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.composer.focus_handle(cx), cx);
+    }
+
+    /// Show the other thread. The agent of the old thread stops, and an agent starts for the
+    /// new thread. The thread does not change while the agent works.
+    fn open_thread(&mut self, thread: Thread, cx: &mut Context<Self>) {
+        if !cfg!(debug_assertions) || thread == self.thread || self.chat.busy || demo::enabled() {
+            return;
+        }
+        self.save_now();
+        // The panel can show the summary of the old thread.
+        if self.doc.as_ref().is_some_and(|d| d.path == self.thread.history_file(&self.env)) {
+            self.doc = None;
+        }
+        // The view of an MCP App is for a tool call of the old thread. Its messages and its
+        // context must not go to the new thread. A closed panel ignores its old messages.
+        self.close_app(cx);
+        self.app_context = None;
+        self.thread = thread;
+        // The agent of the old thread stops and sends `Closed`. The new chat keeps the
+        // generation, so that the events of the old session do not apply to it.
+        let generation = self.chat.generation;
+        self.chat = Chat::new(self.chat.kind, thread.load(&self.env), self.chat.cwd.clone());
+        self.chat.generation = generation;
+        self.toggled_tools.clear();
+        self.open_steps.clear();
+        // The rows of the old thread are not in the new thread, so the scroller starts again.
+        self.rows = build_rows(&self.chat, &self.open_steps);
+        let count = self.rows.len();
+        self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        self.connect(None, cx);
+        self.scroll_to_end(cx);
+        cx.notify();
     }
 
     /// Show the memory file in the panel.
@@ -756,15 +809,9 @@ impl AppView {
 
     /// Show the summary of the earlier conversation in the panel.
     fn open_history(&mut self, cx: &mut Context<Self>) {
-        memory::ensure_history(&self.env.history_file);
-        let path = self.env.history_file.clone();
+        memory::ensure_history(self.thread.history_file(&self.env));
+        let path = self.thread.history_file(&self.env).to_path_buf();
         self.open_doc("History", KitIcon::BookOpen, &path, cx);
-    }
-
-    /// Put a suggested prompt in the composer, for the user to change or send.
-    fn suggest(&mut self, text: &'static str, window: &mut Window, cx: &mut Context<Self>) {
-        self.composer.update(cx, |s, cx| s.set_value(text, window, cx));
-        window.focus(&self.composer.focus_handle(cx), cx);
     }
 }
 
@@ -1054,13 +1101,6 @@ fn save_agent(path: &std::path::Path, kind: AgentKind) {
     }
 }
 
-fn agent_color(kind: AgentKind) -> Hsla {
-    match kind {
-        AgentKind::Claude => rgb(0xD97757).into(),
-        AgentKind::Codex => rgb(0x10A37F).into(),
-    }
-}
-
 /// The accent of the theme, for the selected items, the links, and the send button.
 fn accent(theme: &Theme) -> Hsla {
     theme.primary
@@ -1279,6 +1319,29 @@ impl AppView {
                     .child(div().text_color(accent).child(".")),
             );
 
+        // The threads, in a dev build only. See `Thread`.
+        let thread_row = |id: &'static str, thread: Thread, icon: KitIcon, label: &'static str, cx: &mut Context<Self>| {
+            h_flex()
+                .id(id)
+                .mx_2()
+                .px_2()
+                .h(px(32.))
+                .gap_2p5()
+                .rounded(px(8.))
+                .text_sm()
+                .font_medium()
+                .cursor_pointer()
+                .hover(|el| el.bg(accent.opacity(0.08)))
+                .when(self.thread == thread, |el| el.bg(accent.opacity(0.12)))
+                .on_click(cx.listener(move |this, _, _, cx| this.open_thread(thread, cx)))
+                .child(Icon::new(icon).size(px(16.)).text_color(theme.muted_foreground))
+                .child(div().flex_1().child(label))
+        };
+        let threads = div()
+            .pt_2()
+            .child(thread_row("thread-main", Thread::Main, KitIcon::Bot, "Main", cx))
+            .child(thread_row("thread-test", Thread::Test, KitIcon::FlaskConical, "Test", cx));
+
         // The file of facts about the user that each session reads. See `memory`.
         let memory = h_flex()
             .id("memory")
@@ -1307,7 +1370,7 @@ impl AppView {
             .font_medium()
             .cursor_pointer()
             .hover(|el| el.bg(accent.opacity(0.08)))
-            .when(self.doc.as_ref().is_some_and(|d| d.path == self.env.history_file), |el| el.bg(accent.opacity(0.12)))
+            .when(self.doc.as_ref().is_some_and(|d| d.path == self.thread.history_file(&self.env)), |el| el.bg(accent.opacity(0.12)))
             .on_click(cx.listener(|this, _, _, cx| this.open_history(cx)))
             .child(Icon::new(KitIcon::BookOpen).size(px(16.)).text_color(theme.muted_foreground))
             .child(div().flex_1().child("History"));
@@ -1347,6 +1410,7 @@ impl AppView {
                     .child(div().flex_1().child(brand))
                     .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
+            .when(cfg!(debug_assertions), |el| el.child(threads))
             .child(div().pt_2().child(memory).child(history).child(refresh))
             .children(self.render_app_list(cx))
             .child(div().flex_1())
@@ -1755,8 +1819,21 @@ impl AppView {
                 .into_any_element(),
             Item::Agent(text) => {
                 let group: SharedString = format!("agent-message-{ix}").into();
-                let copy = text.clone();
                 let bubble = agent_bubble(&theme);
+                // The chat shows the summary of a long reply. The panel shows the full reply.
+                let docs = doc::links(text, &self.env.docs_dir);
+                let text = if docs.is_empty() { text.clone() } else { doc::without_links(text, &self.env.docs_dir) };
+                let copy = text.clone();
+                // A link to a document opens it in the panel. Other links open in the browser.
+                let (dir, clicks) = (self.env.docs_dir.clone(), self.doc_clicks.clone());
+                let message = TextView::markdown(("item", ix), SharedString::from(text))
+                    .selectable(true)
+                    .on_link_click(move |href, _, _, cx| match doc::link_target(href, &dir) {
+                        Some(path) => {
+                            let _ = clicks.try_send(path);
+                        }
+                        None => cx.open_url(href),
+                    });
                 h_flex()
                     .group(group.clone())
                     .items_end()
@@ -1771,7 +1848,8 @@ impl AppView {
                             .py_2p5()
                             .rounded(px(18.))
                             .bg(bubble)
-                            .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true))
+                            .child(message)
+                            .when(!docs.is_empty(), |el| el.child(self.document_links(ix, &docs, &theme, cx)))
                             // The tail at the bottom left: a gray corner, and a corner of the
                             // background color on it that cuts the curve.
                             .child(
@@ -2020,6 +2098,46 @@ impl AppView {
         }
     }
 
+    /// The rows at the bottom of a message that open its documents in the panel. The rows do
+    /// not show the file names. A click on the row of the open document closes the panel.
+    fn document_links(&self, ix: usize, docs: &[PathBuf], theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let accent = accent(theme);
+        let open = self.doc.as_ref().map(|d| d.path.clone());
+        v_flex()
+            .mt_2()
+            .pt_1p5()
+            .mb(px(-4.))
+            .border_t_1()
+            .border_color(theme.border)
+            .children(docs.iter().enumerate().map(|(i, path)| {
+                let shown = open.as_ref() == Some(path);
+                let label = if !path.is_file() {
+                    "The full reply is not there".to_string()
+                } else if shown {
+                    "Hide the full reply".to_string()
+                } else if docs.len() == 1 {
+                    "Read the full reply".to_string()
+                } else {
+                    format!("Read {}", doc::title(path))
+                };
+                let path = path.clone();
+                h_flex()
+                    .id(ElementId::NamedInteger(format!("doc-link-{ix}").into(), i as u64))
+                    .gap_1p5()
+                    .py_1()
+                    .text_sm()
+                    .font_medium()
+                    .text_color(accent)
+                    .cursor_pointer()
+                    .hover(|el| el.opacity(0.8))
+                    .child(Icon::new(KitIcon::FileText).size(px(14.)))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(Icon::new(if shown { KitIcon::ChevronLeft } else { KitIcon::ChevronRight }).size(px(14.)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_document(&path, cx)))
+            }))
+            .into_any_element()
+    }
+
     fn render_permission(&self, p: &PendingPermission, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         // One primary button, for the usual answer. Two primary buttons side by side compete.
@@ -2064,72 +2182,48 @@ impl AppView {
         .into_any_element()
     }
 
-    /// The top of a new chat: the agent, a question, and the folder that the agent works in.
-    fn render_greeting(&self, cwd: &Path, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        v_flex()
-            .items_center()
-            .gap_3()
-            .px_6()
-            .child(live_avatar("avatar-greeting", 44.))
-            .child(
-                div()
-                    .text_2xl()
-                    .font_semibold()
-                    .child("What can I help you with?"),
-            )
-            // A click on the folder opens the folder picker.
+    /// The top of a new chat, as a new message in Messages: a "To:" line with the assistant
+    /// as the recipient. A click on the recipient opens a menu to change the agent.
+    fn render_to_line(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let (kind, busy) = (self.chat.kind, self.chat.busy);
+        let view = cx.entity().downgrade();
+        let recipient = Button::new("recipient")
+            .ghost()
+            .small()
+            .rounded(ButtonRounded::Size(px(6.)))
+            .bg(accent(&theme).opacity(0.12))
             .child(
                 h_flex()
-                    .id("pick-folder")
-                    .px_2p5()
-                    .py_1()
                     .gap_1p5()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .hover(|el| el.bg(theme.secondary).text_color(theme.foreground))
-                    .on_click(cx.listener(|this, _, _, cx| this.pick_folder(cx)))
-                    .child(Icon::new(KitIcon::Folder).size(px(14.)))
-                    .child(display_path(cwd))
-                    .child(Icon::new(KitIcon::ChevronDown).size(px(12.))),
+                    .child(avatar(16.))
+                    .child(div().font_medium().text_color(accent(&theme)).child(ASSISTANT_NAME)),
             )
-            .into_any_element()
-    }
-
-    /// Prompts to start from. A click puts the prompt in the composer.
-    fn render_suggestions(&self, kind: AgentKind, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        const SUGGESTIONS: [(KitIcon, &str, &str); 3] = [
-            (KitIcon::BookOpen, "Explain this project", "Explain how this project works. Start with the main parts."),
-            (KitIcon::Bug, "Find a bug", "Find a bug in this project and fix it. Tell me what you changed."),
-            (KitIcon::FlaskConical, "Write tests", "Write tests for the part of this project with the fewest tests."),
-        ];
-        h_flex()
-            .w_full()
-            .max_w(px(COLUMN))
-            .mx_auto()
-            .px_6()
+            .dropdown_menu_with_anchor(Anchor::TopLeft, move |menu, _, _| {
+                AgentKind::ALL.iter().fold(menu.label("Agent"), |menu, &k| {
+                    let view = view.clone();
+                    menu.item(
+                        PopupMenuItem::new(k.label())
+                            .checked(k == kind)
+                            .disabled(busy)
+                            .on_click(move |_, _, cx| {
+                                let _ = view.update(cx, |this, cx| this.pick_agent(k, cx));
+                            }),
+                    )
+                })
+            });
+        self.toolbar("new-message-toolbar", cx)
+            .px_4()
             .gap_2()
-            .flex_wrap()
-            .justify_center()
-            .children(SUGGESTIONS.iter().enumerate().map(|(i, &(icon, label, prompt))| {
-                h_flex()
-                    .id(("suggestion", i))
-                    .px_3()
-                    .py_1p5()
-                    .gap_1p5()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.background)
-                    .cursor_pointer()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .hover(|el| el.bg(theme.secondary).text_color(theme.foreground))
-                    .on_click(cx.listener(move |this, _, window, cx| this.suggest(prompt, window, cx)))
-                    .child(Icon::new(icon).size(px(14.)).text_color(agent_color(kind)))
-                    .child(label)
-            }))
+            .border_b_1()
+            .border_color(theme.border)
+            // Without the sidebar, the traffic lights and the button that shows the sidebar
+            // are on this line.
+            .when(!self.sidebar_open, |el| {
+                el.child(div().pl(px(52.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx)))
+            })
+            .child(div().text_sm().text_color(theme.muted_foreground).child("To:"))
+            .child(recipient)
             .into_any_element()
     }
 
@@ -2180,21 +2274,12 @@ impl AppView {
             .rounded(ButtonRounded::Size(px(COMPOSER_LINE / 2. + 1.)))
             .icon(Icon::new(KitIcon::Plus).text_color(theme.muted_foreground))
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                let folder = view.clone();
                 let files = view.clone();
                 menu.item(
                     PopupMenuItem::new("Attach files…")
                         .icon(Icon::new(KitIcon::Paperclip))
                         .on_click(move |_, _, cx| {
                             let _ = files.update(cx, |this, cx| this.pick_files(cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("Change the folder…")
-                        .icon(Icon::new(KitIcon::Folder))
-                        .disabled(busy)
-                        .on_click(move |_, _, cx| {
-                            let _ = folder.update(cx, |this, cx| this.pick_folder(cx));
                         }),
                 )
             });
@@ -2299,12 +2384,9 @@ impl AppView {
         let doc_panel = self.render_doc(window, cx);
         let theme = cx.theme().clone();
         let chat = &self.chat;
-        let kind = chat.kind;
         let busy = chat.busy;
-        // Before the first message, the pane shows the greeting. Notices and errors from the start
-        // of the agent show below the greeting.
+        // Before the first message, the pane shows the "To:" line and no messages.
         let empty = chat.items.iter().all(|i| matches!(i, Item::Notice(_) | Item::Error(_)));
-        let cwd = chat.cwd.clone();
         let permission = chat.permission.as_ref().map(|p| self.render_permission(p, cx));
         let composer = v_flex()
             .w_full()
@@ -2318,8 +2400,10 @@ impl AppView {
         // The assistant in the middle, as the contact in Messages. The strip also moves the window.
         // Without the sidebar, the traffic lights and the button that shows the sidebar are on it.
         // The two sides have the same width, so the middle stays in the middle.
-        let toolbar = self
-            .toolbar("main-toolbar", cx)
+        let toolbar = if empty {
+            self.render_to_line(cx)
+        } else {
+            self.toolbar("main-toolbar", cx)
             .h(px(HEADER))
             .items_start()
             .px_4()
@@ -2340,17 +2424,17 @@ impl AppView {
                     .child(live_avatar("avatar-header", 44.))
                     .child(div().text_sm().font_medium().child(ASSISTANT_NAME)),
             )
-            .child(div().flex_1());
+            .child(div().flex_1())
+            .into_any_element()
+        };
 
-        // An empty conversation shows only the composer, in the middle of the pane.
+        // An empty conversation is blank, as a new message in Messages. Notices and errors from
+        // the start of the agent show above the composer.
         let body = if empty {
             v_flex()
                 .flex_1()
-                .justify_center()
-                // Sit a little above the center.
-                .pb(px(TOOLBAR * 2.))
-                .gap_6()
-                .child(self.render_greeting(&cwd, &theme, cx))
+                .min_h_0()
+                .justify_end()
                 .when(!chat.items.is_empty(), |el| {
                     el.child(
                         v_flex()
@@ -2358,12 +2442,12 @@ impl AppView {
                             .max_w(px(COLUMN))
                             .mx_auto()
                             .px_6()
+                            .pb_4()
                             .gap_2()
                             .children((0..self.rows.len()).map(|row| self.render_row(row, cx))),
                     )
                 })
-                .child(composer)
-                .child(self.render_suggestions(kind, &theme, cx))
+                .child(composer.pb_5().pt_1())
                 .into_any_element()
         } else {
             v_flex()
