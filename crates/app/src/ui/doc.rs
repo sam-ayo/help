@@ -312,11 +312,30 @@ fn slug(title: &str) -> String {
     }
 }
 
+/// The most characters of a title that comes from the message of the user.
+const TITLE: usize = 60;
+
+/// A title from the message of the user: the first line, cut at a word, with a capital letter.
+fn prompt_title(prompt: &str) -> Option<String> {
+    let line = prompt.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let line = line.trim_end_matches(['.', '?', '!', ':', ',', ';']).trim_end();
+    let line = if line.chars().count() <= TITLE {
+        line.to_string()
+    } else {
+        let cut: String = line.chars().take(TITLE).collect();
+        format!("{}…", cut[..cut.rfind(' ').unwrap_or(cut.len())].trim_end())
+    };
+    let mut chars = line.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
+
 /// Write a long reply of the agent to a new document in `dir`. Returns the text for the chat:
-/// the first paragraph of the reply and a link to the document.
-pub(super) fn write_reply(text: &str, dir: &Path) -> std::io::Result<String> {
+/// the first paragraph of the reply and a link to the document. If the reply has no heading,
+/// the title comes from `prompt`, the message of the user.
+pub(super) fn write_reply(text: &str, prompt: &str, dir: &Path) -> std::io::Result<String> {
     let first = headings(text).next().map(str::to_string);
-    let title = first.clone().unwrap_or_else(|| "Reply".into());
+    let title = first.clone().or_else(|| prompt_title(prompt)).unwrap_or_else(|| "Reply".into());
     let stem = slug(&title);
     let path = (1..)
         .map(|n| dir.join(if n == 1 { format!("{stem}.md") } else { format!("{stem}-{n}.md") }))
@@ -364,10 +383,31 @@ fn page_theme(theme: &Theme) -> Value {
     })
 }
 
-fn build_webview(messages: async_channel::Sender<String>, window: &Window) -> wry::Result<WebView> {
+/// A script that gives the page the colors of the app before the page draws. Without it, the
+/// page is white until it gets the colors from the app.
+fn theme_script(theme: &Value) -> String {
+    let rules: String = theme
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, value)| Some(format!("--help-{name}: {};", value.as_str()?)))
+        .collect();
+    format!(
+        "(() => {{ const sheet = new CSSStyleSheet(); sheet.replaceSync({}); \
+         document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet]; }})();",
+        json!(format!(":root {{ {rules} }}"))
+    )
+}
+
+fn build_webview(messages: async_channel::Sender<String>, theme: &Value, window: &Window) -> wry::Result<WebView> {
     WebViewBuilder::new()
         .with_incognito(true)
         .with_devtools(cfg!(debug_assertions))
+        // The web view does not draw white before the page draws. The card shows below it.
+        .with_transparent(true)
+        // The web view shows when the editor has the text. See `on_doc_message`.
+        .with_visible(false)
+        .with_initialization_script(theme_script(theme))
         .with_bounds(Rect { position: LogicalPosition::new(0., 0.).into(), size: LogicalSize::new(0., 0.).into() })
         .with_custom_protocol(SCHEME.into(), |_, request| {
             let found = matches!(request.uri().path(), "" | "/" | "/index.html");
@@ -436,6 +476,11 @@ impl AppView {
                 doc.theme = None;
                 doc.load();
             }
+            Some("loaded") => {
+                if let Some(webview) = &doc.webview {
+                    let _ = webview.set_visible(true);
+                }
+            }
             Some("change") => {
                 let Some(markdown) = message.get("markdown").and_then(Value::as_str) else { return };
                 doc.save(markdown.to_string());
@@ -460,7 +505,7 @@ impl AppView {
         }
         if doc.webview.is_none() {
             let (tx, rx) = async_channel::unbounded::<String>();
-            match build_webview(tx, window) {
+            match build_webview(tx, &theme, window) {
                 Ok(webview) => doc.webview = Some(Rc::new(webview)),
                 Err(e) => {
                     tracing::warn!("cannot show the editor: {e}");
@@ -492,13 +537,18 @@ impl AppView {
     /// short. Then show the document of the reply in the panel.
     pub(super) fn finish_reply(&mut self, cx: &mut Context<Self>) {
         let items = &mut self.chat.items;
-        let turn = items.iter().rposition(|i| matches!(i, Item::User { .. })).map_or(0, |i| i + 1);
+        let user = items.iter().rposition(|i| matches!(i, Item::User { .. }));
+        let prompt = match user.map(|i| &items[i]) {
+            Some(Item::User { text, .. }) => text.clone(),
+            _ => String::new(),
+        };
+        let turn = user.map_or(0, |i| i + 1);
         let Some(Item::Agent(text)) = items[turn..].iter_mut().rev().find(|i| matches!(i, Item::Agent(_))) else {
             return;
         };
         let dir = &self.env.docs_dir;
         if links(text, dir).is_empty() && long(text) {
-            match write_reply(text, dir) {
+            match write_reply(text, &prompt, dir) {
                 Ok(short) => *text = short,
                 Err(e) => tracing::warn!("cannot write the reply to a document: {e}"),
             }
@@ -622,15 +672,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("help-docs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let reply = "I wrote the plan below. It has two parts.\n\n---\n\n## Trip plan: Day 1\n\n- Go\n\n## Day 2\n\n- Come back";
-        let chat = write_reply(reply, &dir).unwrap();
+        let chat = write_reply(reply, "plan my trip", &dir).unwrap();
         let path = dir.join("trip-plan-day-1.md");
         assert_eq!(chat, format!("I wrote the plan below. It has two parts.\n\n[Trip plan: Day 1](<{}>)", path.display()));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{reply}\n"));
         assert_eq!(links(&chat, &dir), vec![path]);
         // A second reply with the same title gets a new file.
-        assert!(write_reply(reply, &dir).unwrap().contains("trip-plan-day-1-2.md"));
-        // A reply with no heading gets one.
-        let chat = write_reply(&format!("1. a\n\n{}", "Long text. ".repeat(40)), &dir).unwrap();
+        assert!(write_reply(reply, "plan my trip", &dir).unwrap().contains("trip-plan-day-1-2.md"));
+        // A reply with no heading gets one from the message of the user.
+        let long_text = format!("1. a\n\n{}", "Long text. ".repeat(40));
+        let chat = write_reply(&long_text, "how do I renew my passport?\nI live in Lagos.", &dir).unwrap();
+        let path = dir.join("how-do-i-renew-my-passport.md");
+        assert!(chat.ends_with(&format!("[How do I renew my passport](<{}>)", path.display())));
+        assert!(std::fs::read_to_string(&path).unwrap().starts_with("# How do I renew my passport\n\n1. a"));
+        // With no message, the title is "Reply".
+        let chat = write_reply(&long_text, "", &dir).unwrap();
         assert!(chat.ends_with(&format!("[Reply](<{}>)", dir.join("reply.md").display())));
         assert!(chat.starts_with("Long text.") && chat.len() < 400);
         assert!(std::fs::read_to_string(dir.join("reply.md")).unwrap().starts_with("# Reply\n\n1. a"));
@@ -670,6 +726,21 @@ mod tests {
         let text = "The file /Users/me/Library/Application Support/Help/documents/data.csv has the numbers.";
         assert_eq!(without_links(text, dir), text);
         assert!(links(text, dir).is_empty());
+    }
+
+    #[test]
+    fn a_long_message_gives_a_short_title() {
+        assert_eq!(prompt_title("  \nfix the bug.  "), Some("Fix the bug".into()));
+        let title = prompt_title(&"word ".repeat(30)).unwrap();
+        assert!(title.ends_with("word…") && title.chars().count() <= TITLE + 1);
+        assert_eq!(prompt_title("\n \n"), None);
+    }
+
+    #[test]
+    fn the_page_gets_the_colors_before_it_draws() {
+        let script = theme_script(&json!({ "background": "rgba(1, 2, 3, 1.000)", "font": "\"Inter\", sans-serif" }));
+        assert!(script.contains(r#"--help-background: rgba(1, 2, 3, 1.000);"#));
+        assert!(script.contains(r#"--help-font: \"Inter\", sans-serif;"#));
     }
 
     #[test]

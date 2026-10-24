@@ -2,7 +2,8 @@
 // web view, and the user edits the Markdown as formatted text, as in Notion.
 //
 // The app and the page send JSON messages:
-// - page to app: {type: "ready"}, {type: "change", markdown}, {type: "focus"}, {type: "paste"}
+// - page to app: {type: "ready"}, {type: "loaded"}, {type: "change", markdown}, {type: "focus"},
+//   {type: "paste"}
 // - app to page: helpDoc.load(markdown), helpDoc.theme(vars), helpDoc.paste(text)
 
 import { CrepeBuilder } from '@milkdown/crepe/builder';
@@ -59,8 +60,13 @@ async function load(markdown) {
       send({ type: 'change', markdown });
     });
   });
-  await crepe.create();
-  known = crepe.getMarkdown();
+  // The app shows the web view when the editor has the text. Before that, the page is empty.
+  try {
+    await crepe.create();
+    known = crepe.getMarkdown();
+  } finally {
+    send({ type: 'loaded' });
+  }
 }
 
 // The colors and the fonts of the app, as CSS variables.
