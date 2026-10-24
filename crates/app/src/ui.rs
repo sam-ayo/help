@@ -193,6 +193,8 @@ pub struct AppView {
     /// The memory file or the conversation summary, at the right side of the window. It
     /// shows instead of the view of an MCP App.
     doc: Option<doc::Doc>,
+    /// A document that the app read before the user opened it. See `prefetch_document`.
+    doc_prefetch: Option<doc::Doc>,
     /// The views send their messages here, with the generation of their panel.
     app_messages: async_channel::Sender<(u64, String)>,
     /// The context that a view gave for the next message to the agent: the name of the tool,
@@ -274,6 +276,7 @@ impl AppView {
             panel: None,
             panel_generation: 0,
             doc: None,
+            doc_prefetch: None,
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
@@ -2406,6 +2409,7 @@ impl AppView {
                     format!("Read {}", doc::title(path))
                 };
                 let path = path.clone();
+                let hovered = path.clone();
                 h_flex()
                     .id(ElementId::NamedInteger(format!("doc-link-{ix}").into(), i as u64))
                     .gap_1p5()
@@ -2418,6 +2422,11 @@ impl AppView {
                     .child(Icon::new(KitIcon::FileText).size(px(14.)))
                     .child(div().flex_1().min_w_0().truncate().child(label))
                     .child(Icon::new(if shown { KitIcon::ChevronLeft } else { KitIcon::ChevronRight }).size(px(14.)))
+                    .on_hover(cx.listener(move |this, hover: &bool, _, cx| {
+                        if *hover {
+                            this.prefetch_document(&hovered, cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_document(&path, cx)))
             }))
             .into_any_element()

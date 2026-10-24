@@ -86,6 +86,39 @@ impl Doc {
         self.modified = modified(&self.path);
         self.saved = true;
     }
+
+    /// Make the editor if the document has none, and give the editor a change of the theme.
+    fn prepare(&mut self, cx: &mut Context<AppView>) -> Entity<MarkdownEditor> {
+        let key = theme_key(cx.theme());
+        let theme = Arc::new(editor_theme(cx.theme()));
+        let editor = match &self.editor {
+            Some(editor) => {
+                if self.theme != Some(key) {
+                    editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
+                }
+                editor.clone()
+            }
+            None => {
+                let options = MarkdownEditorOptions {
+                    environment: MarkdownEditorEnvironment {
+                        theme,
+                        document_base_dir: self.path.parent().map(Path::to_path_buf),
+                        ..MarkdownEditorEnvironment::default()
+                    },
+                    // The panel can open at the end of a turn. The keys stay in the composer.
+                    autofocus: false,
+                    ..MarkdownEditorOptions::default()
+                };
+                let text = self.text.clone();
+                let editor = cx.new(|cx| MarkdownEditor::new(text, options, cx));
+                self._events = Some(cx.subscribe(&editor, AppView::on_doc_event));
+                self.editor = Some(editor.clone());
+                editor
+            }
+        };
+        self.theme = Some(key);
+        editor
+    }
 }
 
 /// The documents that a message of the agent links to: the Markdown files in `dir` that the
@@ -371,7 +404,17 @@ impl AppView {
         self.close_doc(cx);
         if !same {
             self.close_app(cx);
-            self.doc = Some(Doc::open(title.into(), icon, path));
+            // A hover on the link made the document and its editor already. The file can
+            // change after the hover, and then the app reads it again.
+            let mut doc = self
+                .doc_prefetch
+                .take()
+                .filter(|d| d.path == path)
+                .and_then(|mut d| (!d.reload()).then_some(d))
+                .unwrap_or_else(|| Doc::open(SharedString::default(), icon, path));
+            doc.title = title.into();
+            doc.icon = icon;
+            self.doc = Some(doc);
         }
         cx.notify();
     }
@@ -413,41 +456,24 @@ impl AppView {
 
     /// Make the editor if the panel has none, and give the editor a change of the theme.
     fn prepare_doc(&mut self, cx: &mut Context<Self>) -> Option<Entity<MarkdownEditor>> {
-        let key = theme_key(cx.theme());
-        let theme = Arc::new(editor_theme(cx.theme()));
-        let doc = self.doc.as_mut()?;
-        let editor = match &doc.editor {
-            Some(editor) => {
-                if doc.theme != Some(key) {
-                    editor.update(cx, |editor, cx| editor.set_theme(theme, cx));
-                }
-                editor.clone()
-            }
-            None => {
-                let options = MarkdownEditorOptions {
-                    environment: MarkdownEditorEnvironment {
-                        theme,
-                        document_base_dir: doc.path.parent().map(Path::to_path_buf),
-                        ..MarkdownEditorEnvironment::default()
-                    },
-                    // The panel can open at the end of a turn. The keys stay in the composer.
-                    autofocus: false,
-                    ..MarkdownEditorOptions::default()
-                };
-                let text = doc.text.clone();
-                let editor = cx.new(|cx| MarkdownEditor::new(text, options, cx));
-                doc._events = Some(cx.subscribe(&editor, Self::on_doc_event));
-                doc.editor = Some(editor.clone());
-                editor
-            }
-        };
-        doc.theme = Some(key);
-        Some(editor)
+        Some(self.doc.as_mut()?.prepare(cx))
     }
 
     /// Show a document that the agent wrote in the panel.
     pub(super) fn open_document(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.open_doc(title(path), KitIcon::FileText, path, cx);
+    }
+
+    /// Read a document and make its editor before the user opens it, so that the panel opens
+    /// with no delay. A hover on the link to the document calls this.
+    pub(super) fn prefetch_document(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let ready = |d: &Doc| d.path == path;
+        if self.doc.as_ref().is_some_and(ready) || self.doc_prefetch.as_ref().is_some_and(ready) || !path.is_file() {
+            return;
+        }
+        let mut doc = Doc::open(SharedString::default(), KitIcon::FileText, path);
+        doc.prepare(cx);
+        self.doc_prefetch = Some(doc);
     }
 
     /// At the end of a turn, move a long final reply to a document, so that the chat stays
