@@ -1246,12 +1246,7 @@ fn apply(chat: &mut Chat, event: Event) {
                 if let Some(s) = new_status {
                     state.status = s;
                 }
-                if new_input.is_some() {
-                    state.input = new_input;
-                }
-                if new_output.is_some() {
-                    state.output = new_output;
-                }
+                state.update(new_input, new_output);
             }
             let found = chat.items.iter_mut().rev().find_map(|i| match i {
                 Item::Tool {

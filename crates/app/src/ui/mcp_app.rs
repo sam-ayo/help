@@ -80,6 +80,27 @@ impl McpCallState {
             _ => None,
         }
     }
+
+    /// The tool has no view. Only a view uses the input and the result, and a result can be
+    /// large, for example a screenshot. So the app does not keep them.
+    pub fn set_no_view(&mut self) {
+        self.lookup = Lookup::NoView;
+        self.input = None;
+        self.output = None;
+    }
+
+    /// Keep the new input and result of the tool, if a view can use them.
+    pub fn update(&mut self, input: Option<Value>, output: Option<Value>) {
+        if matches!(self.lookup, Lookup::NoView) {
+            return;
+        }
+        if input.is_some() {
+            self.input = input;
+        }
+        if output.is_some() {
+            self.output = output;
+        }
+    }
 }
 
 /// A connected MCP server that has tools with views, as the sidebar shows it.
@@ -321,7 +342,7 @@ impl AppView {
                             state.lookup = Lookup::View(Arc::new(ui));
                             this.open_app(id, cx);
                         }
-                        None => state.lookup = Lookup::NoView,
+                        None => state.set_no_view(),
                     }
                     cx.notify();
                 });
@@ -563,6 +584,18 @@ mod tests {
         let content = json!([{ "type": "text", "text": "a" }, { "type": "image" }, { "type": "text", "text": "b" }]);
         assert_eq!(content_text(&content), "a\nb");
         assert_eq!(content_text(&json!({ "type": "text", "text": "one" })), "one");
+    }
+
+    #[test]
+    fn a_tool_with_no_view_keeps_no_data() {
+        let call = McpCall { server: "help".into(), tool: "vm_screenshot".into() };
+        let mut state = McpCallState::new(call, Some(json!({})), ToolStatus::Running);
+        state.update(None, Some(json!({ "content": [] })));
+        assert!(state.output.is_some());
+        state.set_no_view();
+        assert!(state.input.is_none() && state.output.is_none());
+        state.update(Some(json!({})), Some(json!({ "content": [] })));
+        assert!(state.input.is_none() && state.output.is_none());
     }
 
     #[test]
