@@ -227,3 +227,281 @@ pub fn delegation() -> Vec<(Duration, Event)> {
         (ms(500), Event::TurnEnded("EndTurn".into())),
     ]
 }
+
+/// The sets of sample data. A dev build shows a switch for them in the demo. Start the app with
+/// `HELP_DEMO=worst`, `empty`, `one`, or `huge` to start with that set.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Data {
+    /// The sample conversation of `chat`.
+    Demo,
+    /// The longest, shortest, and strangest values that real data can have. See `worst`.
+    Worst,
+    /// A conversation with no messages.
+    Empty,
+    /// Each count is 1.
+    One,
+    /// 1,000 turns.
+    Huge,
+}
+
+impl Data {
+    pub const ALL: [Data; 5] = [Data::Demo, Data::Worst, Data::Empty, Data::One, Data::Huge];
+
+    pub fn initial() -> Self {
+        match std::env::var("HELP_DEMO").as_deref() {
+            Ok("worst") => Data::Worst,
+            Ok("empty") => Data::Empty,
+            Ok("one") => Data::One,
+            Ok("huge") => Data::Huge,
+            _ => Data::Demo,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Data::Demo => "Demo",
+            Data::Worst => "Worst case",
+            Data::Empty => "Empty",
+            Data::One => "One",
+            Data::Huge => "1,000 turns",
+        }
+    }
+
+    pub fn chat(self) -> Chat {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cwd = std::path::PathBuf::from(&home).join("Projects/web-app");
+        match self {
+            Data::Demo => chat(),
+            Data::Worst => worst(&home),
+            Data::Empty => Chat::new(AgentKind::Claude, Vec::new(), cwd),
+            Data::One => one(cwd),
+            Data::Huge => huge(cwd),
+        }
+    }
+
+    /// The MCP servers with views in the sidebar: (server, title).
+    pub fn app_servers(self) -> Vec<(&'static str, &'static str)> {
+        match self {
+            Data::Worst => vec![
+                ("northwind-industries-holdings-analytics-dashboard", "Northwind Industries Holdings Analytics Dashboard"),
+                ("fox", "🦊 Fox"),
+                ("wang", "王秀英"),
+                ("spaces", "  Sam   Lee "),
+                ("untitled", ""),
+                ("figma", "Figma"),
+                ("linear", "Linear"),
+                ("notion", "Notion"),
+                ("benachrichtigungen", "Benachrichtigungseinstellungen"),
+            ],
+            Data::One => vec![("figma", "Figma")],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The files in the composer, for the next message.
+    pub fn composer_files(self) -> Vec<Attachment> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        match self {
+            Data::Worst => {
+                let dir = worst_dir(&home);
+                vec![
+                    file(&dir, "Q3 Board Deck — FINAL (revised) v12 [approved by legal].pdf", "application/pdf", 18_432_000),
+                    file(&dir, "IMG_20250914_183022_HDR_portrait_edited_edited.HEIC", "image/heic", 4_812_000),
+                    image_file(&dir, "panorama.png", 4000, 200),
+                ]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+use acp_host::Attachment;
+
+fn worst_dir(home: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(home).join("Library/Application Support/Help/demo-worst");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// An attachment for a file that is not on the disk.
+fn file(dir: &std::path::Path, name: &str, mime: &str, size: u64) -> Attachment {
+    Attachment { path: dir.join(name), name: name.into(), mime: mime.into(), size }
+}
+
+/// An attachment for a PNG file of the given size. The function writes the file if it is not there.
+fn image_file(dir: &std::path::Path, name: &str, w: u32, h: u32) -> Attachment {
+    let path = dir.join(name);
+    if !path.exists() {
+        let img = image::RgbaImage::from_fn(w, h, |x, y| image::Rgba([(x * 255 / w) as u8, (y * 255 / h) as u8, 160, 255]));
+        let _ = img.save(&path);
+    }
+    let size = std::fs::metadata(&path).map_or(0, |m| m.len());
+    Attachment { path, name: name.into(), mime: "image/png".into(), size }
+}
+
+/// A document with the given name and text. The function writes the file if it is not there.
+fn document(home: &str, name: &str, text: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(home).join("Library/Application Support/Help/documents").join(name);
+    if !path.exists() {
+        let _ = path.parent().map(std::fs::create_dir_all);
+        let _ = std::fs::write(&path, text);
+    }
+    path
+}
+
+/// The worst realistic values for each field that the conversation shows, spread over the turns.
+fn worst(home: &str) -> Chat {
+    let dir = worst_dir(home);
+    let long_doc = document(
+        home,
+        "parametres-de-confidentialite-et-de-securite-rapport-complet-v12.md",
+        "# Paramètres de confidentialité et de sécurité — rapport complet v12\n\nLe rapport complet.\n",
+    );
+    let missing_doc = std::path::Path::new(home).join("Library/Application Support/Help/documents/deleted-report.md");
+    let minified = format!(
+        "{{\"data\":[{}]}}",
+        (0..80)
+            .map(|i| format!("{{\"id\":\"9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e{i:02}\",\"email\":\"bartholomew.fitzgerald+{i}@northwind-industries-holdings.example.com\"}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let heredoc = format!(
+        "cat > /Users/aleksandra.wisniewska-kowalczyk/Projects/northwind-industries-holdings/web-app/.env.production <<'EOF'\n{}\nEOF",
+        (0..40).map(|i| format!("SERVICE_{i}_URL=https://example.com/workspaces/acme/projects/q3-launch/services/{i}")).collect::<Vec<_>>().join("\n")
+    );
+    let items = vec![
+        // Three years ago: the time label has the year. Attachments only, and no text.
+        Item::User {
+            text: String::new(),
+            at: chrono::Utc::now().timestamp() - 3 * 365 * 24 * 60 * 60,
+            attachments: vec![
+                file(&dir, "Q3 Board Deck — FINAL (revised) v12 [approved by legal].pdf", "application/pdf", 18_432_000),
+                file(&dir, "Q3 Board Deck — FINAL (revised) v11 [approved by legal].pdf", "application/pdf", 18_431_000),
+                image_file(&dir, "tall-screenshot.png", 200, 4000),
+                image_file(&dir, "panorama.png", 4000, 200),
+            ],
+        },
+        Item::Agent("Done.".into()),
+        // An unbreakable URL and email, Markdown characters, and HTML.
+        user(
+            "Why does https://example.com/workspaces/acme/projects/q3-launch/docs/9f8e7d6c5b4a?tab=comments&filter=unresolved \
+             not send to bartholomew.fitzgerald@northwind-industries-holdings.example.com? \
+             The form shows <script>alert(1)</script> and **bold** and &amp; as text.",
+            26 * 60,
+        ),
+        Item::Thought(format!("Aleksandra Wiśniewska-Kowalczyk, Đặng Thị Ngọc Hân, 王秀英, نور الهدى عبد الرحمن. {}", "The user asks about the email form. ".repeat(12))),
+        tool(
+            "w1",
+            "cd /Users/aleksandra.wisniewska-kowalczyk/Projects/northwind-industries-holdings/web-app && npx playwright test tests/e2e/checkout/payment-methods.spec.ts --project=webkit --repeat-each=50 --reporter=line",
+            "execute",
+            ToolStatus::Done,
+            None,
+        ),
+        tool("w2", "Read src/api/members.json", "read", ToolStatus::Failed, Some(&minified)),
+        tool("w3", "Đặng Thị Ngọc Hân — Benachrichtigungseinstellungen", "edit", ToolStatus::Done, None),
+        Item::Plan(Vec::new()),
+        Item::Plan(
+            [
+                "Find the cause",
+                "Read the form code in src/components/forms/ContactForm.tsx and the server action in src/app/actions/contact.ts",
+                "Benachrichtigungseinstellungen",
+                "Fix the escaping",
+                "Add a test",
+                "Run the tests",
+                "Update the docs",
+                "Ask for a review",
+                "Deploy to staging",
+                "Check the logs",
+                "Deploy to production",
+                "Close issue #142",
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.to_string(), if i < 4 { ToolStatus::Done } else if i == 4 { ToolStatus::Running } else { ToolStatus::Pending }))
+            .collect(),
+        ),
+        Item::Agent(
+            "The form escapes the text twice. Compare:\n\n\
+             | Field | Value before | Value after | Escaped | Source file |\n|---|---|---|---|---|\n\
+             | email | bartholomew.fitzgerald@northwind-industries-holdings.example.com | bartholomew.fitzgerald%40northwind-industries-holdings.example.com | yes | src/app/actions/contact.ts |\n\
+             | name | Aleksandra Wiśniewska-Kowalczyk | Aleksandra Wi&#347;niewska-Kowalczyk | yes | src/components/forms/ContactForm.tsx |\n\n\
+             ```ts\nconst url = `https://example.com/workspaces/${workspace}/projects/${project}/docs/${doc}?tab=comments&filter=unresolved&highlight=${encodeURIComponent(email)}`;\n```\n\n\
+             Total: 1284 of 1000000 members, 0.30000000000000004 of them, NaN%."
+                .into(),
+        ),
+        Item::Notice(
+            "Cannot attach IMG_20250914_183022_HDR_portrait_edited_edited.HEIC, Q3 Board Deck — FINAL (revised) v12 [approved by legal].pdf, \
+             9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f.zip."
+                .into(),
+        ),
+        Item::Error(
+            "Error: ENOENT: no such file or directory, open '/Users/aleksandra.wisniewska-kowalczyk/Library/Application Support/Help/files/9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f/IMG_20250914_183022_HDR_portrait_edited_edited.HEIC'"
+                .into(),
+        ),
+        Item::Compacted,
+        // Right-to-left text, and a reply in the same language.
+        user("نور الهدى عبد الرحمن هنا. لماذا لا يصل البريد إلى العميل؟ جربت ثلاث مرات اليوم ولم يصل أي شيء.", 4 * 60),
+        Item::Agent("لأن النموذج يرمّز عنوان البريد مرتين. أصلحت ذلك في `src/app/actions/contact.ts` وأضفت اختبارا.".into()),
+        // Line breaks, and characters that Markdown reads as format.
+        user("Steps to see it:\n- open the form\n1. type a name\n# 142 is still open\nsnake_case_name and 2*3*4 = 24\n===", 4 * 60 - 1),
+        Item::Agent("Thanks, I see it.".into()),
+        // A reply that is only links to documents: the text is empty when the links go.
+        user("Write the full report.", 3 * 60),
+        Item::Agent(format!("[Report](<{}>)\n\n[Old report](<{}>)", long_doc.display(), missing_doc.display())),
+        Item::AgentFiles(vec![
+            image_file(&dir, "tall-screenshot.png", 200, 4000),
+            file(&dir, "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f.zip", "application/zip", 0),
+        ]),
+        // One letter.
+        user("k", 2),
+        tool(
+            "s1",
+            "Find every place that reads Benachrichtigungseinstellungen in the northwind-industries-holdings monorepo",
+            acp_host::SUBAGENT_KIND,
+            ToolStatus::Running,
+            None,
+        ),
+        child("s1a", "Search for \"Benachrichtigungseinstellungen\" in packages/notifications/src/settings/", "search", ToolStatus::Running, None, Some("s1")),
+    ];
+    let mut chat = Chat::new(AgentKind::Claude, items, std::path::PathBuf::from(home).join("Projects/northwind-industries-holdings/web-app"));
+    let (reply, _) = oneshot::channel();
+    chat.busy = true;
+    chat.permission = Some(PendingPermission {
+        title: format!("Run `{heredoc}`"),
+        options: vec![
+            PermissionOptionView { id: "allow".into(), name: "Allow".into(), allow: true },
+            PermissionOptionView {
+                id: "always".into(),
+                name: "Always allow cat in /Users/aleksandra.wisniewska-kowalczyk/Projects/northwind-industries-holdings/web-app".into(),
+                allow: true,
+            },
+            PermissionOptionView { id: "reject".into(), name: "Reject".into(), allow: false },
+        ],
+        reply,
+    });
+    chat
+}
+
+/// Each count is 1: one step, one subagent, one plan entry.
+fn one(cwd: std::path::PathBuf) -> Chat {
+    let items = vec![
+        user("Check the docs.", 1),
+        Item::Plan(vec![("Read the docs".into(), ToolStatus::Done)]),
+        tool("o1", "Check the docs", acp_host::SUBAGENT_KIND, ToolStatus::Running, None),
+        child("o1a", "Read docs/settings.md", "read", ToolStatus::Done, None, Some("o1")),
+    ];
+    let mut chat = Chat::new(AgentKind::Claude, items, cwd);
+    chat.busy = true;
+    chat
+}
+
+/// 1,000 turns, each with a step and a reply.
+fn huge(cwd: std::path::PathBuf) -> Chat {
+    let mut items = Vec::new();
+    for i in 0..1000i64 {
+        items.push(user(&format!("Question {} of 1,000.", i + 1), (1000 - i) * 90));
+        items.push(tool(&format!("h{i}"), "Read src/config.ts", "read", ToolStatus::Done, None));
+        items.push(Item::Agent(format!("Answer {} of 1,000.", i + 1)));
+    }
+    Chat::new(AgentKind::Claude, items, cwd)
+}

@@ -20,7 +20,7 @@ use gpui_component::{
     menu::{DropdownMenu as _, PopupMenuItem},
     message_scroller::{MessageScroller, MessageScrollerState},
     spinner::Spinner,
-    text::TextView,
+    text::{TextView, TextViewStyle},
     v_flex,
 };
 use gpui_kit_assets::IconName as KitIcon;
@@ -204,6 +204,10 @@ pub struct AppView {
     attachments: Vec<Attachment>,
     /// A click on a link to a document in a message sends the path here. See `doc::links`.
     doc_clicks: async_channel::Sender<PathBuf>,
+    /// The window width, the sidebar, and the panel, as of the last render. See `text_id`.
+    text_layout: (i32, bool, bool),
+    /// The set of sample data that the demo shows. See `demo::Data`.
+    demo_data: demo::Data,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -221,8 +225,9 @@ impl AppView {
             }
         })];
 
+        let demo_data = demo::Data::initial();
         let chat = if demo::enabled() {
-            demo::chat()
+            demo_data.chat()
         } else {
             let cwd = std::fs::read_to_string(&env.folder_file)
                 .ok()
@@ -272,8 +277,10 @@ impl AppView {
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
-            attachments: Vec::new(),
+            attachments: if demo::enabled() { demo_data.composer_files() } else { Vec::new() },
             doc_clicks,
+            text_layout: (0, false, false),
+            demo_data,
             _subs: subs,
         };
         for event in demo::app_call() {
@@ -800,6 +807,96 @@ impl AppView {
         cx.notify();
     }
 
+    /// The sidebar shows if the user did not hide it, and the window has room for it next to the
+    /// panel at the right side. A narrow window hides it while a panel shows.
+    fn sidebar_shows(&self, window: &Window) -> bool {
+        let panel = if self.doc.is_some() {
+            doc::WIDTH + INSET * 2.
+        } else if self.panel.is_some() {
+            mcp_app::PANEL
+        } else {
+            0.
+        };
+        let width = f32::from(window.viewport_size().width);
+        self.sidebar_open && (panel == 0. || width >= SIDEBAR + INSET * 2. + MIN_CONVERSATION + panel)
+    }
+
+    /// The width that a panel at the right side can have, so that the conversation keeps
+    /// `MIN_CONVERSATION`.
+    pub(super) fn panel_room(&self, window: &Window) -> f32 {
+        let sidebar = if self.sidebar_shows(window) { SIDEBAR + INSET * 2. } else { 0. };
+        (f32::from(window.viewport_size().width) - sidebar - MIN_CONVERSATION).max(MIN_PANEL)
+    }
+
+    /// Show or hide the sidebar. If the window is too narrow for the sidebar and the panel, the
+    /// panel closes, so that the sidebar can show.
+    fn toggle_sidebar(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.sidebar_open && !self.sidebar_shows(window) {
+            self.close_doc(cx);
+            self.close_app(cx);
+        } else {
+            self.sidebar_open = !self.sidebar_open;
+        }
+        cx.notify();
+    }
+
+    /// Show a different set of sample data in the demo. See `demo::Data`.
+    fn show_demo_data(&mut self, data: demo::Data, cx: &mut Context<Self>) {
+        if data == self.demo_data {
+            return;
+        }
+        self.demo_data = data;
+        self.close_doc(cx);
+        self.close_app(cx);
+        self.chat = data.chat();
+        self.attachments = data.composer_files();
+        self.toggled_tools.clear();
+        self.open_steps.clear();
+        self.rows = build_rows(&self.chat, &self.open_steps);
+        let count = self.rows.len();
+        self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
+        self.load_app_servers(cx);
+        self.scroll_to_end(cx);
+        cx.notify();
+    }
+
+    /// The switch between the sets of sample data, in the demo of a dev build only. It is not a
+    /// part of the design, so it has plain neutral colors.
+    fn render_demo_switch(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if !cfg!(debug_assertions) || !demo::enabled() || demo::live() {
+            return None;
+        }
+        let segments = demo::Data::ALL.into_iter().enumerate().map(|(i, data)| {
+            div()
+                .id(("demo-data", i))
+                .px_2p5()
+                .py_1()
+                .rounded_full()
+                .cursor_pointer()
+                .when(data == self.demo_data, |el| el.bg(gpui::white()).shadow_sm())
+                .child(data.label())
+                .on_click(cx.listener(move |this, _, _, cx| this.show_demo_data(data, cx)))
+        });
+        Some(
+            h_flex()
+                .absolute()
+                .top(px(HEADER))
+                .right(px(12.))
+                .child(
+                    h_flex()
+                        .p(px(2.))
+                        .gap(px(2.))
+                        .rounded_full()
+                        .bg(rgb(0xe5e5e5))
+                        .text_color(rgb(0x171717))
+                        .text_xs()
+                        .font_family(".SystemUIFont")
+                        .children(segments),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Show the memory file in the panel.
     fn open_memory(&mut self, cx: &mut Context<Self>) {
         memory::ensure(&self.env.memory_file);
@@ -855,6 +952,126 @@ fn time_label(at: i64, now: chrono::DateTime<chrono::Local>) -> Option<(String, 
         _ if time.year() == now.year() => (time.format("%a, %b %-d").to_string(), format!("at {clock}")),
         _ => (time.format("%b %-d, %Y").to_string(), format!("at {clock}")),
     })
+}
+
+/// The text of the user for the Markdown view, escaped so that it shows as the user wrote it:
+/// `**a**` keeps its stars, `<b>` and `&amp;` show as text, "- a" is not a list, and each line
+/// break stays. Code spans and code blocks keep their format, and the links in the text open.
+fn literal(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let mut fence: Option<&str> = None;
+    for (n, line) in lines.iter().enumerate() {
+        let next = lines.get(n + 1).map(|l| l.trim_start());
+        let trimmed = line.trim_start();
+        if let Some(open) = fence {
+            if trimmed.starts_with(open) {
+                fence = None;
+            }
+            out.push_str(line);
+        } else if is_fence(trimmed) {
+            fence = Some(&trimmed[..3]);
+            out.push_str(line);
+        } else {
+            out.push_str(&literal_line(line));
+            // Markdown joins two lines into one. A backslash at the end keeps the line break.
+            if !trimmed.is_empty() && next.is_some_and(|l| !l.is_empty() && !is_fence(l)) {
+                out.push('\\');
+            }
+        }
+        if next.is_some() {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn is_fence(line: &str) -> bool {
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+/// One line of `literal`, outside a code block.
+fn literal_line(line: &str) -> String {
+    let chars: Vec<(usize, char)> = line.char_indices().collect();
+    // Links and email addresses stay as they are, so that they still open.
+    let mut links = Vec::new();
+    let mut word_start = None;
+    for (i, &(at, c)) in chars.iter().enumerate() {
+        if !c.is_whitespace() && word_start.is_none() {
+            word_start = Some(at);
+        }
+        if c.is_whitespace() || i + 1 == chars.len() {
+            if let Some(from) = word_start.take() {
+                let to = if c.is_whitespace() { at } else { at + c.len_utf8() };
+                let word = &line[from..to];
+                let email = word.split_once('@').is_some_and(|(a, b)| !a.is_empty() && b.contains('.'));
+                if word.contains("://") || word.starts_with("www.") || email {
+                    links.push(from..to);
+                }
+            }
+        }
+    }
+    // The text before the first character that is not a space.
+    let indent = chars.iter().position(|(_, c)| !c.is_whitespace()).unwrap_or(chars.len());
+    // The dot of "1. a" or the parenthesis of "1) a", which make a list.
+    let digits = chars[indent..].iter().take_while(|(_, c)| c.is_ascii_digit()).count();
+    let list_mark = (digits > 0
+        && matches!(chars.get(indent + digits), Some((_, '.' | ')')))
+        && chars.get(indent + digits + 1).is_none_or(|(_, c)| c.is_whitespace()))
+    .then_some(indent + digits);
+
+    let mut out = String::with_capacity(line.len() + 8);
+    // The length of the run of backticks that opened the code span, if one is open.
+    let mut code: Option<usize> = None;
+    // The first link that does not end before the character. The links are in order.
+    let mut link = 0;
+    let mut i = 0;
+    while i < chars.len() {
+        let (at, c) = chars[i];
+        while links.get(link).is_some_and(|r| at >= r.end) {
+            link += 1;
+        }
+        if c == '`' {
+            let run = chars[i..].iter().take_while(|(_, c)| *c == '`').count();
+            match code {
+                Some(n) if n == run => code = None,
+                None if chars[i + run..].windows(run).any(|w| w.iter().all(|(_, c)| *c == '`')) => code = Some(run),
+                _ => {}
+            }
+            out.extend(chars[i..i + run].iter().map(|(_, c)| c));
+            i += run;
+            continue;
+        }
+        let escape = code.is_none()
+            && !links.get(link).is_some_and(|r| r.contains(&at))
+            && (matches!(c, '\\' | '*' | '_' | '~' | '[' | ']' | '<' | '>' | '|' | '#')
+                || (i == indent && matches!(c, '-' | '+' | '='))
+                || Some(i) == list_mark
+                || (c == '&' && is_reference(&line[at + 1..])));
+        if escape {
+            out.push('\\');
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// The text after a `&` starts a character reference, such as `amp;` or `#169;`.
+fn is_reference(rest: &str) -> bool {
+    let rest: String = rest.chars().take(33).collect();
+    rest.find(';').is_some_and(|end| {
+        let name = rest[..end].strip_prefix('#').unwrap_or(&rest[..end]);
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric())
+    })
+}
+
+/// The style of the text in the messages of the agent. A wide table scrolls, so that its columns
+/// do not get so narrow that words break in the middle.
+fn message_style() -> TextViewStyle {
+    let mut table = StyleRefinement::default();
+    table.overflow.x = Some(gpui::Overflow::Scroll);
+    TextViewStyle::default().table(table)
 }
 
 /// Count `n` of a thing: "1 step", "2 steps".
@@ -1075,6 +1292,20 @@ const COMPOSER_LINE: f32 = 36.;
 /// The size of the send button, and the space around it in the message field.
 const SEND: f32 = 28.;
 const SEND_INSET: f32 = (COMPOSER_LINE - SEND) / 2.;
+/// A tool title with more characters than this gets a tooltip with the full title.
+const LONG_TITLE: usize = 50;
+/// The most characters of the output of a tool that the card shows.
+const TOOL_DETAIL: usize = 4000;
+/// The most characters of a button label in a permission request. A longer label gets an
+/// ellipsis in the middle, and a tooltip with the full label.
+const PERMISSION_OPTION: usize = 30;
+/// The narrowest conversation. A panel gets narrower, and then the sidebar hides, to keep this
+/// width.
+const MIN_CONVERSATION: f32 = 320.;
+/// The narrowest panel at the right side.
+const MIN_PANEL: f32 = 280.;
+/// The highest text of a permission request. Longer text scrolls.
+const PERMISSION_TITLE: f32 = 112.;
 /// The width of the sidebar panel.
 const SIDEBAR: f32 = 232.;
 /// The space between the sidebar panel and the window edges.
@@ -1237,10 +1468,7 @@ fn sidebar_toggle(id: &'static str, tooltip: &'static str, cx: &mut Context<AppV
         .small()
         .icon(Icon::new(KitIcon::PanelLeft))
         .tooltip_with_action(tooltip, &ToggleSidebar, None)
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.sidebar_open = !this.sidebar_open;
-            cx.notify();
-        }))
+        .on_click(cx.listener(|this, _, window, cx| this.toggle_sidebar(window, cx)))
 }
 
 /// A menu item with a round color swatch before the label.
@@ -1410,10 +1638,17 @@ impl AppView {
                     .child(div().flex_1().child(brand))
                     .child(sidebar_toggle("hide-sidebar", "Hide sidebar", cx)),
             )
-            .when(cfg!(debug_assertions), |el| el.child(threads))
-            .child(div().pt_2().child(memory).child(history).child(refresh))
-            .children(self.render_app_list(cx))
-            .child(div().flex_1())
+            // The rows scroll, so that many apps do not push the theme menu out of the window.
+            .child(
+                v_flex()
+                    .id("sidebar-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .when(cfg!(debug_assertions), |el| el.child(threads))
+                    .child(div().pt_2().child(memory).child(history).child(refresh))
+                    .children(self.render_app_list(cx)),
+            )
             .child(self.render_theme_footer(cx));
         div()
             .w(px(SIDEBAR + INSET))
@@ -1433,7 +1668,10 @@ impl AppView {
         let theme = cx.theme().clone();
         let dark = theme.is_dark();
         let rows = self.app_servers.iter().enumerate().map(|(ix, app)| {
-            let initial = app.title.chars().next().unwrap_or('?').to_uppercase().to_string();
+            // The title from the server can have extra spaces, an emoji first, or no text.
+            let title = app.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let title = if title.is_empty() { app.server.clone() } else { title };
+            let initial = title.chars().find(|c| c.is_alphanumeric()).unwrap_or('?').to_uppercase().to_string();
             let fallback = {
                 let theme = theme.clone();
                 move || {
@@ -1465,7 +1703,7 @@ impl AppView {
                 .text_sm()
                 .font_medium()
                 .child(div().size(px(16.)).flex_shrink_0().child(logo))
-                .child(div().flex_1().min_w_0().truncate().child(app.title.clone()))
+                .child(div().flex_1().min_w_0().truncate().child(title))
                 .tooltip({
                     let server = app.server.clone();
                     move |window, cx| gpui_component::tooltip::Tooltip::new(server.clone()).build(window, cx)
@@ -1599,6 +1837,7 @@ impl AppView {
                 theme::set(Some(window), cx, |c| c.appearance = next)
             });
         h_flex()
+            .flex_shrink_0()
             .px_2()
             .py_2()
             .gap_1()
@@ -1787,7 +2026,7 @@ impl AppView {
                                 .rounded(px(18.))
                                 .bg(bubble)
                                 .text_color(theme.foreground)
-                                .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true))
+                                .child(TextView::markdown(self.text_id(ix), SharedString::from(literal(text))).selectable(true))
                                 // The tail at the bottom right, as a sent message in Messages.
                                 .child(
                                     div()
@@ -1824,9 +2063,12 @@ impl AppView {
                 let docs = doc::links(text, &self.env.docs_dir);
                 let text = if docs.is_empty() { text.clone() } else { doc::without_links(text, &self.env.docs_dir) };
                 let copy = text.clone();
+                // The reply can be only the links. Then the bubble has only the rows of the links.
+                let has_text = !text.trim().is_empty();
                 // A link to a document opens it in the panel. Other links open in the browser.
                 let (dir, clicks) = (self.env.docs_dir.clone(), self.doc_clicks.clone());
-                let message = TextView::markdown(("item", ix), SharedString::from(text))
+                let message = TextView::markdown(self.text_id(ix), SharedString::from(text))
+                    .style(message_style())
                     .selectable(true)
                     .on_link_click(move |href, _, _, cx| match doc::link_target(href, &dir) {
                         Some(path) => {
@@ -1848,8 +2090,8 @@ impl AppView {
                             .py_2p5()
                             .rounded(px(18.))
                             .bg(bubble)
-                            .child(message)
-                            .when(!docs.is_empty(), |el| el.child(self.document_links(ix, &docs, &theme, cx)))
+                            .when(has_text, |el| el.child(message))
+                            .when(!docs.is_empty(), |el| el.child(self.document_links(ix, &docs, has_text, &theme, cx)))
                             // The tail at the bottom left: a gray corner, and a corner of the
                             // background color on it that cuts the curve.
                             .child(
@@ -1937,6 +2179,11 @@ impl AppView {
                                         cx.notify();
                                     }))
                             })
+                            // A long title, such as a command, is cut. The tooltip has all of it.
+                            .when(title.chars().count() > LONG_TITLE, |el| {
+                                let title = title.clone();
+                                el.tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(title.clone()).build(window, cx))
+                            })
                             .child(Icon::new(tool_icon(tool_kind)).size(px(14.)).text_color(theme.muted_foreground))
                             .child(div().flex_1().min_w_0().truncate().text_sm().child(title.clone()))
                             // The tool has the view of an MCP App.
@@ -1983,7 +2230,11 @@ impl AppView {
                         )
                     })
                     .when_some(detail.clone().filter(|_| open), |el, d| {
-                        let short: String = d.chars().take(4000).collect();
+                        let mut short: String = d.chars().take(TOOL_DETAIL).collect();
+                        // Show that the output has more text than shows.
+                        if short.len() < d.len() {
+                            short.push_str("\n…");
+                        }
                         el.child(
                             div()
                                 .id(("tool-detail", ix))
@@ -2092,23 +2343,29 @@ impl AppView {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(TextView::markdown(("item", ix), SharedString::from(text.clone())).selectable(true)),
+                        .child(TextView::markdown(self.text_id(ix), SharedString::from(text.clone())).selectable(true)),
                 )
                 .into_any_element(),
         }
     }
 
+    /// The ID of the text of a message. The text keeps the width of its widest line, so a
+    /// bubble that fits its text stays narrow when the conversation gets wider. A change to
+    /// the width gives the text a new ID, and the text wraps again at the new width.
+    fn text_id(&self, ix: usize) -> ElementId {
+        let (width, sidebar, panel) = self.text_layout;
+        ElementId::NamedInteger(format!("item-{width}-{sidebar}-{panel}").into(), ix as u64)
+    }
+
     /// The rows at the bottom of a message that open its documents in the panel. The rows do
     /// not show the file names. A click on the row of the open document closes the panel.
-    fn document_links(&self, ix: usize, docs: &[PathBuf], theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// `below_text` is true if the message has text above the rows. A line then parts them.
+    fn document_links(&self, ix: usize, docs: &[PathBuf], below_text: bool, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = accent(theme);
         let open = self.doc.as_ref().map(|d| d.path.clone());
         v_flex()
-            .mt_2()
-            .pt_1p5()
             .mb(px(-4.))
-            .border_t_1()
-            .border_color(theme.border)
+            .map(|el| if below_text { el.mt_2().pt_1p5().border_t_1().border_color(theme.border) } else { el.mt(px(-4.)) })
             .children(docs.iter().enumerate().map(|(i, path)| {
                 let shown = open.as_ref() == Some(path);
                 let label = if !path.is_file() {
@@ -2159,8 +2416,13 @@ impl AppView {
                             .flex_1()
                             .min_w_0()
                             .child(div().text_sm().font_semibold().child("The agent asks for permission"))
+                            // A long command, such as a script, scrolls. Without a limit, it
+                            // pushes the buttons and the composer out of the window.
                             .child(
                                 div()
+                                    .id("permission-title-scroll")
+                                    .max_h(px(PERMISSION_TITLE))
+                                    .overflow_y_scroll()
                                     .text_sm()
                                     .text_color(theme.muted_foreground)
                                     .child(TextView::markdown("permission-title", SharedString::from(p.title.clone()))),
@@ -2174,7 +2436,10 @@ impl AppView {
                     .justify_end()
                     .children(p.options.iter().enumerate().map(|(i, o)| {
                         let id = o.id.clone();
-                        let button = Button::new(("perm", i)).small().label(o.name.clone());
+                        let label = attach::middle(&o.name, PERMISSION_OPTION);
+                        let long = label != o.name;
+                        let button = Button::new(("perm", i)).small().label(label);
+                        let button = if long { button.tooltip(o.name.clone()) } else { button };
                         let button = if Some(i) == first_allow { button.primary() } else { button.outline() };
                         button.on_click(cx.listener(move |this, _, _, cx| this.answer_permission(Some(id.clone()), cx)))
                     })),
@@ -2184,7 +2449,7 @@ impl AppView {
 
     /// The top of a new chat, as a new message in Messages: a "To:" line with the assistant
     /// as the recipient. A click on the recipient opens a menu to change the agent.
-    fn render_to_line(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn render_to_line(&self, sidebar: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let (kind, busy) = (self.chat.kind, self.chat.busy);
         let view = cx.entity().downgrade();
@@ -2219,7 +2484,7 @@ impl AppView {
             .border_color(theme.border)
             // Without the sidebar, the traffic lights and the button that shows the sidebar
             // are on this line.
-            .when(!self.sidebar_open, |el| {
+            .when(!sidebar, |el| {
                 el.child(div().pl(px(52.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx)))
             })
             .child(div().text_sm().text_color(theme.muted_foreground).child("To:"))
@@ -2338,7 +2603,7 @@ impl AppView {
             .to_string();
         Some(
             v_flex()
-                .w(px(mcp_app::PANEL))
+                .w(px(mcp_app::PANEL.min(self.panel_room(window))))
                 .h_full()
                 .flex_shrink_0()
                 .border_l_1()
@@ -2380,8 +2645,15 @@ impl AppView {
     }
 
     fn render_view(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let sidebar = self.sidebar_shows(window);
         let app_panel = self.render_panel(window, cx);
         let doc_panel = self.render_doc(window, cx);
+        // The things that change the width of the conversation. See `text_id`.
+        self.text_layout = (
+            f32::from(window.viewport_size().width) as i32,
+            self.sidebar_open,
+            self.doc.is_some() || self.panel.is_some(),
+        );
         let theme = cx.theme().clone();
         let chat = &self.chat;
         let busy = chat.busy;
@@ -2401,7 +2673,7 @@ impl AppView {
         // Without the sidebar, the traffic lights and the button that shows the sidebar are on it.
         // The two sides have the same width, so the middle stays in the middle.
         let toolbar = if empty {
-            self.render_to_line(cx)
+            self.render_to_line(sidebar, cx)
         } else {
             self.toolbar("main-toolbar", cx)
             .h(px(HEADER))
@@ -2412,7 +2684,7 @@ impl AppView {
                     .flex_1()
                     // The traffic lights are in the middle of the first TOOLBAR of height.
                     .h(px(TOOLBAR))
-                    .when(!self.sidebar_open, |el| {
+                    .when(!sidebar, |el| {
                         el.pl(px(68.)).child(sidebar_toggle("show-sidebar", "Show sidebar", cx))
                     }),
             )
@@ -2480,11 +2752,8 @@ impl AppView {
             // is a native view, so its own clicks do not come here.
             .capture_any_mouse_down(cx.listener(|this, _, _, _| this.unfocus_doc()))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
-            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
-                cx.notify();
-            }))
-            .when(self.sidebar_open, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
+            .when(sidebar, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
             .child(
                 v_flex()
                     .id("conversation")
@@ -2501,8 +2770,10 @@ impl AppView {
                         this.attach_paths(paths.paths(), cx);
                         this.focus_composer(window, cx);
                     }))
+                    .relative()
                     .child(toolbar)
-                    .child(body),
+                    .child(body)
+                    .children(self.render_demo_switch(cx)),
             )
             .children(app_panel)
             .children(doc_panel)
@@ -2527,6 +2798,27 @@ mod tests {
             Item::Error("oops".into()),
             Item::Agent("Done.".into()),
         ]
+    }
+
+    #[test]
+    fn the_text_of_the_user_shows_as_written() {
+        assert_eq!(literal("a <b>c</b> &amp; d & e"), r"a \<b\>c\</b\> \&amp; d & e");
+        assert_eq!(literal("&#169; &x;"), r"\&\#169; \&x;");
+        assert_eq!(literal("**bold** and _it_ and ~x~ [a](b) #142"), r"\*\*bold\*\* and \_it\_ and \~x\~ \[a\](b) \#142");
+        assert_eq!(literal(r"C:\temp"), r"C:\\temp");
+        // Block marks at the start of a line.
+        assert_eq!(literal("- a\n+ b\n1. c\n12) d\n> e\n==="), "\\- a\\\n\\+ b\\\n1\\. c\\\n12\\) d\\\n\\> e\\\n\\===");
+        assert_eq!(literal("a - b 1. c"), "a - b 1. c");
+        // Each line break stays. A blank line is a new paragraph.
+        assert_eq!(literal("one\ntwo\n\nthree"), "one\\\ntwo\n\nthree");
+        // Code keeps its text.
+        assert_eq!(literal("use `Vec<u8>` here <x>"), r"use `Vec<u8>` here \<x\>");
+        assert_eq!(literal("see:\n```\n<div>**</div>\n```\n<p>"), "see:\n```\n<div>**</div>\n```\n\\<p\\>");
+        // A lone backtick does not open a code span.
+        assert_eq!(literal("it`s <ok>"), r"it`s \<ok\>");
+        // Links and email addresses open.
+        assert_eq!(literal("https://example.com/a_b?x=1&y=2 now"), "https://example.com/a_b?x=1&y=2 now");
+        assert_eq!(literal("mail first_last@example.com"), "mail first_last@example.com");
     }
 
     #[test]

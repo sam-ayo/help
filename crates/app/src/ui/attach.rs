@@ -25,8 +25,29 @@ use gpui_kit_assets::IconName as KitIcon;
 const PICTURE: f32 = 160.;
 /// The widest picture in a message.
 const MAX_PICTURE: f32 = 320.;
+/// The narrowest picture in a message. A tall picture gets this width, and Cover cuts it.
+const MIN_PICTURE: f32 = 96.;
 /// The size of a picture in the composer.
 const PREVIEW: f32 = 56.;
+/// The most characters of a file name in a tile in a message (two lines), and in the composer
+/// (one line).
+const TILE_NAME: usize = 64;
+const PREVIEW_NAME: usize = 18;
+
+/// The text with an ellipsis in the middle if it has more than `max` characters. Use it for
+/// names with an important end, as file names: "IMG_2025…edited.HEIC" keeps the extension.
+pub fn middle(text: &str, max: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max || max < 3 {
+        return text.to_string();
+    }
+    let ext = text.rfind('.').map_or(0, |i| text[i..].chars().count()).min(max / 3);
+    let tail = ((max - 1) / 2).max(ext);
+    let head = max - 1 - tail;
+    let start: String = chars[..head].iter().collect();
+    let end: String = chars[chars.len() - tail..].iter().collect();
+    format!("{}…{}", start.trim_end(), end.trim_start())
+}
 
 /// The image types that GPUI can draw.
 fn drawable(a: &Attachment) -> bool {
@@ -164,9 +185,16 @@ pub fn tiles(
             let el_id = ElementId::NamedInteger(id.clone(), i as u64);
             let missing = !a.path.exists();
             let tile = match picture(a, dir) {
+                // The box has the height of a picture, and a width in limits. The picture fills
+                // it and Cover cuts it. A `max_w` on the image itself makes it lower too, because
+                // the image keeps its aspect ratio: a panorama becomes a thin line.
                 Some(src) => div()
                     .id(el_id)
                     .relative()
+                    .flex()
+                    .h(px(PICTURE))
+                    .min_w(px(MIN_PICTURE))
+                    .max_w(px(MAX_PICTURE))
                     .rounded(px(12.))
                     .overflow_hidden()
                     .border_1()
@@ -174,8 +202,9 @@ pub fn tiles(
                     .cursor_pointer()
                     .child(
                         gpui::img(src)
-                            .h(px(PICTURE))
-                            .max_w(px(MAX_PICTURE))
+                            .h_full()
+                            .min_w_0()
+                            .flex_grow(1.)
                             .object_fit(ObjectFit::Cover)
                             .with_fallback({
                                 let name = a.name.clone();
@@ -211,7 +240,7 @@ pub fn tiles(
                             .child(
                                 v_flex()
                                     .min_w_0()
-                                    .child(div().text_sm().truncate().child(a.name.clone()))
+                                    .child(div().text_sm().line_clamp(2).child(middle(&a.name, TILE_NAME)))
                                     .child(div().text_xs().text_color(theme.muted_foreground).child(if missing {
                                         "The file is not there".to_string()
                                     } else {
@@ -230,7 +259,8 @@ pub fn tiles(
         .into_any_element()
 }
 
-/// The attachments in the composer, each with a button that removes it.
+/// The attachments in the composer, each with a button that removes it. They are in one row
+/// that scrolls, as in Messages. Rows that wrap make the composer higher than a small window.
 pub fn previews(
     files: &[Attachment],
     dir: &Path,
@@ -239,7 +269,8 @@ pub fn previews(
 ) -> gpui::AnyElement {
     let theme = cx.theme();
     h_flex()
-        .flex_wrap()
+        .id("composer-attachments")
+        .overflow_x_scroll()
         .gap_2()
         .px_2()
         .pt_2()
@@ -268,13 +299,14 @@ pub fn previews(
                     .child(
                         v_flex()
                             .min_w_0()
-                            .child(div().text_sm().truncate().child(a.name.clone()))
+                            .child(div().text_sm().truncate().child(middle(&a.name, PREVIEW_NAME)))
                             .child(div().text_xs().text_color(theme.muted_foreground).child(size_label(a.size))),
                     )
                     .into_any_element(),
             };
             div()
                 .id(("attachment", i))
+                .flex_shrink_0()
                 .group("attachment")
                 .relative()
                 .cursor_pointer()
@@ -313,5 +345,18 @@ mod tests {
         assert_eq!(size_label(12_300), "12 KB");
         assert_eq!(size_label(3_400_000), "3.4 MB");
         assert_eq!(size_label(1_100_000_000), "1.1 GB");
+    }
+
+    #[test]
+    fn long_names_lose_their_middle() {
+        assert_eq!(middle("report.pdf", 34), "report.pdf");
+        let name = "Q3 Board Deck — FINAL (revised) v12 [approved by legal].pdf";
+        assert_eq!(middle(name, TILE_NAME), name);
+        let short = middle(name, 34);
+        assert_eq!(short.chars().count(), 34);
+        assert!(short.starts_with("Q3 Board Deck") && short.ends_with("legal].pdf"), "{short}");
+        let id = middle("9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f.zip", PREVIEW_NAME);
+        assert_eq!(id.chars().count(), PREVIEW_NAME);
+        assert!(id.ends_with("7e6f.zip"), "{id}");
     }
 }

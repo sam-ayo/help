@@ -26,7 +26,7 @@ use wry::{
     http::{Response, header::CONTENT_TYPE},
 };
 
-use super::{AppView, Context};
+use super::{AppView, Context, demo};
 
 /// The width of the panel.
 pub(super) const PANEL: f32 = 420.;
@@ -100,6 +100,11 @@ impl AppEntry {
             Some(Arc::new(gpui::Image::from_bytes(format, logo.bytes)))
         };
         Self { logo: image(server.logo), logo_dark: image(server.logo_dark), server: server.server, title: server.title }
+    }
+
+    /// A server with no logo, for the sample data of the demo.
+    pub fn named(server: &str, title: &str) -> Self {
+        Self { server: server.into(), title: title.into(), logo: None, logo_dark: None }
     }
 
     /// The logo for the theme, if the server has one.
@@ -268,6 +273,11 @@ impl AppView {
     /// Connect to all the MCP servers of the agent, and show the servers that have views in the
     /// sidebar. The app calls this when the agent, the folder, or the servers change.
     pub(super) fn load_app_servers(&mut self, cx: &mut Context<Self>) {
+        if demo::enabled() && self.demo_data != demo::Data::Demo {
+            self.app_servers = self.demo_data.app_servers().into_iter().map(|(s, t)| AppEntry::named(s, t)).collect();
+            cx.notify();
+            return;
+        }
         let apps = self.apps();
         let (kind, cwd) = (self.chat.kind, self.chat.cwd.clone());
         let task = self.env.runtime.spawn(async move { apps.app_servers().await });
