@@ -365,9 +365,11 @@ impl AppView {
                     if this.chat.generation != generation {
                         return;
                     }
+                    let mut changed = None;
                     if this.chat.compaction.is_some() && !matches!(event, Event::Ready { .. }) {
                         this.apply_compaction(event, cx);
                     } else {
+                        changed = first_changed_item(&this.chat, &event);
                         // Keep the conversation at the end of each turn, and when the agent stops.
                         let ended = matches!(event, Event::TurnEnded(_));
                         let save = ended || matches!(event, Event::Closed);
@@ -390,7 +392,10 @@ impl AppView {
                     this.sync_mcp(cx);
                     // The conversation follows the new text only when it shows the end. The user
                     // can scroll up to read while the agent works.
-                    this.rows_changed(cx);
+                    match changed {
+                        Some(item) => this.rows_changed_from(item, cx),
+                        None => this.rows_changed(cx),
+                    }
                     cx.notify();
                 });
                 if ok.is_err() {
@@ -720,12 +725,22 @@ impl AppView {
     /// Make the rows again, and tell the scroller what changed. The rows of the current turn
     /// can change in place, so the scroller measures them again.
     fn rows_changed(&mut self, cx: &mut Context<Self>) {
+        let turn = self.chat.items.iter().rposition(|i| matches!(i, Item::User { .. })).unwrap_or(0);
+        self.rows_changed_from(turn, cx);
+    }
+
+    /// Make the rows again, and measure again only the rows from the row of the item `item`.
+    /// The rows above keep their heights, so the text above does not move while the user reads.
+    fn rows_changed_from(&mut self, item: usize, cx: &mut Context<Self>) {
         let rows = build_rows(&self.chat, &self.open_steps);
         let old = std::mem::replace(&mut self.rows, rows);
         let rows = &self.rows;
         let same = old.iter().zip(rows).take_while(|(a, b)| a == b).count();
-        let turn = self.chat.items.iter().rposition(|i| matches!(i, Item::User { .. })).unwrap_or(0);
-        let from = rows.iter().position(|r| matches!(r, Row::Item(ix) if *ix >= turn)).unwrap_or(rows.len());
+        // A hidden step has no row, but the line at the end of the turn counts the steps.
+        let from = rows
+            .iter()
+            .position(|r| matches!(*r, Row::Item(ix) | Row::Reply { ix, .. } if ix >= item))
+            .unwrap_or(rows.len().saturating_sub(1));
         self.scroller.update(cx, |s, cx| {
             s.splice(same..old.len(), rows.len() - same, cx);
             let from = from.min(same);
@@ -1148,6 +1163,24 @@ fn build_rows(chat: &Chat, open_steps: &HashSet<usize>) -> Vec<Row> {
         rows.push(Row::Working { steps: working_steps });
     }
     rows
+}
+
+/// The first item that `event` can change, or `None` if the event can change all of the turn.
+/// A part of a streamed reply changes only the last item, so the other rows keep their heights.
+fn first_changed_item(chat: &Chat, event: &Event) -> Option<usize> {
+    let items = &chat.items;
+    let tool = |id: &str| items.iter().rposition(|i| matches!(i, Item::Tool { id: t, .. } if t == id));
+    // The card of a subagent shows its tool calls, so a change to one of them changes the card.
+    let card = |ix: usize| match &items[ix] {
+        Item::Tool { parent: Some(p), .. } => tool(p).map_or(ix, |p| p.min(ix)),
+        _ => ix,
+    };
+    match event {
+        Event::AgentText(_) | Event::Thought(_) | Event::AgentFile(_) => Some(items.len().saturating_sub(1)),
+        Event::ToolCall { parent, .. } => Some(parent.as_deref().and_then(tool).unwrap_or(items.len())),
+        Event::ToolUpdate { id, .. } => tool(id).map(card),
+        _ => None,
+    }
 }
 
 fn apply(chat: &mut Chat, event: Event) {
