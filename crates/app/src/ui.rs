@@ -1819,12 +1819,14 @@ impl AppView {
                 .into_any_element(),
             Item::Agent(text) => {
                 let group: SharedString = format!("agent-message-{ix}").into();
-                let copy = text.clone();
                 let bubble = agent_bubble(&theme);
+                // The chat shows the summary of a long reply. The panel shows the full reply.
                 let docs = doc::links(text, &self.env.docs_dir);
+                let text = if docs.is_empty() { text.clone() } else { doc::without_links(text, &self.env.docs_dir) };
+                let copy = text.clone();
                 // A link to a document opens it in the panel. Other links open in the browser.
                 let (dir, clicks) = (self.env.docs_dir.clone(), self.doc_clicks.clone());
-                let message = TextView::markdown(("item", ix), SharedString::from(text.clone()))
+                let message = TextView::markdown(("item", ix), SharedString::from(text))
                     .selectable(true)
                     .on_link_click(move |href, _, _, cx| match doc::links(href.trim_start_matches("file://"), &dir).pop() {
                         Some(path) => {
@@ -1832,7 +1834,7 @@ impl AppView {
                         }
                         None => cx.open_url(href),
                     });
-                let row = h_flex()
+                h_flex()
                     .group(group.clone())
                     .items_end()
                     .gap_3()
@@ -1847,6 +1849,7 @@ impl AppView {
                             .rounded(px(18.))
                             .bg(bubble)
                             .child(message)
+                            .when(!docs.is_empty(), |el| el.child(self.document_links(ix, &docs, &theme, cx)))
                             // The tail at the bottom left: a gray corner, and a corner of the
                             // background color on it that cuts the curve.
                             .child(
@@ -1883,14 +1886,7 @@ impl AppView {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
                                 }),
                         ),
-                    );
-                if docs.is_empty() {
-                    return row.into_any_element();
-                }
-                v_flex()
-                    .gap_2()
-                    .child(row)
-                    .child(self.document_cards(ix, docs, &theme, cx))
+                    )
                     .into_any_element()
             }
             Item::Thought(text) => h_flex()
@@ -2102,55 +2098,41 @@ impl AppView {
         }
     }
 
-    /// The cards of the documents that a message links to, below the message. A click opens
-    /// the document in the panel.
-    fn document_cards(&self, ix: usize, docs: Vec<PathBuf>, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+    /// The rows at the bottom of a message that open its documents in the panel. The rows do
+    /// not show the file names. A click on the row of the open document closes the panel.
+    fn document_links(&self, ix: usize, docs: &[PathBuf], theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = accent(theme);
         let open = self.doc.as_ref().map(|d| d.path.clone());
-        h_flex()
-            .flex_wrap()
-            .gap_2()
-            .pl(px(TAIL_INSET))
-            .pr(px(40.))
-            .children(docs.into_iter().enumerate().map(|(i, path)| {
-                let shown = open.as_ref() == Some(&path);
-                let status = if !path.is_file() {
-                    "The file is not there"
+        v_flex()
+            .mt_2()
+            .pt_1p5()
+            .mb(px(-4.))
+            .border_t_1()
+            .border_color(theme.border)
+            .children(docs.iter().enumerate().map(|(i, path)| {
+                let shown = open.as_ref() == Some(path);
+                let label = if !path.is_file() {
+                    "The full reply is not there".to_string()
                 } else if shown {
-                    "Open in the panel"
+                    "Hide the full reply".to_string()
+                } else if docs.len() == 1 {
+                    "Read the full reply".to_string()
                 } else {
-                    "Document"
+                    format!("Read {}", doc::title(path))
                 };
+                let path = path.clone();
                 h_flex()
-                    .id(ElementId::NamedInteger(format!("doc-card-{ix}").into(), i as u64))
-                    .gap_2p5()
-                    .px_3()
-                    .py_2()
-                    .w(px(280.))
-                    .rounded(px(12.))
-                    .border_1()
-                    .border_color(if shown { accent.opacity(0.6) } else { theme.border })
-                    .bg(theme.background)
+                    .id(ElementId::NamedInteger(format!("doc-link-{ix}").into(), i as u64))
+                    .gap_1p5()
+                    .py_1()
+                    .text_sm()
+                    .font_medium()
+                    .text_color(accent)
                     .cursor_pointer()
-                    .hover(|el| el.bg(theme.secondary))
-                    .child(
-                        div()
-                            .size(px(32.))
-                            .flex_shrink_0()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(8.))
-                            .bg(accent.opacity(0.12))
-                            .child(Icon::new(KitIcon::FileText).size(px(16.)).text_color(accent)),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(div().text_sm().font_medium().truncate().child(doc::title(&path)))
-                            .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(status)),
-                    )
+                    .hover(|el| el.opacity(0.8))
+                    .child(Icon::new(KitIcon::FileText).size(px(14.)))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(Icon::new(if shown { KitIcon::ChevronLeft } else { KitIcon::ChevronRight }).size(px(14.)))
                     .on_click(cx.listener(move |this, _, _, cx| this.open_document(&path, cx)))
             }))
             .into_any_element()

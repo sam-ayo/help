@@ -156,6 +156,84 @@ pub(super) fn links(text: &str, dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// The links to documents in `dir` in a line: the byte range of each link, and its label.
+/// A link is `[label](<path>)`, `[label](path)`, or a path with no label.
+fn doc_spans(line: &str, dir: &Path) -> Vec<(std::ops::Range<usize>, String)> {
+    let is_doc = |target: &str| {
+        let target = target.trim_start_matches("file://").replace("%20", " ");
+        let target = Path::new(&target);
+        target.parent() == Some(dir) && target.extension().is_some_and(|e| e == "md")
+    };
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(open) = line[at..].find('[').map(|i| at + i) {
+        let Some(close) = line[open..].find("](").map(|i| open + i) else { break };
+        let rest = &line[close + 2..];
+        let (target, len) = match rest.strip_prefix('<') {
+            Some(r) => match r.find(">)") {
+                Some(end) => (&r[..end], end + 3),
+                None => break,
+            },
+            None => match rest.find(')') {
+                Some(end) => (&rest[..end], end + 1),
+                None => break,
+            },
+        };
+        let end = close + 2 + len;
+        if is_doc(target) {
+            spans.push((open..end, line[open + 1..close].to_string()));
+        }
+        at = end;
+    }
+    // A path with no label.
+    let prefix = format!("{}/", dir.display());
+    for (start, _) in line.match_indices(&prefix) {
+        if spans.iter().any(|(r, _)| r.contains(&start)) {
+            continue;
+        }
+        let begin = line[..start].strip_suffix("file://").map_or(start, |s| s.len());
+        let end = line[start..].find(".md").map_or(line.len(), |i| start + i + 3);
+        spans.push((begin..end, String::new()));
+    }
+    spans.sort_by_key(|(r, _)| r.start);
+    spans
+}
+
+/// The text of a message for the chat, without the links to its documents. The panel shows
+/// the documents, so the chat does not show their names. A line with only a link goes. In a
+/// sentence, a link becomes its label.
+pub(super) fn without_links(text: &str, dir: &Path) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let spans = doc_spans(line, dir);
+        if spans.is_empty() {
+            lines.push(line.to_string());
+            continue;
+        }
+        let (mut out, mut rest, mut last) = (String::new(), String::new(), 0);
+        for (range, label) in &spans {
+            out.push_str(&line[last..range.start]);
+            rest.push_str(&line[last..range.start]);
+            out.push_str(label);
+            last = range.end;
+        }
+        out.push_str(&line[last..]);
+        rest.push_str(&line[last..]);
+        if rest.chars().any(char::is_alphanumeric) {
+            lines.push(out.trim_end().to_string());
+        }
+    }
+    let mut text = String::new();
+    for line in lines {
+        if line.trim().is_empty() && (text.is_empty() || text.ends_with("\n\n")) {
+            continue;
+        }
+        text.push_str(line.trim_end());
+        text.push('\n');
+    }
+    text.trim_end().to_string()
+}
+
 /// The title of a document, from its file name: `trip-plan.md` is "Trip plan".
 pub(super) fn title(path: &Path) -> String {
     let stem = path.file_stem().map(|s| s.to_string_lossy().replace(['-', '_'], " ")).unwrap_or_default();
@@ -546,6 +624,17 @@ mod tests {
         assert!(chat.starts_with("Long text.") && chat.len() < 400);
         assert!(std::fs::read_to_string(dir.join("reply.md")).unwrap().starts_with("# Reply\n\n1. a"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_chat_does_not_show_the_links_to_documents() {
+        let dir = Path::new("/Users/me/Library/Application Support/Help/documents");
+        let text = "The plan has two days.\n\n[Trip plan](</Users/me/Library/Application Support/Help/documents/trip-plan.md>)";
+        assert_eq!(without_links(text, dir), "The plan has two days.");
+        let text = "Read [the plan](file:///Users/me/Library/Application%20Support/Help/documents/trip-plan.md) first.\n\n\
+                    - /Users/me/Library/Application Support/Help/documents/budget.md\n\nSee [the docs](https://x.org/a.md).";
+        assert_eq!(without_links(text, dir), "Read the plan first.\n\nSee [the docs](https://x.org/a.md).");
+        assert_eq!(without_links("No links.", dir), "No links.");
     }
 
     #[test]
