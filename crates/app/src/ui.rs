@@ -779,6 +779,10 @@ impl AppView {
         if self.doc.as_ref().is_some_and(|d| d.path == self.thread.history_file(&self.env)) {
             self.doc = None;
         }
+        // The view of an MCP App is for a tool call of the old thread. Its messages and its
+        // context must not go to the new thread. A closed panel ignores its old messages.
+        self.close_app(cx);
+        self.app_context = None;
         self.thread = thread;
         // The agent of the old thread stops and sends `Closed`. The new chat keeps the
         // generation, so that the events of the old session do not apply to it.
