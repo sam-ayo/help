@@ -284,6 +284,12 @@ impl Render for Editor {
         // to the viewport center instead of being pinned to the bottom edge.
         let scroll_beyond_bottom = viewport_height * 0.5;
         let viewport_width = f32::from(viewport_bounds.size.width.max(px(1.0)));
+        // The scroll handle has no bounds before the first layout. The rows then wrap at a
+        // width of 1 px for one frame, so they stay hidden until the next frame.
+        let measured = viewport_bounds.size.width > px(0.0);
+        if !measured {
+            window.request_animation_frame();
+        }
         let has_overflow = max_scroll_y > 0.5;
 
         let centered_width = Self::centered_column_width(viewport_width, &theme.dimensions);
@@ -658,6 +664,7 @@ impl Render for Editor {
                 + scroll_trigger_padding
                 + scroll_beyond_bottom))
             .children(block_rows);
+        let scroll_content = if measured { scroll_content } else { scroll_content.invisible() };
         let scroll_content = if self.view_mode == super::ViewMode::Rendered {
             scroll_content.on_mouse_down(
                 MouseButton::Right,
