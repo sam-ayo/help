@@ -10,7 +10,7 @@ use std::{
     time::SystemTime,
 };
 
-use gpui::{ClipboardItem, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Task, Window, div, px};
+use gpui::{ClipboardItem, prelude::FluentBuilder as _, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Task, Window, div, px};
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -27,7 +27,7 @@ use wry::{
 use super::{AppView, Context, INSET, Item, TOOLBAR, accent, mcp_app};
 
 /// The width of the panel.
-const WIDTH: f32 = 480.;
+pub(super) const WIDTH: f32 = 480.;
 /// The scheme of the address of the editor page.
 const SCHEME: &str = "helpdoc";
 /// The editor page, built from `web/doc-editor` with `npm run build`.
@@ -127,10 +127,6 @@ impl Doc {
         if let Some(webview) = &self.webview {
             let _ = webview.set_visible(false);
         }
-    }
-
-    fn file_name(&self) -> String {
-        self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     }
 }
 
@@ -237,9 +233,23 @@ pub(super) fn without_links(text: &str, dir: &Path) -> String {
 
 /// The title of a document, from its file name: `trip-plan.md` is "Trip plan".
 pub(super) fn title(path: &Path) -> String {
+    // The file name has no accents and no capitals, so the first heading is better.
+    if let Some(heading) = heading(path) {
+        return heading;
+    }
     let stem = path.file_stem().map(|s| s.to_string_lossy().replace(['-', '_'], " ")).unwrap_or_default();
     let mut chars = stem.trim().chars();
     chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// The text of the first `# ` heading in the start of the file, if the file has one.
+fn heading(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    let mut head = Vec::new();
+    std::fs::File::open(path).ok()?.take(4096).read_to_end(&mut head).ok()?;
+    let head = String::from_utf8_lossy(&head);
+    let heading = head.lines().find_map(|l| l.strip_prefix("# "))?.trim();
+    (!heading.is_empty()).then(|| heading.to_string())
 }
 
 /// A reply with more characters than this goes to a document. See `long`.
@@ -507,7 +517,6 @@ impl AppView {
         let theme = cx.theme().clone();
         let accent = accent(&theme);
 
-        let status = if doc.saved { format!("{} · Saved", doc.file_name()) } else { doc.file_name() };
         // The icon of the file, in a tinted square.
         let badge = div()
             .size(px(28.))
@@ -517,12 +526,13 @@ impl AppView {
             .justify_center()
             .rounded(px(8.))
             .bg(accent.opacity(0.12))
-            .child(Icon::new(doc.icon.clone()).size(px(15.)).text_color(accent));
+            .child(Icon::new(doc.icon).size(px(15.)).text_color(accent));
         let heading = v_flex()
             .flex_1()
             .min_w_0()
             .child(div().text_sm().font_semibold().truncate().child(doc.title.clone()))
-            .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(status));
+            // The header does not show the file name. It shows "Saved" after a change.
+            .when(doc.saved, |el| el.child(div().text_xs().text_color(theme.muted_foreground).child("Saved")));
         let header = self
             .toolbar("doc-toolbar", cx)
             .h(px(TOOLBAR))
@@ -576,7 +586,7 @@ impl AppView {
             .child(body);
         Some(
             div()
-                .w(px(WIDTH + INSET * 2.))
+                .w(px((WIDTH + INSET * 2.).min(self.panel_room(window))))
                 .h_full()
                 .flex_shrink_0()
                 .p(px(INSET))
@@ -666,5 +676,9 @@ mod tests {
     fn the_title_comes_from_the_file_name() {
         assert_eq!(title(Path::new("/d/trip-plan.md")), "Trip plan");
         assert_eq!(title(Path::new("/d/code_review.md")), "Code review");
+        let path = std::env::temp_dir().join(format!("help-title-{}.md", std::process::id()));
+        std::fs::write(&path, "Intro.\n\n# Paramètres de sécurité\n\n## Part\n").unwrap();
+        assert_eq!(title(&path), "Paramètres de sécurité");
+        std::fs::remove_file(&path).unwrap();
     }
 }
