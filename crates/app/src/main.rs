@@ -184,6 +184,8 @@ fn main() {
             KeyBinding::new("cmd-w", presence::HideWindow, None),
             KeyBinding::new("cmd-q", presence::Quit, None),
         ]);
+        // The keys of the editor in the document panel. All of them are for the editor only.
+        cx.bind_keys(md_editor::default_key_bindings());
         cx.set_global(theme::ThemeChoice::load(support.join("theme")));
         theme::apply(None, cx);
 

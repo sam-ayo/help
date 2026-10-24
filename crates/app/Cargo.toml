@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 acp_host.workspace = true
 mcp_apps.workspace = true
+md_editor.workspace = true
 vm.workspace = true
 protocol.workspace = true
 anyhow.workspace = true

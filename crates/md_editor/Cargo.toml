@@ -1,0 +1,94 @@
+[package]
+name = "md_editor"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "The native Markdown editor of the document panel. From gpui-markdown-editor (yuWorm), which comes from Velotype (manyougz)."
+
+[lints.clippy]
+# Allow stylistic patterns the project doesn't enforce. These mirror the
+# spirit of gpui-component's workspace lints — categorically silence
+# noise (range-loop indexing, identical-block flagging, helper-arg
+# counts, "future detached via let _") while keeping real correctness
+# lints active.
+if_same_then_else = "allow"
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+let_underscore_future = "allow"
+manual_div_ceil = "allow"
+manual_checked_ops = "allow"
+manual_clamp = "allow"
+module_inception = "allow"
+obfuscated_if_else = "allow"
+question_mark = "allow"
+collapsible_if = "allow"
+collapsible_else_if = "allow"
+
+[features]
+default = ["code-highlight-core", "code-highlight-official", "code-highlight-config", "html-native"]
+code-highlight-core = ["dep:tree-sitter", "dep:tree-sitter-highlight"]
+html-native = ["dep:tree-sitter", "dep:tree-sitter-html"]
+code-highlight-official = [
+    "code-highlight-core",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-json",
+    "dep:tree-sitter-md",
+    "dep:tree-sitter-bash",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-css",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-html",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-php",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-ruby",
+]
+code-highlight-config = [
+    "code-highlight-core",
+    "dep:tree-sitter-yaml",
+    "dep:tree-sitter-toml",
+]
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22.1"
+cssparser = "0.37"
+directories = "6"
+futures = "0.3"
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+mermaid-rs-renderer = { version = "0.3.0", default-features = false }
+ratex-layout = "0.1.9"
+ratex-parser = "0.1.9"
+ratex-svg = { version = "0.1.9", features = ["embed-fonts", "standalone"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+unicode-segmentation = "1.13"
+uuid = "1.23"
+url = "2"
+tree-sitter = { version = "0.26.9", optional = true }
+tree-sitter-highlight = { version = "0.26.9", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-md = { version = "0.5", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-css = { version = "0.25", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-html = { version = "0.23", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-yaml = { version = "0.7", optional = true }
+tree-sitter-toml = { package = "adot-tree-sitter-toml", version = "0.1", optional = true }
+
+[dev-dependencies]
+gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
