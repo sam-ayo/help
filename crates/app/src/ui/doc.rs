@@ -1,5 +1,6 @@
-//! The memory file or the conversation summary, in a panel at the right side of the window.
-//! The user edits the Markdown as formatted text, as in Notion. The editor is a web page
+//! A Markdown file in a panel at the right side of the window: the memory file, the
+//! conversation summary, or a document that the agent wrote for a long reply. The user edits
+//! the Markdown as formatted text, as in Notion. The editor is a web page
 //! (see `web/doc-editor`) in a web view. The page sends each change, and the app saves it.
 
 use std::{
@@ -9,7 +10,7 @@ use std::{
     time::SystemTime,
 };
 
-use gpui::{Hsla, IntoElement, ParentElement as _, Styled as _, Task, Window, div, px};
+use gpui::{ClipboardItem, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Task, Window, div, px};
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -23,7 +24,7 @@ use wry::{
     http::{Response, header::CONTENT_TYPE},
 };
 
-use super::{AppView, Context, INSET, TOOLBAR, accent, mcp_app};
+use super::{AppView, Context, INSET, Item, TOOLBAR, accent, mcp_app};
 
 /// The width of the panel.
 const WIDTH: f32 = 480.;
@@ -34,7 +35,7 @@ const EDITOR: &str = include_str!("../../web/doc-editor.html");
 
 /// A Markdown file in the panel.
 pub(super) struct Doc {
-    title: &'static str,
+    title: SharedString,
     icon: KitIcon,
     pub(super) path: PathBuf,
     /// The text of the file, as the app read it or saved it last.
@@ -60,7 +61,7 @@ pub(super) struct Doc {
 }
 
 impl Doc {
-    fn open(title: &'static str, icon: KitIcon, path: &Path) -> Self {
+    fn open(title: SharedString, icon: KitIcon, path: &Path) -> Self {
         let mut doc = Self {
             title,
             icon,
@@ -133,6 +134,115 @@ impl Doc {
     }
 }
 
+/// The documents that a message of the agent links to: the Markdown files in `dir` that the
+/// text names. The agent writes a long reply to a document. See `memory::preamble`.
+pub(super) fn links(text: &str, dir: &Path) -> Vec<PathBuf> {
+    // The path of the folder has a space, and a link can have it as `%20`.
+    let text = text.replace("%20", " ");
+    let prefix = format!("{}/", dir.display());
+    let mut paths = Vec::new();
+    for (start, _) in text.match_indices(&prefix) {
+        let rest = &text[start + prefix.len()..];
+        let Some(end) = rest.find(".md").filter(|&end| end > 0) else { continue };
+        let name = &rest[..end + 3];
+        if name.contains(['/', '\n', '<', '>', '(', ')', '[', ']', '`']) {
+            continue;
+        }
+        let path = dir.join(name);
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+/// The title of a document, from its file name: `trip-plan.md` is "Trip plan".
+pub(super) fn title(path: &Path) -> String {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().replace(['-', '_'], " ")).unwrap_or_default();
+    let mut chars = stem.trim().chars();
+    chars.next().map(|c| c.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// A reply with more characters than this goes to a document. See `long`.
+const LONG_REPLY: usize = 1500;
+/// The most characters of the summary that stays in the chat.
+const SUMMARY: usize = 300;
+
+/// The headings of a Markdown text, without the `#` marks. The lines in code blocks are not
+/// headings.
+fn headings(text: &str) -> impl Iterator<Item = &str> {
+    let mut code = false;
+    text.lines().filter_map(move |line| {
+        let line = line.trim_start();
+        if line.starts_with("```") {
+            code = !code;
+        }
+        let rest = line.trim_start_matches('#');
+        (!code && line.starts_with('#') && rest.starts_with(' ')).then(|| rest.trim())
+    })
+}
+
+/// The reply is too long for the chat: it has many characters, or the headings of a document.
+pub(super) fn long(text: &str) -> bool {
+    text.chars().count() > LONG_REPLY || headings(text).count() >= 2
+}
+
+/// The first paragraph of plain text, cut at the end of a sentence or a word.
+fn summary(text: &str) -> Option<String> {
+    let plain = |p: &&str| {
+        let p = p.trim_start();
+        !p.is_empty()
+            && !p.starts_with(['#', '-', '*', '|', '>', '`', '<'])
+            && !p.split_once(". ").is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+    };
+    let paragraph = text.split("\n\n").find(plain)?.trim().replace('\n', " ");
+    if paragraph.chars().count() <= SUMMARY {
+        return Some(paragraph);
+    }
+    let cut: String = paragraph.chars().take(SUMMARY).collect();
+    Some(match cut.rfind(". ") {
+        Some(end) if end > SUMMARY / 3 => cut[..=end].to_string(),
+        _ => format!("{}…", cut[..cut.rfind(' ').unwrap_or(cut.len())].trim_end()),
+    })
+}
+
+/// A file name from a title: lowercase words and hyphens.
+fn slug(title: &str) -> String {
+    let mut slug = String::new();
+    for c in title.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            slug.push(c);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug: String = slug.chars().take(50).collect();
+    match slug.trim_matches('-') {
+        "" => "reply".into(),
+        s => s.into(),
+    }
+}
+
+/// Write a long reply of the agent to a new document in `dir`. Returns the text for the chat:
+/// the first paragraph of the reply and a link to the document.
+pub(super) fn write_reply(text: &str, dir: &Path) -> std::io::Result<String> {
+    let first = headings(text).next().map(str::to_string);
+    let title = first.clone().unwrap_or_else(|| "Reply".into());
+    let stem = slug(&title);
+    let path = (1..)
+        .map(|n| dir.join(if n == 1 { format!("{stem}.md") } else { format!("{stem}-{n}.md") }))
+        .find(|p| !p.exists())
+        .unwrap_or_default();
+    let body = match first {
+        Some(_) => format!("{}\n", text.trim()),
+        None => format!("# {title}\n\n{}\n", text.trim()),
+    };
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(&path, body)?;
+    let summary = summary(text).unwrap_or_else(|| "The reply is in a document.".into());
+    Ok(format!("{summary}\n\n[{title}](<{}>)", path.display()))
+}
+
 fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
@@ -193,12 +303,12 @@ fn build_webview(messages: async_channel::Sender<String>, window: &Window) -> wr
 
 impl AppView {
     /// Show a Markdown file in the panel. If the file shows already, the panel closes.
-    pub(super) fn open_doc(&mut self, title: &'static str, icon: KitIcon, path: &Path, cx: &mut Context<Self>) {
+    pub(super) fn open_doc(&mut self, title: impl Into<SharedString>, icon: KitIcon, path: &Path, cx: &mut Context<Self>) {
         let same = self.doc.as_ref().is_some_and(|d| d.path == path);
         self.close_doc(cx);
         if !same {
             self.close_app(cx);
-            self.doc = Some(Doc::open(title, icon, path));
+            self.doc = Some(Doc::open(title.into(), icon, path));
         }
         cx.notify();
     }
@@ -284,8 +394,34 @@ impl AppView {
         Some((doc.webview.clone()?, doc.bounds.clone()))
     }
 
-    /// The panel with the memory file or the conversation summary. It floats inset from the
-    /// window edges, as the sidebar does.
+    /// Show a document that the agent wrote in the panel.
+    pub(super) fn open_document(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.open_doc(title(path), KitIcon::FileText, path, cx);
+    }
+
+    /// At the end of a turn, move a long final reply to a document, so that the chat stays
+    /// short. Then show the document of the reply in the panel.
+    pub(super) fn finish_reply(&mut self, cx: &mut Context<Self>) {
+        let items = &mut self.chat.items;
+        let turn = items.iter().rposition(|i| matches!(i, Item::User { .. })).map_or(0, |i| i + 1);
+        let Some(Item::Agent(text)) = items[turn..].iter_mut().rev().find(|i| matches!(i, Item::Agent(_))) else {
+            return;
+        };
+        let dir = &self.env.docs_dir;
+        if links(text, dir).is_empty() && long(text) {
+            match write_reply(text, dir) {
+                Ok(short) => *text = short,
+                Err(e) => tracing::warn!("cannot write the reply to a document: {e}"),
+            }
+        }
+        let Some(path) = links(text, dir).into_iter().find(|p| p.is_file()) else { return };
+        if self.doc.as_ref().is_none_or(|d| d.path != path) {
+            self.open_document(&path, cx);
+        }
+    }
+
+    /// The panel with the Markdown file. It floats inset from the window edges, as the
+    /// sidebar does.
     pub(super) fn render_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         let (webview, bounds) = self.prepare_doc(window, cx)?;
         let doc = self.doc.as_ref()?;
@@ -306,7 +442,7 @@ impl AppView {
         let heading = v_flex()
             .flex_1()
             .min_w_0()
-            .child(div().text_sm().font_semibold().truncate().child(doc.title))
+            .child(div().text_sm().font_semibold().truncate().child(doc.title.clone()))
             .child(div().text_xs().text_color(theme.muted_foreground).truncate().child(status));
         let header = self
             .toolbar("doc-toolbar", cx)
@@ -318,6 +454,15 @@ impl AppView {
             .border_color(theme.border.opacity(0.6))
             .child(badge)
             .child(heading)
+            .child({
+                let text = doc.text.clone();
+                Button::new("copy-doc")
+                    .ghost()
+                    .small()
+                    .icon(KitIcon::Copy)
+                    .tooltip("Copy the Markdown")
+                    .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
+            })
             .child(
                 Button::new("close-doc")
                     .ghost()
@@ -359,5 +504,53 @@ impl AppView {
                 .child(card)
                 .into_any_element(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_message_links_to_the_documents_in_the_folder() {
+        let dir = Path::new("/Users/me/Library/Application Support/Help/documents");
+        let text = "The plan is ready: [Trip plan](</Users/me/Library/Application Support/Help/documents/trip-plan.md>). \
+                    Also file:///Users/me/Library/Application%20Support/Help/documents/budget.md and \
+                    [again](</Users/me/Library/Application Support/Help/documents/trip-plan.md>). \
+                    Not /Users/me/notes.md, not /Users/me/Library/Application Support/Help/documents/sub/x.md.";
+        assert_eq!(links(text, dir), vec![dir.join("trip-plan.md"), dir.join("budget.md")]);
+        assert!(links("no documents", dir).is_empty());
+    }
+
+    #[test]
+    fn a_long_reply_goes_to_a_document() {
+        assert!(!long("Paris."));
+        assert!(!long("# One heading\n\nShort."));
+        assert!(long("## A\n\ntext\n\n## B\n\ntext"));
+        assert!(!long("```sh\n# a comment\n# another\n```"));
+        assert!(long(&"word ".repeat(400)));
+
+        let dir = std::env::temp_dir().join(format!("help-docs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reply = "I wrote the plan below. It has two parts.\n\n---\n\n## Trip plan: Day 1\n\n- Go\n\n## Day 2\n\n- Come back";
+        let chat = write_reply(reply, &dir).unwrap();
+        let path = dir.join("trip-plan-day-1.md");
+        assert_eq!(chat, format!("I wrote the plan below. It has two parts.\n\n[Trip plan: Day 1](<{}>)", path.display()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), format!("{reply}\n"));
+        assert_eq!(links(&chat, &dir), vec![path]);
+        // A second reply with the same title gets a new file.
+        assert!(write_reply(reply, &dir).unwrap().contains("trip-plan-day-1-2.md"));
+        // A reply with no heading gets one.
+        let chat = write_reply(&format!("1. a\n\n{}", "Long text. ".repeat(40)), &dir).unwrap();
+        assert!(chat.ends_with(&format!("[Reply](<{}>)", dir.join("reply.md").display())));
+        assert!(chat.starts_with("Long text.") && chat.len() < 400);
+        assert!(std::fs::read_to_string(dir.join("reply.md")).unwrap().starts_with("# Reply\n\n1. a"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_title_comes_from_the_file_name() {
+        assert_eq!(title(Path::new("/d/trip-plan.md")), "Trip plan");
+        assert_eq!(title(Path::new("/d/code_review.md")), "Code review");
     }
 }

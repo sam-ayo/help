@@ -58,8 +58,8 @@ fn read_history(path: &Path) -> Option<String> {
 }
 
 /// The start of the first prompt of each session: who the assistant is, the memory, and the
-/// summary of the earlier conversation.
-pub fn preamble(path: &Path, history_path: &Path) -> String {
+/// summary of the earlier conversation. `docs` is the folder for the long replies.
+pub fn preamble(path: &Path, history_path: &Path, docs: &Path) -> String {
     let memory = read_capped(path, MAX_MEMORY);
     let memory = if memory.trim().is_empty() || memory == TEMPLATE {
         "The file has no facts yet.".to_string()
@@ -75,6 +75,15 @@ pub fn preamble(path: &Path, history_path: &Path) -> String {
          sentences, give the answer first, and use a short list for steps. Do not add \
          details that the user did not ask for. The user talks with you in one long \
          conversation in the Help app, and opens it from any app with Option-Space.\n\n\
+         A long reply makes the conversation difficult to read, so do not put it in the chat. \
+         A long reply is, for example, a plan, a report, a review, or more than about 300 \
+         words. Write the full reply as a Markdown file in the folder `{docs}` with your file \
+         tools. Start the file with a `# ` heading. Give a new document a new, short file name \
+         of lowercase words and hyphens, for example `trip-plan.md`. Then reply in the chat \
+         with a summary of two to four sentences and a link to the file, in the form \
+         `[Title](<full path of the file>)`. The app shows the link as a card that opens the \
+         document. When the user asks you to change a document, change the file, and tell the \
+         user the change in one line.\n\n\
          You can start subagents. When a task has parts that do not depend on each other, or \
          needs a broad search, delegate the parts to subagents that work at the same time. \
          Before you delegate, tell the user in one short line what each subagent does. When \
@@ -92,6 +101,7 @@ pub fn preamble(path: &Path, history_path: &Path) -> String {
          {history}\
          The message of the user follows.\n\n",
         path = path.display(),
+        docs = docs.display(),
         history = match read_history(history_path) {
             Some(h) => format!(
                 "A summary of the earlier conversation with the user is in the file `{}`. The app \
@@ -171,14 +181,16 @@ mod tests {
 
         ensure(&path);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), TEMPLATE);
-        let empty = preamble(&path, &history);
+        let docs = dir.join("documents");
+        let empty = preamble(&path, &history, &docs);
         assert!(empty.contains("no facts yet"));
         assert!(empty.contains(&path.display().to_string()));
         assert!(!empty.contains("<history>"));
+        assert!(empty.contains(&docs.display().to_string()));
 
         std::fs::write(&path, "# About me\n\n- Name: Sam\n").unwrap();
         std::fs::write(&history, "# Earlier conversation\n\n- Fixed the build\n").unwrap();
-        let full = preamble(&path, &history);
+        let full = preamble(&path, &history, &docs);
         assert!(full.contains("<memory>\n# About me\n\n- Name: Sam\n</memory>"));
         assert!(full.contains("<history>\n# Earlier conversation\n\n- Fixed the build\n</history>"));
 
