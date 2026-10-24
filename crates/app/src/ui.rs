@@ -1311,7 +1311,7 @@ const COLUMN: f32 = 760.;
 /// The name of the assistant, for the user. The agent picker shows the agent kind.
 const ASSISTANT_NAME: &str = "help";
 /// The height of the strip at the top of the conversation, with the avatar of the assistant.
-const HEADER: f32 = 84.;
+const HEADER: f32 = 76.;
 /// The height of the toolbars. The traffic lights sit in the sidebar toolbar.
 const TOOLBAR: f32 = 52.;
 /// The height of one line in the message field: the 20 px line of the text field, with its
@@ -2528,16 +2528,20 @@ impl AppView {
         let action = if busy {
             Button::new("stop")
                 .with_size(px(SEND))
+                .size(px(SEND))
+                .p_0()
                 .rounded(ButtonRounded::Size(px(SEND / 2.)))
-                .icon(Icon::new(KitIcon::Square))
+                .child(Icon::new(KitIcon::Square).size(px(12.)))
                 .tooltip("Stop")
                 .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
         } else {
             Button::new("send")
                 .with_size(px(SEND))
+                .size(px(SEND))
+                .p_0()
                 .primary()
                 .rounded(ButtonRounded::Size(px(SEND / 2.)))
-                .icon(Icon::new(KitIcon::ArrowUp))
+                .child(Icon::new(KitIcon::ArrowUp).size(px(14.)))
                 .tooltip("Send")
                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
         };
@@ -2560,12 +2564,15 @@ impl AppView {
                 });
             }
         };
-        // The actions that are not about the message.
+        // The actions that are not about the message. The icons of the composer are
+        // children, not `icon`: a button makes its icon 0.75 of its size.
         let more = Button::new("composer-more")
             .with_size(px(COMPOSER_LINE + 2.))
+            .size(px(COMPOSER_LINE + 2.))
+            .p_0()
             .secondary()
             .rounded(ButtonRounded::Size(px(COMPOSER_LINE / 2. + 1.)))
-            .icon(Icon::new(KitIcon::Plus).text_color(theme.muted_foreground))
+            .child(Icon::new(KitIcon::Plus).size(px(16.)).text_color(theme.muted_foreground))
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let files = view.clone();
                 menu.item(
@@ -2718,11 +2725,10 @@ impl AppView {
             )
             .child(
                 v_flex()
-                    .pt_2()
+                    .pt(px(2.))
                     .items_center()
-                    .gap_1()
-                    .child(live_avatar("avatar-header", 44.))
-                    .child(div().text_sm().font_medium().child(ASSISTANT_NAME)),
+                    .child(live_avatar("avatar-header", 56.))
+                    .child(div().text_xs().font_medium().child(ASSISTANT_NAME)),
             )
             .child(div().flex_1())
             .into_any_element()
