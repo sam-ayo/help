@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use acp_host::{McpServerSpec, McpTransport};
+use acp_host::{AgentKind, McpServerSpec, McpTransport};
 use anyhow::{Context, Result};
 use rmcp::model::{ClientCapabilities, ClientConfig, Implementation, JsonObject};
 use rmcp::service::RunningService;
@@ -22,8 +22,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) type Client = RunningService<RoleClient, ClientConfig>;
 
-/// Connect to the server, and complete the MCP initialize.
-pub(crate) async fn connect(spec: &McpServerSpec, cwd: &Path) -> Result<Client> {
+/// Connect to the server, and complete the MCP initialize. An HTTP server with no
+/// `Authorization` header gets the OAuth token of Claude Code, if Claude Code has one.
+pub(crate) async fn connect(spec: &McpServerSpec, kind: AgentKind, cwd: &Path) -> Result<Client> {
     let config = client_config();
     let connect = async {
         match &spec.transport {
@@ -49,6 +50,13 @@ pub(crate) async fn connect(spec: &McpServerSpec, cwd: &Path) -> Result<Client> 
                         (Ok(name), Ok(value)) => _ = map.insert(name, value),
                         _ => tracing::warn!(server = %spec.name, "skip the bad header {name}"),
                     }
+                }
+                if kind == AgentKind::Claude
+                    && !map.contains_key(&http::header::AUTHORIZATION)
+                    && let Some(token) = crate::oauth::claude_token(&spec.name, url).await
+                    && let Ok(value) = http::HeaderValue::try_from(format!("Bearer {token}"))
+                {
+                    map.insert(http::header::AUTHORIZATION, value);
                 }
                 let transport = StreamableHttpClientTransport::from_config(
                     StreamableHttpClientTransportConfig::with_uri(url.as_str()).custom_headers(map),

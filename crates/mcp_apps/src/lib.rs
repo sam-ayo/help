@@ -22,6 +22,7 @@ mod connect;
 mod csp;
 mod list;
 mod logo;
+mod oauth;
 
 pub use csp::csp_header;
 pub use logo::Logo;
@@ -287,7 +288,7 @@ impl Apps {
             State::Failed(at) if at.elapsed() < RETRY_AFTER => bail!("the server failed to connect"),
             State::New | State::Failed(_) => {}
         }
-        let client = match connect::connect(&server.spec, &self.inner.cwd).await {
+        let client = match connect::connect(&server.spec, self.inner.kind, &self.inner.cwd).await {
             Ok(client) => client,
             Err(err) => {
                 tracing::warn!("cannot connect to the MCP server {}: {err:#}", server.spec.name);
