@@ -1828,7 +1828,7 @@ impl AppView {
                 let (dir, clicks) = (self.env.docs_dir.clone(), self.doc_clicks.clone());
                 let message = TextView::markdown(("item", ix), SharedString::from(text))
                     .selectable(true)
-                    .on_link_click(move |href, _, _, cx| match doc::links(href.trim_start_matches("file://"), &dir).pop() {
+                    .on_link_click(move |href, _, _, cx| match doc::link_target(href, &dir) {
                         Some(path) => {
                             let _ = clicks.try_send(path);
                         }

@@ -137,18 +137,8 @@ impl Doc {
 /// The documents that a message of the agent links to: the Markdown files in `dir` that the
 /// text names. The agent writes a long reply to a document. See `memory::preamble`.
 pub(super) fn links(text: &str, dir: &Path) -> Vec<PathBuf> {
-    // The path of the folder has a space, and a link can have it as `%20`.
-    let text = text.replace("%20", " ");
-    let prefix = format!("{}/", dir.display());
     let mut paths = Vec::new();
-    for (start, _) in text.match_indices(&prefix) {
-        let rest = &text[start + prefix.len()..];
-        let Some(end) = rest.find(".md").filter(|&end| end > 0) else { continue };
-        let name = &rest[..end + 3];
-        if name.contains(['/', '\n', '<', '>', '(', ')', '[', ']', '`']) {
-            continue;
-        }
-        let path = dir.join(name);
+    for (_, _, path) in text.lines().flat_map(|line| doc_spans(line, dir)) {
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -156,14 +146,15 @@ pub(super) fn links(text: &str, dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// The links to documents in `dir` in a line: the byte range of each link, and its label.
-/// A link is `[label](<path>)`, `[label](path)`, or a path with no label.
-fn doc_spans(line: &str, dir: &Path) -> Vec<(std::ops::Range<usize>, String)> {
-    let is_doc = |target: &str| {
-        let target = target.trim_start_matches("file://").replace("%20", " ");
-        let target = Path::new(&target);
-        target.parent() == Some(dir) && target.extension().is_some_and(|e| e == "md")
-    };
+/// The document that the target of a link opens, if the target is a Markdown file in `dir`.
+pub(super) fn link_target(target: &str, dir: &Path) -> Option<PathBuf> {
+    let target = PathBuf::from(target.trim_start_matches("file://").replace("%20", " "));
+    (target.parent() == Some(dir) && target.extension().is_some_and(|e| e == "md")).then_some(target)
+}
+
+/// The links to documents in `dir` in a line: the byte range of each link, its label, and the
+/// document. A link is `[label](<path>)`, `[label](path)`, or a path with no label.
+fn doc_spans(line: &str, dir: &Path) -> Vec<(std::ops::Range<usize>, String, PathBuf)> {
     let mut spans = Vec::new();
     let mut at = 0;
     while let Some(open) = line[at..].find('[').map(|i| at + i) {
@@ -180,22 +171,32 @@ fn doc_spans(line: &str, dir: &Path) -> Vec<(std::ops::Range<usize>, String)> {
             },
         };
         let end = close + 2 + len;
-        if is_doc(target) {
-            spans.push((open..end, line[open + 1..close].to_string()));
+        if let Some(path) = link_target(target, dir) {
+            spans.push((open..end, line[open + 1..close].to_string(), path));
         }
         at = end;
     }
-    // A path with no label.
-    let prefix = format!("{}/", dir.display());
-    for (start, _) in line.match_indices(&prefix) {
-        if spans.iter().any(|(r, _)| r.contains(&start)) {
-            continue;
+    // A path with no label. The folder can have a space, and a path can have it as `%20`.
+    // The file name ends at a space or a mark of Markdown, and has the `.md` extension.
+    let folder = format!("{}/", dir.display());
+    for prefix in [folder.clone(), folder.replace(' ', "%20")] {
+        for (start, _) in line.match_indices(&prefix) {
+            let begin = line[..start].strip_suffix("file://").map_or(start, |s| s.len());
+            let rest = &line[start + prefix.len()..];
+            let token = &rest[..rest.find(|c: char| c.is_whitespace() || "/<>()[]`\"'*".contains(c)).unwrap_or(rest.len())];
+            // A sentence can end after the path.
+            let name = token.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+            if name.len() <= 3 || !name.ends_with(".md") {
+                continue;
+            }
+            let end = start + prefix.len() + name.len();
+            if spans.iter().any(|(r, _, _)| r.start < end && begin < r.end) {
+                continue;
+            }
+            spans.push((begin..end, String::new(), dir.join(name.replace("%20", " "))));
         }
-        let begin = line[..start].strip_suffix("file://").map_or(start, |s| s.len());
-        let end = line[start..].find(".md").map_or(line.len(), |i| start + i + 3);
-        spans.push((begin..end, String::new()));
     }
-    spans.sort_by_key(|(r, _)| r.start);
+    spans.sort_by_key(|(r, _, _)| r.start);
     spans
 }
 
@@ -211,7 +212,7 @@ pub(super) fn without_links(text: &str, dir: &Path) -> String {
             continue;
         }
         let (mut out, mut rest, mut last) = (String::new(), String::new(), 0);
-        for (range, label) in &spans {
+        for (range, label, _) in &spans {
             out.push_str(&line[last..range.start]);
             rest.push_str(&line[last..range.start]);
             out.push_str(label);
@@ -635,6 +636,30 @@ mod tests {
                     - /Users/me/Library/Application Support/Help/documents/budget.md\n\nSee [the docs](https://x.org/a.md).";
         assert_eq!(without_links(text, dir), "Read the plan first.\n\nSee [the docs](https://x.org/a.md).");
         assert_eq!(without_links("No links.", dir), "No links.");
+    }
+
+    #[test]
+    fn a_document_name_ends_at_its_last_extension() {
+        let dir = Path::new("/Users/me/Library/Application Support/Help/documents");
+        let text = "See /Users/me/Library/Application Support/Help/documents/plan.md.backup.md.";
+        assert_eq!(links(text, dir), vec![dir.join("plan.md.backup.md")]);
+        assert_eq!(without_links(text, dir), "See .");
+        let target = "/Users/me/Library/Application%20Support/Help/documents/plan.md.backup.md";
+        assert_eq!(link_target(target, dir), Some(dir.join("plan.md.backup.md")));
+        assert_eq!(link_target("https://x.org/a.md", dir), None);
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_document_keeps_its_text() {
+        let dir = Path::new("/Users/me/Library/Application Support/Help/documents");
+        // A path with no `.md` name, before a link to a document on the same line.
+        let text = "In /Users/me/Library/Application Support/Help/documents/ is [the plan](</Users/me/Library/Application Support/Help/documents/plan.md>).";
+        assert_eq!(without_links(text, dir), "In /Users/me/Library/Application Support/Help/documents/ is the plan.");
+        assert_eq!(links(text, dir), vec![dir.join("plan.md")]);
+        // A path to a file that is not Markdown.
+        let text = "The file /Users/me/Library/Application Support/Help/documents/data.csv has the numbers.";
+        assert_eq!(without_links(text, dir), text);
+        assert!(links(text, dir).is_empty());
     }
 
     #[test]
