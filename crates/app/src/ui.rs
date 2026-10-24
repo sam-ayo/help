@@ -1023,9 +1023,14 @@ fn literal_line(line: &str) -> String {
     let mut out = String::with_capacity(line.len() + 8);
     // The length of the run of backticks that opened the code span, if one is open.
     let mut code: Option<usize> = None;
+    // The first link that does not end before the character. The links are in order.
+    let mut link = 0;
     let mut i = 0;
     while i < chars.len() {
         let (at, c) = chars[i];
+        while links.get(link).is_some_and(|r| at >= r.end) {
+            link += 1;
+        }
         if c == '`' {
             let run = chars[i..].iter().take_while(|(_, c)| *c == '`').count();
             match code {
@@ -1038,7 +1043,7 @@ fn literal_line(line: &str) -> String {
             continue;
         }
         let escape = code.is_none()
-            && !links.iter().any(|r| r.contains(&at))
+            && !links.get(link).is_some_and(|r| r.contains(&at))
             && (matches!(c, '\\' | '*' | '_' | '~' | '[' | ']' | '<' | '>' | '|' | '#')
                 || (i == indent && matches!(c, '-' | '+' | '='))
                 || Some(i) == list_mark
