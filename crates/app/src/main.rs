@@ -60,7 +60,10 @@ fn app_support() -> PathBuf {
 fn move_old_folders() {
     let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     for (old, new) in [
-        ("Library/Application Support/AgentDesk", "Library/Application Support/Help"),
+        (
+            "Library/Application Support/AgentDesk",
+            "Library/Application Support/Help",
+        ),
         ("AgentDesk", "Help"),
     ] {
         let (old, new) = (home.join(old), home.join(new));
@@ -184,7 +187,14 @@ fn main() {
         cx.set_global(theme::ThemeChoice::load(support.join("theme")));
         theme::apply(None, cx);
 
-        let bounds = Bounds::centered(None, size(px(1100.), px(800.)), cx);
+        // The window fills most of the screen, so that a new user sees a large window.
+        let screen = cx
+            .primary_display()
+            .map(|display| display.visible_bounds().size);
+        let window_size = screen.map_or(size(px(1100.), px(800.)), |screen| {
+            size(screen.width * 0.9, screen.height * 0.9)
+        });
+        let bounds = Bounds::centered(None, window_size, cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: Some(TitlebarOptions {
