@@ -206,6 +206,12 @@ pub struct AppView {
     attachments: Vec<Attachment>,
     /// A click on a link to a document in a message sends the path here. See `doc::links`.
     doc_clicks: async_channel::Sender<PathBuf>,
+    /// The reply under the pointer. Its document buttons show only then. See `document_buttons`.
+    reply_hover: Option<usize>,
+    /// The document button under the pointer: the reply, and the index of the document.
+    doc_button_hover: Option<(usize, usize)>,
+    /// The document button that the pointer went off last. Its arrow moves back.
+    doc_button_left: Option<(usize, usize)>,
     /// The window width, the sidebar, and the panel, as of the last render. See `text_id`.
     text_layout: (i32, bool, bool),
     /// The set of sample data that the demo shows. See `demo::Data`.
@@ -282,6 +288,9 @@ impl AppView {
             app_servers: Vec::new(),
             attachments: if demo::enabled() { demo_data.composer_files() } else { Vec::new() },
             doc_clicks,
+            reply_hover: None,
+            doc_button_hover: None,
+            doc_button_left: None,
             text_layout: (0, false, false),
             demo_data,
             _subs: subs,
@@ -2107,8 +2116,19 @@ impl AppView {
                         }
                         None => cx.open_url(href),
                     });
+                let hovered = self.reply_hover == Some(ix) || self.doc_button_hover.is_some_and(|(r, _)| r == ix);
+                let first_doc = docs.first().cloned();
                 h_flex()
+                    .id(("agent-message", ix))
                     .group(group.clone())
+                    .on_hover(cx.listener(move |this, hover: &bool, _, cx| {
+                        this.set_reply_hover(ix, *hover, cx);
+                        // The pointer is near the document buttons. Read the document now, so
+                        // that it opens with no delay.
+                        if let Some(path) = first_doc.as_ref().filter(|_| *hover) {
+                            this.prefetch_document(path, cx);
+                        }
+                    }))
                     .items_end()
                     .gap_3()
                     .pl(px(TAIL_INSET))
@@ -2122,7 +2142,9 @@ impl AppView {
                             .rounded(px(18.))
                             .bg(bubble)
                             .when(has_text, |el| el.child(message))
-                            .when(!docs.is_empty(), |el| el.child(self.document_links(ix, &docs, has_text, &theme, cx)))
+                            // A reply with only links keeps the rows. Else the bubble is empty.
+                            .when(!docs.is_empty() && !has_text, |el| el.child(self.document_links(ix, &docs, &theme, cx)))
+                            .when(!docs.is_empty() && has_text, |el| el.children(self.document_buttons(ix, &docs, hovered, &theme, cx)))
                             // The tail at the bottom left: a gray corner, and a corner of the
                             // background color on it that cuts the curve.
                             .child(
@@ -2388,23 +2410,21 @@ impl AppView {
         ElementId::NamedInteger(format!("item-{width}-{sidebar}-{panel}").into(), ix as u64)
     }
 
-    /// The rows at the bottom of a message that open its documents in the panel. The rows do
+    /// The rows that open the documents of a reply that has no text, only links. The rows do
     /// not show the file names. A click on the row of the open document closes the panel.
-    /// `below_text` is true if the message has text above the rows. A line then parts them.
-    fn document_links(&self, ix: usize, docs: &[PathBuf], below_text: bool, theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
+    fn document_links(&self, ix: usize, docs: &[PathBuf], theme: &Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let accent = accent(theme);
         let open = self.doc.as_ref().map(|d| d.path.clone());
         v_flex()
-            .mb(px(-4.))
-            .map(|el| if below_text { el.mt_2().pt_1p5().border_t_1().border_color(theme.border) } else { el.mt(px(-4.)) })
+            .my(px(-4.))
             .children(docs.iter().enumerate().map(|(i, path)| {
                 let shown = open.as_ref() == Some(path);
                 let label = if !path.is_file() {
-                    "The full reply is not there".to_string()
+                    "The details are not there".to_string()
                 } else if shown {
-                    "Hide the full reply".to_string()
+                    "Hide the details".to_string()
                 } else if docs.len() == 1 {
-                    "Read the full reply".to_string()
+                    "Read the details".to_string()
                 } else {
                     format!("Read {}", doc::title(path))
                 };
@@ -2430,6 +2450,107 @@ impl AppView {
                     .on_click(cx.listener(move |this, _, _, cx| this.open_document(&path, cx)))
             }))
             .into_any_element()
+    }
+
+    /// Record that the pointer came onto or went off a reply.
+    fn set_reply_hover(&mut self, ix: usize, hover: bool, cx: &mut Context<Self>) {
+        let next = if hover { Some(ix) } else { self.reply_hover.filter(|&i| i != ix) };
+        // The buttons go, so the arrow of a new button starts at rest.
+        if !hover && self.doc_button_left.is_some_and(|(r, _)| r == ix) {
+            self.doc_button_left = None;
+        }
+        if self.reply_hover != next {
+            self.reply_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Record that the pointer came onto or went off a document button.
+    fn set_doc_button_hover(&mut self, button: (usize, usize), hover: bool, cx: &mut Context<Self>) {
+        if hover {
+            self.doc_button_hover = Some(button);
+            self.doc_button_left = None;
+        } else if self.doc_button_hover == Some(button) {
+            self.doc_button_hover = None;
+            // The arrow moves back only if the button stays. It goes when the pointer is off
+            // the reply too.
+            self.doc_button_left = (self.reply_hover == Some(button.0)).then_some(button);
+        } else {
+            return;
+        }
+        cx.notify();
+    }
+
+    /// The buttons that open the documents of a reply in the panel. They sit on the bottom
+    /// edge of the bubble, at the right. They show only when the pointer is on the reply, or
+    /// when the panel shows a document of the reply, so that each reply does not repeat a link.
+    fn document_buttons(&self, ix: usize, docs: &[PathBuf], hovered: bool, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let open = self.doc.as_ref().map(|d| d.path.clone());
+        if !hovered && !docs.iter().any(|p| open.as_ref() == Some(p)) {
+            return None;
+        }
+        // The fill must be opaque. Else the edge of the bubble shows through the button.
+        let tint = |amount: f32| theme.background.blend(theme.foreground.opacity(if theme.is_dark() { amount } else { amount / 4. }));
+        let (fill, hover_fill) = (tint(0.2), tint(0.26));
+        let buttons = h_flex()
+            .absolute()
+            .right(px(12.))
+            .bottom(px(-12.))
+            .gap_1p5()
+            .children(docs.iter().enumerate().map(|(i, path)| {
+                let shown = open.as_ref() == Some(path);
+                let found = path.is_file();
+                let label = if !found {
+                    "The details are not there".to_string()
+                } else if shown {
+                    "Hide the details".to_string()
+                } else if docs.len() == 1 {
+                    "Details".to_string()
+                } else {
+                    doc::title(path)
+                };
+                // The arrow moves to the right when the pointer comes onto the button, and back
+                // when the pointer goes off it.
+                let arrow = (found && !shown).then(|| {
+                    let arrow = || div().relative().child(Icon::new(KitIcon::ArrowRight).size(px(12.)));
+                    let slide = |id: &str, from: f32, to: f32| {
+                        arrow().with_animation(
+                            ElementId::NamedInteger(format!("{id}-{ix}").into(), i as u64),
+                            Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
+                            move |el, delta| el.left(px(from + (to - from) * delta)),
+                        )
+                    };
+                    if self.doc_button_hover == Some((ix, i)) {
+                        slide("doc-arrow-in", 0., 3.).into_any_element()
+                    } else if self.doc_button_left == Some((ix, i)) {
+                        slide("doc-arrow-out", 3., 0.).into_any_element()
+                    } else {
+                        arrow().into_any_element()
+                    }
+                });
+                let path = path.clone();
+                h_flex()
+                    .id(ElementId::NamedInteger(format!("doc-button-{ix}").into(), i as u64))
+                    .gap_1p5()
+                    .px_2p5()
+                    .h(px(24.))
+                    .rounded_full()
+                    .bg(fill)
+                    .border_1()
+                    .border_color(theme.border)
+                    .shadow_sm()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(theme.foreground)
+                    .cursor_pointer()
+                    .hover(|el| el.bg(hover_fill))
+                    .child(Icon::new(KitIcon::FileText).size(px(12.)).text_color(theme.muted_foreground))
+                    .child(label)
+                    .children(arrow)
+                    .on_hover(cx.listener(move |this, hover: &bool, _, cx| this.set_doc_button_hover((ix, i), *hover, cx)))
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_document(&path, cx)))
+            }));
+        Some(buttons.into_any_element())
     }
 
     fn render_permission(&self, p: &PendingPermission, cx: &mut Context<Self>) -> gpui::AnyElement {
