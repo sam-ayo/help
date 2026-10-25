@@ -2099,7 +2099,7 @@ impl AppView {
             Item::Agent(text) => {
                 let group: SharedString = format!("agent-message-{ix}").into();
                 let bubble = agent_bubble(&theme);
-                // The chat shows the summary of a long reply. The panel shows the full reply.
+                // The chat shows the main point of a long reply. The panel shows the details.
                 let docs = doc::links(text, &self.env.docs_dir);
                 let text = if docs.is_empty() { text.clone() } else { doc::without_links(text, &self.env.docs_dir) };
                 let copy = text.clone();

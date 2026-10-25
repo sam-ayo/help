@@ -267,22 +267,36 @@ pub(super) fn long(text: &str) -> bool {
     text.chars().count() > LONG_REPLY || headings(text).count() >= 2
 }
 
-/// The first paragraph of plain text, cut at the end of a sentence or a word.
-fn summary(text: &str) -> Option<String> {
-    let plain = |p: &&str| {
-        let p = p.trim_start();
-        !p.is_empty()
-            && !p.starts_with(['#', '-', '*', '|', '>', '`', '<'])
-            && !p.split_once(". ").is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
-    };
-    let paragraph = text.split("\n\n").find(plain)?.trim().replace('\n', " ");
+/// A paragraph of plain text: not a heading, a list, a table, a quote, or code.
+fn plain(p: &str) -> bool {
+    let p = p.trim_start();
+    !p.is_empty()
+        && !p.starts_with(['#', '-', '*', '|', '>', '`', '<'])
+        && !p.split_once(". ").is_some_and(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// A paragraph on one line, cut at the end of a sentence or a word.
+fn shorten(paragraph: &str) -> String {
+    let paragraph = paragraph.trim().replace('\n', " ");
     if paragraph.chars().count() <= SUMMARY {
-        return Some(paragraph);
+        return paragraph;
     }
     let cut: String = paragraph.chars().take(SUMMARY).collect();
-    Some(match cut.rfind(". ") {
+    match cut.rfind(". ") {
         Some(end) if end > SUMMARY / 3 => cut[..=end].to_string(),
         _ => format!("{}…", cut[..cut.rfind(' ').unwrap_or(cut.len())].trim_end()),
+    }
+}
+
+/// The text for the chat: the first paragraph of plain text, and the question at the end of
+/// the reply, if there is one. The question tells the user what they must decide.
+fn summary(text: &str) -> Option<String> {
+    let mut paragraphs = text.split("\n\n").filter(|p| plain(p));
+    let first = paragraphs.next()?;
+    let question = paragraphs.last().filter(|p| p.trim_end().ends_with('?'));
+    Some(match question {
+        Some(q) => format!("{}\n\n{}", shorten(first), shorten(q)),
+        None => shorten(first),
     })
 }
 
@@ -322,8 +336,8 @@ fn prompt_title(prompt: &str) -> Option<String> {
 }
 
 /// Write a long reply of the agent to a new document in `dir`. Returns the text for the chat:
-/// the first paragraph of the reply and a link to the document. If the reply has no heading,
-/// the title comes from `prompt`, the message of the user.
+/// the first paragraph of the reply, the question at its end, and a link to the document. If
+/// the reply has no heading, the title comes from `prompt`, the message of the user.
 pub(super) fn write_reply(text: &str, prompt: &str, dir: &Path) -> std::io::Result<String> {
     let first = headings(text).next().map(str::to_string);
     let title = first.clone().or_else(|| prompt_title(prompt)).unwrap_or_else(|| "Reply".into());
@@ -623,6 +637,10 @@ mod tests {
         assert!(chat.ends_with(&format!("[Reply](<{}>)", dir.join("reply.md").display())));
         assert!(chat.starts_with("Long text.") && chat.len() < 400);
         assert!(std::fs::read_to_string(dir.join("reply.md")).unwrap().starts_with("# Reply\n\n1. a"));
+        // The question at the end of the reply stays in the chat.
+        let ask = format!("{long_text}\n\nDo you want me to book it?");
+        let chat = write_reply(&ask, "", &dir).unwrap();
+        assert!(chat.starts_with("Long text.") && chat.contains("\n\nDo you want me to book it?\n\n[Reply]"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
