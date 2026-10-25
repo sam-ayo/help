@@ -16,7 +16,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, StyledExt as _, Theme, h_flex,
     button::{Button, ButtonRounded, ButtonVariants as _},
-    input::{InputEvent, Textarea, TextareaState},
+    input::{InputEvent, MoveToEnd, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
     scroll::ScrollableElement as _,
     message_scroller::{MessageScroller, MessageScrollerState},
@@ -70,6 +70,16 @@ enum Item {
     /// The app compacted the conversation here. The summary in `help-memory.md` has the
     /// messages before this item.
     Compacted,
+}
+
+/// A message that the user sent while the agent worked. It goes to the agent when the turn
+/// ends. See `AppView::send`.
+struct Queued {
+    text: String,
+    attachments: Vec<Attachment>,
+    /// The message is in the composer for an edit. It keeps its place in the queue, and
+    /// it does not go to the agent before the user sends the edit.
+    editing: bool,
 }
 
 struct PendingPermission {
@@ -212,6 +222,8 @@ pub struct AppView {
     permission_scroll: gpui::ScrollHandle,
     /// The files that the user attached to the next message. See `attach`.
     attachments: Vec<Attachment>,
+    /// The messages that wait for the end of the turn, the first message first.
+    queue: Vec<Queued>,
     /// A click on a link to a document in a message sends the path here. See `doc::links`.
     doc_clicks: async_channel::Sender<PathBuf>,
     /// The reply under the pointer. Its document buttons show only then. See `document_buttons`.
@@ -237,8 +249,18 @@ impl AppView {
                 .submit_on_enter(true)
         });
         let subs = vec![cx.subscribe_in(&composer, window, |this, _state, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                this.send(window, cx);
+            match ev {
+                // Cmd+Enter during a turn stops the turn and sends the message at once.
+                InputEvent::PressEnter { shift: false, secondary } => {
+                    let (now, queued) = (*secondary && this.chat.busy, this.queue.len());
+                    this.send(window, cx);
+                    if now && this.queue.len() > queued {
+                        this.send_now(queued, cx);
+                    }
+                }
+                // The composer shows the send button during a turn only when it has text.
+                InputEvent::Change if this.chat.busy => cx.notify(),
+                _ => {}
             }
         })];
 
@@ -299,6 +321,7 @@ impl AppView {
             clis: Vec::new(),
             permission_scroll: gpui::ScrollHandle::new(),
             attachments: if demo::enabled() { demo_data.composer_files() } else { Vec::new() },
+            queue: Vec::new(),
             doc_clicks,
             reply_hover: None,
             doc_button_hover: None,
@@ -391,6 +414,8 @@ impl AppView {
                         return;
                     }
                     let mut changed = None;
+                    // The end of a turn, or of the agent, sends the next queued message.
+                    let done = matches!(event, Event::TurnEnded(_) | Event::Closed);
                     if this.chat.compaction.is_some() && !matches!(event, Event::Ready { .. }) {
                         this.apply_compaction(event, cx);
                     } else {
@@ -413,6 +438,9 @@ impl AppView {
                         if ended && let Some(servers) = this.chat.refresh_due.take() {
                             this.refresh_tools(servers, cx);
                         }
+                    }
+                    if done {
+                        this.send_queued(cx);
                     }
                     this.sync_mcp(cx);
                     // The conversation follows the new text only when it shows the end. The user
@@ -448,38 +476,132 @@ impl AppView {
         }
     }
 
+    /// Send the text and the attachments of the composer. During a turn, the message goes in
+    /// the queue, and the agent gets it when the turn ends.
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().to_string();
-        if (text.trim().is_empty() && self.attachments.is_empty()) || self.chat.busy {
+        if text.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
+        let attachments = std::mem::take(&mut self.attachments);
+        // An edited message goes back to its place in the queue.
+        if let Some(q) = self.queue.iter_mut().find(|q| q.editing) {
+            *q = Queued { text, attachments, editing: false };
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            self.send_queued(cx);
+            cx.notify();
+            return;
+        }
+        if self.chat.busy {
+            self.queue.push(Queued { text, attachments, editing: false });
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            self.scroll_to_end(cx);
+            cx.notify();
+            return;
+        }
+        match self.deliver(text, attachments, cx) {
+            Ok(()) => self.composer.update(cx, |s, cx| s.set_value("", window, cx)),
+            Err(attachments) => self.attachments = attachments,
+        }
+    }
+
+    /// Send the first message of the queue, if the agent does not work.
+    fn send_queued(&mut self, cx: &mut Context<Self>) {
+        if self.chat.busy || self.queue.first().is_none_or(|q| q.editing) {
+            return;
+        }
+        let Queued { text, attachments, .. } = self.queue.remove(0);
+        if let Err(attachments) = self.deliver(text.clone(), attachments, cx) {
+            self.queue.insert(0, Queued { text, attachments, editing: false });
+        }
+        cx.notify();
+    }
+
+    /// Stop the turn, and send the queued message `ix` before the other queued messages.
+    fn send_now(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if self.queue.get(ix).is_none_or(|q| q.editing) {
+            return;
+        }
+        let item = self.queue.remove(ix);
+        self.queue.insert(0, item);
+        // The end of the turn sends the message. See `connect`.
+        if self.chat.busy {
+            self.cancel(cx);
+        } else {
+            self.send_queued(cx);
+        }
+    }
+
+    /// Put the queued message `ix` in the composer to edit. The message keeps its place in the
+    /// queue. See `send`.
+    fn edit_queued(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.queue.get(ix).is_none_or(|q| q.editing) {
+            return;
+        }
+        // The composer can have one edit at a time. The older edit stays as it was.
+        let draft = self.composer.read(cx).value().to_string();
+        if let Some(q) = self.queue.iter_mut().find(|q| q.editing) {
+            q.editing = false;
+        } else if !draft.trim().is_empty() || !self.attachments.is_empty() {
+            // Keep the draft of a new message in the queue, after the other messages.
+            let attachments = std::mem::take(&mut self.attachments);
+            self.queue.push(Queued { text: draft, attachments, editing: false });
+        }
+        let q = &mut self.queue[ix];
+        q.editing = true;
+        let (text, attachments) = (q.text.clone(), q.attachments.clone());
+        self.composer.update(cx, |s, cx| s.set_value(text, window, cx));
+        self.attachments = attachments;
+        // The user continues to write at the end of the text.
+        self.focus_composer(window, cx);
+        window.dispatch_action(Box::new(MoveToEnd), cx);
+        cx.notify();
+    }
+
+    /// Remove the queued message `ix`. A message in an edit also leaves the composer.
+    fn remove_queued(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if ix >= self.queue.len() {
+            return;
+        }
+        if self.queue.remove(ix).editing {
+            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
+            self.attachments.clear();
+        }
+        // The removed message can be the edit that stopped the queue.
+        self.send_queued(cx);
+        cx.notify();
+    }
+
+    /// Give a message to the agent, or do the command in it. If the message did not go,
+    /// returns the attachments.
+    fn deliver(&mut self, text: String, attachments: Vec<Attachment>, cx: &mut Context<Self>) -> Result<(), Vec<Attachment>> {
         // The app does the compaction, so that the summary goes to `help-memory.md`. The agent
         // does not get this command.
         if text.trim() == "/compact" && !demo::enabled() {
-            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             self.compact(cx);
             self.scroll_to_end(cx);
-            return;
+            return Ok(());
         }
         // The app cannot see each change to the MCP servers, for example a completed login.
         if text.trim() == "/refresh" && !demo::enabled() {
-            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             self.refresh_tools(Vec::new(), cx);
             self.scroll_to_end(cx);
-            return;
+            return Ok(());
         }
         if demo::live() {
-            let attachments = std::mem::take(&mut self.attachments);
             self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments });
             self.chat.busy = true;
-            self.composer.update(cx, |s, cx| s.set_value("", window, cx));
             self.scroll_to_end(cx);
             cx.notify();
             cx.spawn(async move |this, cx| {
                 for (delay, event) in demo::delegation() {
                     cx.background_executor().timer(delay).await;
                     let ok = this.update(cx, |this, cx| {
+                        let ended = matches!(event, Event::TurnEnded(_));
                         apply(&mut this.chat, event);
+                        if ended {
+                            this.send_queued(cx);
+                        }
                         this.rows_changed(cx);
                         cx.notify();
                     });
@@ -489,19 +611,15 @@ impl AppView {
                 }
             })
             .detach();
-            return;
+            return Ok(());
         }
         if demo::enabled() {
             self.chat.items.push(Item::Notice("The demo has no agent.".into()));
             self.scroll_to_end(cx);
             cx.notify();
-            return;
+            return Err(attachments);
         }
-        let attachments = std::mem::take(&mut self.attachments);
-        match self.submit(text, attachments, cx) {
-            Ok(()) => self.composer.update(cx, |s, cx| s.set_value("", window, cx)),
-            Err(attachments) => self.attachments = attachments,
-        }
+        self.submit(text, attachments, cx)
     }
 
     /// Attach files to the next message. A folder cannot be an attachment.
@@ -2648,6 +2766,76 @@ impl AppView {
         Some(buttons.into_any_element())
     }
 
+    /// The messages that wait for the end of the turn, above the composer. Each message has
+    /// a "Send now" button, and buttons to edit it and to remove it.
+    fn render_queue(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let rows = self.queue.iter().enumerate().map(|(i, q)| {
+            let files = match q.attachments.len() {
+                0 => None,
+                1 => Some("1 file".to_string()),
+                n => Some(format!("{n} files")),
+            };
+            let first = q.text.trim().lines().next().unwrap_or_default().to_string();
+            h_flex()
+                .id(("queued", i))
+                .gap_2()
+                .pl_3()
+                .pr_1()
+                .py_1()
+                .rounded_xl()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.muted.opacity(0.5))
+                .child(Icon::new(KitIcon::Clock).size(px(14.)).text_color(theme.muted_foreground))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_sm()
+                        .when(first.is_empty(), |el| el.text_color(theme.muted_foreground))
+                        .child(if first.is_empty() { files.clone().unwrap_or_default() } else { first }),
+                )
+                .when_some(files.filter(|_| !q.text.trim().is_empty()), |el, files| {
+                    el.child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child(files))
+                })
+                // The text of a message in an edit is in the composer.
+                .when(q.editing, |el| {
+                    el.opacity(0.5)
+                        .child(div().flex_shrink_0().text_xs().text_color(theme.muted_foreground).child("Editing"))
+                })
+                .when(!q.editing, |el| el.child(
+                    Button::new(("queued-send", i))
+                        .ghost()
+                        .small()
+                        .label("Send now")
+                        .tooltip("Stop the turn and send this message")
+                        .on_click(cx.listener(move |this, _, _, cx| this.send_now(i, cx))),
+                )
+                .child(
+                    Button::new(("queued-edit", i))
+                        .ghost()
+                        .small()
+                        .icon(KitIcon::Pencil)
+                        .tooltip("Edit")
+                        .on_click(cx.listener(move |this, _, window, cx| this.edit_queued(i, window, cx))),
+                ))
+                .child(
+                    Button::new(("queued-remove", i))
+                        .ghost()
+                        .small()
+                        .icon(KitIcon::X)
+                        .tooltip("Remove")
+                        .on_click(cx.listener(move |this, _, window, cx| this.remove_queued(i, window, cx))),
+                )
+        });
+        Some(v_flex().gap_1().children(rows).into_any_element())
+    }
+
     fn render_permission(&self, p: &PendingPermission, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         // One primary button, for the usual answer. Two primary buttons side by side compete.
@@ -2769,7 +2957,9 @@ impl AppView {
     /// round field with the send button at its end.
     fn render_composer(&self, busy: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        let action = if busy {
+        // During a turn, a message in the composer goes in the queue. See `send`.
+        let message = !self.composer.read(cx).value().trim().is_empty() || !self.attachments.is_empty();
+        let action = if busy && !message {
             Button::new("stop")
                 .with_size(px(SEND))
                 .size(px(SEND))
@@ -2786,7 +2976,7 @@ impl AppView {
                 .primary()
                 .rounded(ButtonRounded::Size(px(SEND / 2.)))
                 .child(Icon::new(KitIcon::ArrowUp).size(px(14.)))
-                .tooltip("Send")
+                .tooltip(if busy { "Send when the turn ends (⌘↩ sends now)" } else { "Send" })
                 .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
         };
         // A paste of an image or of files attaches them.
@@ -2943,12 +3133,14 @@ impl AppView {
         // Before the first message, the pane shows the "To:" line and no messages.
         let empty = chat.items.iter().all(|i| matches!(i, Item::Notice(_) | Item::Error(_)));
         let permission = chat.permission.as_ref().map(|p| self.render_permission(p, cx));
+        let queue = self.render_queue(cx);
         let composer = v_flex()
             .w_full()
             .max_w(px(COLUMN))
             .mx_auto()
             .px_6()
             .gap_2()
+            .children(queue)
             .children(permission)
             .child(self.render_composer(busy, cx));
 
