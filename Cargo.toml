@@ -22,6 +22,12 @@ base64 = "0.22"
 
 # The avatar renders 180 frames of a blurred SVG at startup (crates/app/src/ui/avatar.rs).
 # Without optimization, that takes about 13 seconds in a debug build.
+# Optimize the dependencies in debug builds. Without optimization, gpui lays out and
+# paints too slowly, and the messages do not scroll smoothly. The workspace crates stay
+# without optimization, so that they compile fast.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.dev.package.tiny-skia]
 opt-level = 3
 [profile.dev.package.tiny-skia-path]
