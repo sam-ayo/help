@@ -9,7 +9,10 @@ use std::{
     time::SystemTime,
 };
 
-use gpui::{AppContext as _, ClipboardItem, Entity, prelude::FluentBuilder as _, Hsla, IntoElement, ParentElement as _, SharedString, Styled as _, Subscription, Window, div, px};
+use gpui::{
+    AppContext as _, ClipboardItem, DragMoveEvent, Entity, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, prelude::FluentBuilder as _, px,
+};
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _, StyledExt as _, Theme,
     button::{Button, ButtonVariants as _},
@@ -18,10 +21,21 @@ use gpui_component::{
 use gpui_kit_assets::IconName as KitIcon;
 use md_editor::{MarkdownEditor, MarkdownEditorEnvironment, MarkdownEditorEvent, MarkdownEditorOptions, MarkdownEditorTheme};
 
-use super::{AppView, Context, INSET, Item, TOOLBAR, accent, mcp_app};
+use super::{AppView, Context, INSET, Item, MIN_PANEL, TOOLBAR, accent, mcp_app};
 
-/// The width of the panel.
+/// The width of the panel when the app starts.
 pub(super) const WIDTH: f32 = 480.;
+
+/// A drag of the left edge of the panel, which changes the width of the panel.
+#[derive(Clone)]
+struct Resize;
+
+/// A drag shows no image under the pointer.
+impl Render for Resize {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 
 /// A Markdown file in the panel.
 pub(super) struct Doc {
@@ -581,13 +595,41 @@ impl AppView {
             .shadow_md()
             .child(header)
             .child(body);
+        // The left edge of the panel. A drag of it changes the width. The panel keeps
+        // `MIN_PANEL`, and the conversation keeps its minimum width.
+        let edge = div()
+            .id("doc-edge")
+            .absolute()
+            .left_0()
+            .top_0()
+            .h_full()
+            .w(px(INSET))
+            .cursor_col_resize()
+            .on_drag(Resize, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                // A double click gives the panel its first width again.
+                if event.click_count() == 2 {
+                    this.doc_width = WIDTH;
+                    cx.notify();
+                }
+            }));
+        let room = self.panel_room(window);
         Some(
             div()
-                .w(px((WIDTH + INSET * 2.).min(self.panel_room(window))))
+                .id("doc-panel")
+                .relative()
+                .w(px((self.doc_width + INSET * 2.).min(room)))
                 .h_full()
                 .flex_shrink_0()
                 .p(px(INSET))
+                .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<Resize>, window, cx| {
+                    let right = f32::from(window.viewport_size().width) - INSET;
+                    let width = right - f32::from(event.event.position.x);
+                    this.doc_width = width.min(room - INSET * 2.).max(MIN_PANEL);
+                    cx.notify();
+                }))
                 .child(card)
+                .child(edge)
                 .into_any_element(),
         )
     }

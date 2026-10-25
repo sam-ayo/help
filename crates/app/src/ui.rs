@@ -30,6 +30,7 @@ use crate::{Env, theme};
 
 mod attach;
 mod avatar;
+mod clis;
 mod demo;
 mod doc;
 mod dock;
@@ -195,6 +196,8 @@ pub struct AppView {
     doc: Option<doc::Doc>,
     /// A document that the app read before the user opened it. See `prefetch_document`.
     doc_prefetch: Option<doc::Doc>,
+    /// The width of the document panel. The user changes it with a drag of the left edge.
+    doc_width: f32,
     /// The views send their messages here, with the generation of their panel.
     app_messages: async_channel::Sender<(u64, String)>,
     /// The context that a view gave for the next message to the agent: the name of the tool,
@@ -202,6 +205,8 @@ pub struct AppView {
     app_context: Option<(String, String)>,
     /// The connected MCP servers that have views. See `mcp_app::AppView::load_app_servers`.
     app_servers: Vec<mcp_app::AppEntry>,
+    /// The packages of command line tools on the PATH. See `clis`.
+    clis: Vec<clis::Cli>,
     /// The files that the user attached to the next message. See `attach`.
     attachments: Vec<Attachment>,
     /// A click on a link to a document in a message sends the path here. See `doc::links`.
@@ -212,8 +217,9 @@ pub struct AppView {
     doc_button_hover: Option<(usize, usize)>,
     /// The document button that the pointer went off last. Its arrow moves back.
     doc_button_left: Option<(usize, usize)>,
-    /// The window width, the sidebar, and the panel, as of the last render. See `text_id`.
-    text_layout: (i32, bool, bool),
+    /// The window width, the sidebar, and the width of the panel, as of the last render. See
+    /// `text_id`.
+    text_layout: (i32, bool, i32),
     /// The set of sample data that the demo shows. See `demo::Data`.
     demo_data: demo::Data,
     _subs: Vec<gpui::Subscription>,
@@ -283,15 +289,17 @@ impl AppView {
             panel_generation: 0,
             doc: None,
             doc_prefetch: None,
+            doc_width: doc::WIDTH,
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
+            clis: Vec::new(),
             attachments: if demo::enabled() { demo_data.composer_files() } else { Vec::new() },
             doc_clicks,
             reply_hover: None,
             doc_button_hover: None,
             doc_button_left: None,
-            text_layout: (0, false, false),
+            text_layout: (0, false, 0),
             demo_data,
             _subs: subs,
         };
@@ -342,6 +350,7 @@ impl AppView {
     fn connect(&mut self, resume: Option<String>, cx: &mut Context<Self>) {
         // A new session can have different MCP servers.
         self.load_app_servers(cx);
+        self.load_clis(cx);
         // The demo starts no agents. See `demo`.
         if demo::enabled() {
             return;
@@ -838,7 +847,7 @@ impl AppView {
     /// panel at the right side. A narrow window hides it while a panel shows.
     fn sidebar_shows(&self, window: &Window) -> bool {
         let panel = if self.doc.is_some() {
-            doc::WIDTH + INSET * 2.
+            self.doc_width + INSET * 2.
         } else if self.panel.is_some() {
             mcp_app::PANEL
         } else {
@@ -1687,7 +1696,8 @@ impl AppView {
                     .overflow_y_scroll()
                     .when(cfg!(debug_assertions), |el| el.child(threads))
                     .child(div().pt_2().child(memory).child(history).child(refresh))
-                    .children(self.render_app_list(cx)),
+                    .children(self.render_app_list(cx))
+                    .children(self.render_cli_list(cx)),
             )
             .child(self.render_theme_footer(cx));
         div()
@@ -1760,6 +1770,46 @@ impl AppView {
                         .font_medium()
                         .text_color(theme.muted_foreground)
                         .child("Apps"),
+                )
+                .children(rows)
+                .into_any_element(),
+        )
+    }
+
+    /// The command line tools that the agent can use, or nothing if the app found none.
+    fn render_cli_list(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.clis.is_empty() {
+            return None;
+        }
+        let theme = cx.theme().clone();
+        let rows = self.clis.iter().enumerate().map(|(ix, cli)| {
+            h_flex()
+                .id(("cli", ix))
+                .mx_2()
+                .px_2()
+                .h(px(32.))
+                .gap_2p5()
+                .rounded(px(8.))
+                .text_sm()
+                .font_medium()
+                .child(Icon::new(KitIcon::Terminal).size(px(16.)).text_color(theme.muted_foreground))
+                .child(div().flex_1().min_w_0().truncate().child(cli.name.clone()))
+                .tooltip({
+                    let commands = cli.commands.join(", ");
+                    move |window, cx| gpui_component::tooltip::Tooltip::new(commands.clone()).build(window, cx)
+                })
+        });
+        Some(
+            v_flex()
+                .pt_3()
+                .child(
+                    div()
+                        .px_4()
+                        .pb_1()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(theme.muted_foreground)
+                        .child("CLIs"),
                 )
                 .children(rows)
                 .into_any_element(),
@@ -2817,7 +2867,11 @@ impl AppView {
         self.text_layout = (
             f32::from(window.viewport_size().width) as i32,
             self.sidebar_open,
-            self.doc.is_some() || self.panel.is_some(),
+            if self.doc.is_some() {
+                self.doc_width as i32
+            } else {
+                i32::from(self.panel.is_some())
+            },
         );
         let theme = cx.theme().clone();
         let chat = &self.chat;
@@ -2901,6 +2955,7 @@ impl AppView {
                     )
                     .flex_1()
                     .min_h_0()
+                    .scrollbar(false)
                     .with_list_style(StyleRefinement::default().py_6())
                     .with_row_style(StyleRefinement::default().px_0().pb_4())
                     .with_bottom_fade(theme.background),
