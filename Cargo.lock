@@ -239,6 +239,7 @@ dependencies = [
  "chrono",
  "dioxus-devtools",
  "ed25519-dalek",
+ "gif 0.14.2",
  "global-hotkey",
  "gpui-component",
  "gpui-kit-assets",

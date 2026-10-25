@@ -46,5 +46,10 @@ subsecond = { version = "0.7.10", optional = true }
 dioxus-devtools = { version = "0.7.10", optional = true }
 wry = "0.57.0"
 
+[dev-dependencies]
+# The moving avatar in the window of the disk image. See `write_release_images` in
+# src/ui/avatar.rs.
+gif = "0.14"
+
 [features]
 hotpatch = ["dep:subsecond", "dep:dioxus-devtools"]

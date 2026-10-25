@@ -2,6 +2,8 @@
 //! hotkey (Option-Space) shows or hides the window from any app. A close of the window hides
 //! the app, so that the agent keeps its session. Only Quit stops the app.
 
+use std::cell::RefCell;
+
 use global_hotkey::{
     GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
     hotkey::{Code, HotKey, Modifiers},
@@ -9,7 +11,7 @@ use global_hotkey::{
 use gpui::{App, Entity, Global, WindowHandle};
 use gpui_component::Root;
 use tray_icon::{
-    Icon, TrayIconBuilder,
+    Icon, TrayIcon, TrayIconBuilder,
     menu::{
         Menu, MenuEvent, MenuItem, PredefinedMenuItem,
         accelerator::{Accelerator, Code as MenuCode, Modifiers as MenuModifiers},
@@ -27,6 +29,17 @@ struct Presence {
 }
 
 impl Global for Presence {}
+
+/// The menu bar item, and the newest icon for it. The icon can come before the item exists.
+#[derive(Default)]
+struct MenuBar {
+    tray: Option<TrayIcon>,
+    icon: Option<Icon>,
+}
+
+thread_local! {
+    static MENU_BAR: RefCell<MenuBar> = RefCell::default();
+}
 
 enum Signal {
     Toggle,
@@ -80,13 +93,16 @@ pub fn install(window: WindowHandle<Root>, view: Entity<AppView>, cx: &mut App) 
         };
         let _ = menu_tx.try_send(signal);
     }));
-    let tray = TrayIconBuilder::new()
-        .with_icon_templated(menu_bar_icon())
-        .with_tooltip("Help")
-        .with_menu(Box::new(menu))
-        .build()
-        .inspect_err(|e| tracing::warn!("cannot add the menu bar item: {e}"))
-        .ok();
+    MENU_BAR.with_borrow_mut(|m| {
+        let mut builder = TrayIconBuilder::new().with_tooltip("Help").with_menu(Box::new(menu));
+        if let Some(icon) = m.icon.take() {
+            builder = builder.with_icon(icon);
+        }
+        m.tray = builder
+            .build()
+            .inspect_err(|e| tracing::warn!("cannot add the menu bar item: {e}"))
+            .ok();
+    });
 
     let hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
     let hotkeys = GlobalHotKeyManager::new()
@@ -106,8 +122,8 @@ pub fn install(window: WindowHandle<Root>, view: Entity<AppView>, cx: &mut App) 
     }));
 
     cx.spawn(async move |cx| {
-        // The menu bar item and the hotkey work while these values exist.
-        let _keep = (tray, hotkeys);
+        // The hotkey works while this value exists.
+        let _keep = hotkeys;
         while let Ok(signal) = rx.recv().await {
             cx.update(|cx| match signal {
                 Signal::Toggle => toggle(cx),
@@ -148,43 +164,18 @@ fn with_view(cx: &mut App, f: impl FnOnce(&Entity<AppView>, &mut gpui::Window, &
     let _ = window.update(cx, |_, window, cx| f(&view, window, cx));
 }
 
-/// A chat bubble with three dots, as a template image: black with alpha. macOS gives it the
-/// color of the menu bar.
-fn menu_bar_icon() -> Icon {
-    const N: usize = 36;
-    const SAMPLES: usize = 4;
-    let inside = |x: f32, y: f32| {
-        // The bubble: a rounded rectangle.
-        let (l, t, r, b, rad) = (3.0, 5.0, 33.0, 26.0, 8.0);
-        let cx = x.clamp(l + rad, r - rad);
-        let cy = y.clamp(t + rad, b - rad);
-        let in_bubble = x >= l
-            && x <= r
-            && y >= t
-            && y <= b
-            && (x - cx).powi(2) + (y - cy).powi(2) <= rad * rad;
-        // The tail at the bottom left: a triangle.
-        let in_tail = y >= 24.0 && y <= 32.0 && x >= 8.0 && x <= 8.0 + (32.0 - y) * 1.2;
-        // The dots are holes in the bubble.
-        let in_dot = [11.0, 18.0, 25.0]
-            .iter()
-            .any(|dx| (x - dx).powi(2) + (y - 15.5f32).powi(2) <= 2.4 * 2.4);
-        (in_bubble || in_tail) && !in_dot
+/// Show the avatar in the menu bar. `rgba` is a square image `width` pixels wide.
+pub fn set_menu_bar_icon(rgba: Vec<u8>, width: u32) {
+    let icon = match Icon::from_rgba(rgba, width, width) {
+        Ok(icon) => icon,
+        Err(e) => return tracing::warn!("cannot use the avatar in the menu bar: {e}"),
     };
-    let mut rgba = Vec::with_capacity(N * N * 4);
-    for py in 0..N {
-        for px in 0..N {
-            let mut hits = 0;
-            for sy in 0..SAMPLES {
-                for sx in 0..SAMPLES {
-                    let x = px as f32 + (sx as f32 + 0.5) / SAMPLES as f32;
-                    let y = py as f32 + (sy as f32 + 0.5) / SAMPLES as f32;
-                    hits += inside(x, y) as u32;
-                }
+    MENU_BAR.with_borrow_mut(|m| match &m.tray {
+        Some(tray) => {
+            if let Err(e) = tray.set_icon(Some(icon)) {
+                tracing::warn!("cannot use the avatar in the menu bar: {e}");
             }
-            let alpha = (hits * 255 / (SAMPLES * SAMPLES) as u32) as u8;
-            rgba.extend_from_slice(&[0, 0, 0, alpha]);
         }
-    }
-    Icon::from_rgba(rgba, N as u32, N as u32).expect("the icon has the correct size")
+        None => m.icon = Some(icon),
+    });
 }

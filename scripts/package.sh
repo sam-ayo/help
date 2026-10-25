@@ -79,14 +79,9 @@ fi
 # The updater replaces the installed app with the app in this archive.
 ditto -c -k --keepParent "$app" "$out/help-$version.zip"
 
-# The disk image has the app and a link to Applications.
+# The disk image has the app, a link to Applications, and the moving avatar.
 dmg="$out/help-$version.dmg"
-stage="$out/dmg"
-mkdir -p "$stage"
-ditto "$app" "$stage/Help.app"
-ln -s /Applications "$stage/Applications"
-hdiutil create -volname Help -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg"
-rm -rf "$stage"
+scripts/make_dmg.sh "$app" "$dmg"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
   codesign --force --timestamp --sign "$CODESIGN_IDENTITY" "$dmg"
