@@ -8,7 +8,7 @@ use std::{
 
 use acp_host::{AgentKind, Attachment, Command, Event, McpConfigWatch, PermissionOptionView, SUBAGENT_KIND, Session, ToolStatus};
 use gpui::{
-    AppContext as _, Context, Div, ElementId, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
+    App, AppContext as _, Context, Div, ElementId, Entity, Focusable as _, Hsla, InteractiveElement as _, IntoElement, MouseButton,
     ParentElement as _, Render, SharedString, StyleRefinement, Stateful, StatefulInteractiveElement as _, Styled as _,
     Anchor, Animation, AnimationExt as _, ClipboardEntry, ClipboardItem, ExternalPaths, Window, div,
     prelude::FluentBuilder as _, px, rgb,
@@ -18,6 +18,7 @@ use gpui_component::{
     button::{Button, ButtonRounded, ButtonVariants as _},
     input::{InputEvent, Textarea, TextareaState},
     menu::{DropdownMenu as _, PopupMenuItem},
+    scroll::ScrollableElement as _,
     message_scroller::{MessageScroller, MessageScrollerState},
     spinner::Spinner,
     text::{TextView, TextViewStyle},
@@ -207,6 +208,8 @@ pub struct AppView {
     app_servers: Vec<mcp_app::AppEntry>,
     /// The packages of command line tools on the PATH. See `clis`.
     clis: Vec<clis::Cli>,
+    /// The scroll of a long command in a permission request. See `render_permission`.
+    permission_scroll: gpui::ScrollHandle,
     /// The files that the user attached to the next message. See `attach`.
     attachments: Vec<Attachment>,
     /// A click on a link to a document in a message sends the path here. See `doc::links`.
@@ -294,6 +297,7 @@ impl AppView {
             app_context: None,
             app_servers: Vec::new(),
             clis: Vec::new(),
+            permission_scroll: gpui::ScrollHandle::new(),
             attachments: if demo::enabled() { demo_data.composer_files() } else { Vec::new() },
             doc_clicks,
             reply_hover: None,
@@ -892,12 +896,14 @@ impl AppView {
         let count = self.rows.len();
         self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
         self.load_app_servers(cx);
+        self.load_clis(cx);
         self.scroll_to_end(cx);
         cx.notify();
     }
 
     /// The switch between the sets of sample data, in the demo of a dev build only. It is not a
-    /// part of the design, so it has plain neutral colors.
+    /// part of the design, so it has plain neutral colors. It is in a row under the composer,
+    /// so that it does not cover the messages or the sidebar in a narrow conversation.
     fn render_demo_switch(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !cfg!(debug_assertions) || !demo::enabled() || demo::live() {
             return None;
@@ -915,11 +921,14 @@ impl AppView {
         });
         Some(
             h_flex()
-                .absolute()
-                .top(px(HEADER))
-                .right(px(12.))
+                .flex_shrink_0()
+                .justify_center()
+                .px_2()
+                .pb_2()
                 .child(
                     h_flex()
+                        .flex_wrap()
+                        .justify_center()
                         .p(px(2.))
                         .gap(px(2.))
                         .rounded_full()
@@ -1108,6 +1117,12 @@ fn message_style() -> TextViewStyle {
     let mut table = StyleRefinement::default();
     table.overflow.x = Some(gpui::Overflow::Scroll);
     TextViewStyle::default().table(table)
+}
+
+/// The text of a scroll area goes on below its bottom edge.
+fn more_below(scroll: &gpui::ScrollHandle) -> bool {
+    let max = scroll.max_offset().y;
+    max > px(1.) && -scroll.offset().y < max - px(1.)
 }
 
 /// Count `n` of a thing: "1 step", "2 steps".
@@ -1348,6 +1363,8 @@ const TOOL_DETAIL: usize = 4000;
 /// The most characters of a button label in a permission request. A longer label gets an
 /// ellipsis in the middle, and a tooltip with the full label.
 const PERMISSION_OPTION: usize = 30;
+/// The most characters of a package name in the sidebar. A longer name loses its middle.
+const CLI_NAME: usize = 21;
 /// The narrowest conversation. A panel gets narrower, and then the sidebar hides, to keep this
 /// width.
 const MIN_CONVERSATION: f32 = 320.;
@@ -1508,6 +1525,19 @@ fn tool_icon(kind: &str) -> KitIcon {
         SUBAGENT_KIND => KitIcon::Bot,
         _ => KitIcon::Wrench,
     }
+}
+
+/// The tooltip of a row in the sidebar: the full name, and a muted line under it. The text
+/// wraps, so that a long line stays in the window.
+fn sidebar_tooltip(name: String, detail: Option<String>, window: &mut Window, cx: &mut App) -> gpui::AnyView {
+    gpui_component::tooltip::Tooltip::element(move |_, cx| {
+        v_flex()
+            .max_w(px(320.))
+            .py_0p5()
+            .child(div().font_medium().child(name.clone()))
+            .when_some(detail.clone(), |el, detail| el.child(div().text_xs().text_color(cx.theme().muted_foreground).child(detail)))
+    })
+    .build(window, cx)
 }
 
 /// The button that hides or shows the sidebar.
@@ -1753,10 +1783,12 @@ impl AppView {
                 .text_sm()
                 .font_medium()
                 .child(div().size(px(16.)).flex_shrink_0().child(logo))
-                .child(div().flex_1().min_w_0().truncate().child(title))
+                .child(div().flex_1().min_w_0().truncate().child(title.clone()))
+                // The row can cut the title, so the tooltip has all of it, and then the ID of the
+                // server if it is different.
                 .tooltip({
                     let server = app.server.clone();
-                    move |window, cx| gpui_component::tooltip::Tooltip::new(server.clone()).build(window, cx)
+                    move |window, cx| sidebar_tooltip(title.clone(), (server != title).then(|| server.clone()), window, cx)
                 })
         });
         Some(
@@ -1793,10 +1825,13 @@ impl AppView {
                 .text_sm()
                 .font_medium()
                 .child(Icon::new(KitIcon::Terminal).size(px(16.)).text_color(theme.muted_foreground))
-                .child(div().flex_1().min_w_0().truncate().child(cli.name.clone()))
+                // The end of a name such as `@modelcontextprotocol/server-filesystem` tells the
+                // packages apart, so a long name loses its middle.
+                .child(div().flex_1().min_w_0().truncate().child(attach::middle(&cli.name, CLI_NAME)))
                 .tooltip({
-                    let commands = cli.commands.join(", ");
-                    move |window, cx| gpui_component::tooltip::Tooltip::new(commands.clone()).build(window, cx)
+                    let name = cli.name.clone();
+                    let commands = clis::summary(&cli.commands);
+                    move |window, cx| sidebar_tooltip(name.clone(), Some(commands.clone()), window, cx)
                 })
         });
         Some(
@@ -2469,8 +2504,14 @@ impl AppView {
             .my(px(-4.))
             .children(docs.iter().enumerate().map(|(i, path)| {
                 let shown = open.as_ref() == Some(path);
-                let label = if !path.is_file() {
+                // With two or more documents, each label has the title, so that the user can
+                // tell the rows apart.
+                let label = if docs.len() > 1 && !path.is_file() {
+                    format!("{} is not there", doc::title(path))
+                } else if !path.is_file() {
                     "The details are not there".to_string()
+                } else if shown && docs.len() > 1 {
+                    format!("Hide {}", doc::title(path))
                 } else if shown {
                     "Hide the details".to_string()
                 } else if docs.len() == 1 {
@@ -2550,8 +2591,12 @@ impl AppView {
             .children(docs.iter().enumerate().map(|(i, path)| {
                 let shown = open.as_ref() == Some(path);
                 let found = path.is_file();
-                let label = if !found {
+                let label = if docs.len() > 1 && !found {
+                    format!("{} is not there", doc::title(path))
+                } else if !found {
                     "The details are not there".to_string()
+                } else if shown && docs.len() > 1 {
+                    format!("Hide {}", doc::title(path))
                 } else if shown {
                     "Hide the details".to_string()
                 } else if docs.len() == 1 {
@@ -2625,15 +2670,34 @@ impl AppView {
                             .min_w_0()
                             .child(div().text_sm().font_semibold().child("The agent asks for permission"))
                             // A long command, such as a script, scrolls. Without a limit, it
-                            // pushes the buttons and the composer out of the window.
+                            // pushes the buttons and the composer out of the window. A cut line
+                            // can look like the end of the command, so a fade and a scrollbar
+                            // show that there is more to read before the user allows it.
                             .child(
                                 div()
-                                    .id("permission-title-scroll")
-                                    .max_h(px(PERMISSION_TITLE))
-                                    .overflow_y_scroll()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(TextView::markdown("permission-title", SharedString::from(p.title.clone()))),
+                                    .relative()
+                                    .child(
+                                        div()
+                                            .id("permission-title-scroll")
+                                            .max_h(px(PERMISSION_TITLE))
+                                            .overflow_y_scroll()
+                                            .track_scroll(&self.permission_scroll)
+                                            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .child(TextView::markdown("permission-title", SharedString::from(p.title.clone()))),
+                                    )
+                                    .when(more_below(&self.permission_scroll), |el| {
+                                        let card = theme.background.blend(theme.warning.opacity(0.08));
+                                        el.child(
+                                            div().absolute().left_0().right_0().bottom_0().h(px(32.)).bg(gpui::linear_gradient(
+                                                180.,
+                                                gpui::linear_color_stop(card.opacity(0.), 0.),
+                                                gpui::linear_color_stop(card, 1.),
+                                            )),
+                                        )
+                                    })
+                                    .vertical_scrollbar(&self.permission_scroll),
                             ),
                     ),
             )

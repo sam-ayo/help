@@ -133,6 +133,17 @@ fn installed_on_request(keg: &Path) -> bool {
     receipt["installed_on_request"].as_bool().unwrap_or(true)
 }
 
+/// The commands that a tooltip shows. A package such as `coreutils` has about 100, so the
+/// tooltip names the first ones and gives the number of the others.
+pub(super) fn summary(commands: &[String]) -> String {
+    const SHOWN: usize = 12;
+    let first = commands.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    match commands.len().saturating_sub(SHOWN) {
+        0 => first,
+        rest => format!("{first}, and {rest} more"),
+    }
+}
+
 fn executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt as _;
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
@@ -141,7 +152,10 @@ fn executable(path: &Path) -> bool {
 impl AppView {
     /// Look for the tools again, because the user can install a tool while the app runs.
     pub(super) fn load_clis(&mut self, cx: &mut Context<Self>) {
+        // The demo does not show the tools of this Mac, so that a screenshot shows only sample data.
         if demo::enabled() {
+            self.clis = self.demo_data.clis();
+            cx.notify();
             return;
         }
         let task = cx.background_spawn(async move { find() });
@@ -162,6 +176,14 @@ mod tests {
 
     fn name(real: &str, real_dir: &str) -> Option<String> {
         package("cmd", Path::new(real), Path::new(real_dir))
+    }
+
+    #[test]
+    fn a_long_list_of_commands_gets_a_count() {
+        let commands = |n: usize| (1..=n).map(|i| format!("c{i}")).collect::<Vec<_>>();
+        assert_eq!(summary(&commands(2)), "c1, c2");
+        assert_eq!(summary(&commands(12)).matches(", ").count(), 11);
+        assert!(summary(&commands(67)).ends_with("c12, and 55 more"));
     }
 
     #[test]

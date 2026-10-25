@@ -298,6 +298,38 @@ impl Data {
         }
     }
 
+    /// The packages of command line tools in the sidebar. See `clis`.
+    pub(super) fn clis(self) -> Vec<super::clis::Cli> {
+        let cli = |name: &str, commands: &[&str]| super::clis::Cli {
+            name: name.into(),
+            commands: commands.iter().map(|c| c.to_string()).collect(),
+        };
+        match self {
+            Data::Worst => {
+                // GNU coreutils has about 100 commands, each with a `g` before its name.
+                let coreutils: Vec<String> = ["base64", "basename", "cat", "chmod", "chown", "cp", "cut", "date", "dd", "df", "dirname", "du", "echo", "env", "expand", "expr", "factor", "head", "id", "join", "kill", "link", "ln", "ls", "md5sum", "mkdir", "mktemp", "mv", "nice", "nl", "nohup", "numfmt", "od", "paste", "pr", "printf", "pwd", "readlink", "realpath", "rm", "rmdir", "seq", "sha1sum", "sha256sum", "shuf", "sleep", "sort", "split", "stat", "stdbuf", "tail", "tee", "test", "timeout", "touch", "tr", "truncate", "tsort", "tty", "uname", "uniq", "unlink", "users", "wc", "who", "whoami", "yes"]
+                    .iter()
+                    .map(|c| format!("g{c}"))
+                    .collect();
+                let coreutils: Vec<&str> = coreutils.iter().map(String::as_str).collect();
+                vec![
+                    cli("@modelcontextprotocol/server-filesystem", &["mcp-server-filesystem"]),
+                    cli("@anthropic-ai/claude-code", &["claude"]),
+                    cli("coreutils", &coreutils),
+                    cli("gh", &["gh"]),
+                    cli("google-cloud-sdk", &["bq", "docker-credential-gcloud", "gcloud", "git-credential-gcloud.sh", "gsutil"]),
+                    cli("jq", &["jq"]),
+                    cli("k9s", &["k9s"]),
+                    cli("Visual Studio Code - Insiders", &["code-insiders"]),
+                    cli("Python", &["idle3.13", "pip3", "pip3.13", "pydoc3", "pydoc3.13", "python3", "python3-config", "python3.13", "python3.13-config"]),
+                ]
+            }
+            Data::One => vec![cli("gh", &["gh"])],
+            Data::Huge => (1..=300).map(|i| cli(&format!("package-{i}"), &["command"])).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The files in the composer, for the next message.
     pub fn composer_files(self) -> Vec<Attachment> {
         let home = std::env::var("HOME").unwrap_or_default();
