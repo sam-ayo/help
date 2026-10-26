@@ -181,6 +181,7 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("cmd-.", ui::StopAgent, None),
             KeyBinding::new("cmd-ctrl-s", ui::ToggleSidebar, None),
+            KeyBinding::new("escape", ui::ExitFullView, None),
             KeyBinding::new("cmd-w", presence::HideWindow, None),
             KeyBinding::new("cmd-q", presence::Quit, None),
         ]);

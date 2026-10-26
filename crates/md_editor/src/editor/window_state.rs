@@ -134,6 +134,7 @@ impl Editor {
         let available = (viewport_width - dimensions.editor_padding * 2.0).max(1.0);
         (available * Self::centered_column_ratio(viewport_width, dimensions))
             .max(320.0)
+            .min(dimensions.max_column_width.unwrap_or(f32::INFINITY))
             .min(available)
     }
 

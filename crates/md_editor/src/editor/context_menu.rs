@@ -107,13 +107,15 @@ impl Editor {
         }
     }
 
-    pub(super) fn dismiss_contextual_overlays(&mut self, cx: &mut Context<Self>) {
+    /// Returns `true` if an overlay showed.
+    pub(super) fn dismiss_contextual_overlays(&mut self, cx: &mut Context<Self>) -> bool {
         let had_menu = self.context_menu.take().is_some();
         let had_dialog = self.table_insert_dialog.take().is_some();
         let had_submenu_close = self.context_menu_submenu_close_task.take().is_some();
         if had_menu || had_dialog || had_submenu_close {
             cx.notify();
         }
+        had_menu || had_dialog
     }
 
     fn schedule_context_menu_submenu_close(&mut self, cx: &mut Context<Self>) {
@@ -254,7 +256,10 @@ impl Editor {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dismiss_contextual_overlays(cx);
+        // With no overlay, the key goes to the app, which can use it.
+        if !self.dismiss_contextual_overlays(cx) {
+            cx.propagate();
+        }
     }
 
     pub(super) fn on_context_menu_insert_hover(

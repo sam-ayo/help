@@ -17,6 +17,25 @@ const RENDER_OVERDRAW_PX: f32 = 800.0;
 /// the panel are short, so all rows are mounted.
 const CULL_ROWS: bool = false;
 
+/// The most frames that the editor uses to scroll back to its anchor after a change of the
+/// viewport width. See `Editor::keep_scroll_anchor`.
+const ANCHOR_FRAMES: u8 = 8;
+
+/// The rows of the last frame, for `Editor::keep_scroll_anchor`.
+struct ScrollAnchorRows<'a> {
+    /// The id of the first block of each row.
+    ids: &'a [EntityId],
+    /// The painted top of each row in the last frame, in window coordinates.
+    tops: &'a [Option<f32>],
+    /// The height of each row, with the gap below it.
+    strides: &'a [f32],
+    /// The rows that the last frame mounted.
+    mounted: Option<(usize, usize)>,
+    viewport_top: f32,
+    /// The space above the first row.
+    padding: f32,
+}
+
 fn editor_text_font() -> Font {
     // FontFallbacks is internally `Arc<Vec<String>>` — building it once
     // per process and Arc-cloning per render is the right shape, since
@@ -249,17 +268,71 @@ impl Editor {
         }));
     }
 
-    fn sync_scroll_viewport(&mut self, viewport_size: Size<Pixels>, cx: &mut Context<Self>) {
+    /// Returns `true` if the width of the viewport changed.
+    fn sync_scroll_viewport(&mut self, viewport_size: Size<Pixels>, cx: &mut Context<Self>) -> bool {
         match self.last_scroll_viewport_size {
             Some(previous) if Self::viewport_size_changed(previous, viewport_size) => {
                 self.last_scroll_viewport_size = Some(viewport_size);
                 self.request_active_block_scroll_into_view(cx);
+                (f32::from(previous.width) - f32::from(viewport_size.width)).abs() > 0.5
             }
-            Some(_) => {}
+            Some(_) => false,
             None => {
                 self.last_scroll_viewport_size = Some(viewport_size);
+                false
             }
         }
+    }
+
+    /// A change of the viewport width wraps the text again, so the same scroll offset shows
+    /// other rows. This keeps the row at the top of the viewport at the top. Each frame
+    /// without a change records the anchor row. After a change, each frame moves the anchor
+    /// row nearer to its old place, until it is there. Returns the new scroll offset.
+    ///
+    /// With a caret in a block, the editor keeps the caret in view instead.
+    fn keep_scroll_anchor(
+        &mut self,
+        rows: &ScrollAnchorRows,
+        width_changed: bool,
+        has_caret: bool,
+        scroll_y: f32,
+        max_scroll_y: f32,
+    ) -> Option<f32> {
+        // The painted top of a row, if the row was mounted in the last frame.
+        let painted = |row: usize| {
+            rows.mounted
+                .filter(|(start, end)| (*start..*end).contains(&row))
+                .and_then(|_| rows.tops.get(row).copied().flatten())
+                .map(|top| top - rows.viewport_top)
+        };
+        if width_changed && !has_caret {
+            self.pending_scroll_anchor = self.scroll_anchor.map(|anchor| (anchor, ANCHOR_FRAMES));
+        }
+        let Some(((id, want), frames)) = self.pending_scroll_anchor else {
+            let (start, end) = rows.mounted?;
+            self.scroll_anchor = (start..end.min(rows.ids.len()))
+                .filter_map(|row| painted(row).map(|top| (rows.ids[row], top)))
+                .take_while(|(_, top)| *top <= 0.5)
+                .last();
+            return None;
+        };
+        let row = rows.ids.iter().position(|row| *row == id);
+        let Some(row) = row.filter(|_| frames > 0) else {
+            self.pending_scroll_anchor = None;
+            return None;
+        };
+        let target = match painted(row) {
+            Some(top) => scroll_y + top - want,
+            // A row that is not mounted is at about the sum of the heights above it.
+            None => rows.padding + rows.strides[..row].iter().sum::<f32>() - want,
+        };
+        let target = target.clamp(0.0, max_scroll_y);
+        if painted(row).is_some() && (target - scroll_y).abs() < 0.5 {
+            self.pending_scroll_anchor = None;
+            return None;
+        }
+        self.pending_scroll_anchor = Some(((id, want), frames - 1));
+        Some(target)
     }
 }
 impl Render for Editor {
@@ -270,7 +343,7 @@ impl Render for Editor {
 
         let viewport_bounds = self.scroll_handle.bounds();
         let viewport_size = viewport_bounds.size;
-        self.sync_scroll_viewport(viewport_size, cx);
+        let width_changed = self.sync_scroll_viewport(viewport_size, cx);
 
         let theme = self.environment.theme.clone();
 
@@ -293,7 +366,7 @@ impl Render for Editor {
         let has_overflow = max_scroll_y > 0.5;
 
         let centered_width = Self::centered_column_width(viewport_width, &theme.dimensions);
-        let current_scroll_y = (-f32::from(self.scroll_handle.offset().y)).clamp(0.0, max_scroll_y);
+        let mut current_scroll_y = (-f32::from(self.scroll_handle.offset().y)).clamp(0.0, max_scroll_y);
         let scrollbar_geometry =
             Self::scrollbar_geometry(viewport_height, max_scroll_y, current_scroll_y);
         let track_height = scrollbar_geometry.track_height;
@@ -589,6 +662,25 @@ impl Render for Editor {
         if self.row_stride_cache.len() > row_first_ids.len().saturating_mul(2) {
             let live: std::collections::HashSet<EntityId> = row_first_ids.iter().copied().collect();
             self.row_stride_cache.retain(|id, _| live.contains(id));
+        }
+
+        if self.scrollbar_drag.is_none() {
+            let mounted = self.prev_render_window.filter(|_| !structural_change);
+            let anchor = ScrollAnchorRows {
+                ids: &row_first_ids,
+                tops: &row_tops,
+                strides: &strides,
+                mounted,
+                viewport_top: f32::from(viewport_bounds.top()),
+                padding: d.editor_padding,
+            };
+            if let Some(scroll_y) =
+                self.keep_scroll_anchor(&anchor, width_changed, focus_row.is_some(), current_scroll_y, max_scroll_y)
+            {
+                self.scroll_handle.set_offset(point(px(0.0), px(-scroll_y)));
+                current_scroll_y = scroll_y;
+                window.request_animation_frame();
+            }
         }
 
         let render_window = if CULL_ROWS {

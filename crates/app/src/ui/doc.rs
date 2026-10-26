@@ -26,6 +26,13 @@ use super::{AppView, Context, INSET, Item, MIN_PANEL, TOOLBAR, accent, mcp_app};
 /// The width of the panel when the app starts.
 pub(super) const WIDTH: f32 = 480.;
 
+/// The widest that the text is in the full view. A line of about 90 characters is easy to
+/// read.
+const FULL_COLUMN: f32 = 680.;
+
+/// The space at the left side of the window for the traffic lights.
+const TRAFFIC_LIGHTS: f32 = 84.;
+
 /// A drag of the left edge of the panel, which changes the width of the panel.
 #[derive(Clone)]
 struct Resize;
@@ -50,8 +57,9 @@ pub(super) struct Doc {
     editor: Option<Entity<MarkdownEditor>>,
     /// The app saved a change from the editor.
     saved: bool,
-    /// The colors of the app that the editor has. See `theme_key`.
-    theme: Option<[Hsla; 4]>,
+    /// The colors of the app that the editor has, and if the editor is in the full view. See
+    /// `theme_key`.
+    theme: Option<([Hsla; 4], bool)>,
     _events: Option<Subscription>,
 }
 
@@ -101,10 +109,11 @@ impl Doc {
         self.saved = true;
     }
 
-    /// Make the editor if the document has none, and give the editor a change of the theme.
-    fn prepare(&mut self, cx: &mut Context<AppView>) -> Entity<MarkdownEditor> {
-        let key = theme_key(cx.theme());
-        let theme = Arc::new(editor_theme(cx.theme()));
+    /// Make the editor if the document has none, and give the editor a change of the theme or
+    /// of the view. `full` is `true` for the full view.
+    fn prepare(&mut self, full: bool, cx: &mut Context<AppView>) -> Entity<MarkdownEditor> {
+        let key = (theme_key(cx.theme()), full);
+        let theme = Arc::new(editor_theme(cx.theme(), full));
         let editor = match &self.editor {
             Some(editor) => {
                 if self.theme != Some(key) {
@@ -380,8 +389,9 @@ fn theme_key(theme: &Theme) -> [Hsla; 4] {
     [theme.background, theme.foreground, accent(theme), theme.border]
 }
 
-/// The theme of the editor, with the colors of the app, and sizes for the narrow panel.
-fn editor_theme(theme: &Theme) -> MarkdownEditorTheme {
+/// The theme of the editor, with the colors of the app, and sizes for the narrow panel. In
+/// the full view, the text has a margin at each side.
+fn editor_theme(theme: &Theme, full: bool) -> MarkdownEditorTheme {
     let mut t = if theme.is_dark() { MarkdownEditorTheme::default_theme() } else { MarkdownEditorTheme::light_theme() };
     let accent = accent(theme);
     let c = &mut t.colors;
@@ -422,6 +432,9 @@ fn editor_theme(theme: &Theme) -> MarkdownEditorTheme {
     ty.h6_size = 13.;
     ty.code_size = 13.;
     t.dimensions.editor_padding = 20.;
+    if full {
+        t.dimensions.max_column_width = Some(FULL_COLUMN);
+    }
     t
 }
 
@@ -451,6 +464,30 @@ impl AppView {
     /// Close the panel. The editor told each change already, so the file has all of them.
     pub(super) fn close_doc(&mut self, cx: &mut Context<Self>) {
         self.doc = None;
+        self.doc_full = false;
+        cx.notify();
+    }
+
+    /// Show the document across the full window, or in the panel again. The two views show the
+    /// same editor, so the text keeps its scroll position.
+    fn toggle_full_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.doc_full {
+            self.exit_full_doc(window, cx);
+            return;
+        }
+        self.doc_full = true;
+        // The Escape key needs an element with the focus in the full view.
+        window.focus(&self.doc_focus, cx);
+        cx.notify();
+    }
+
+    /// Show the document in the panel again, and put the focus in the composer.
+    pub(super) fn exit_full_doc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.doc_full {
+            return;
+        }
+        self.doc_full = false;
+        self.focus_composer(window, cx);
         cx.notify();
     }
 
@@ -485,7 +522,8 @@ impl AppView {
 
     /// Make the editor if the panel has none, and give the editor a change of the theme.
     fn prepare_doc(&mut self, cx: &mut Context<Self>) -> Option<Entity<MarkdownEditor>> {
-        Some(self.doc.as_mut()?.prepare(cx))
+        let full = self.doc_full;
+        Some(self.doc.as_mut()?.prepare(full, cx))
     }
 
     /// Show a document that the agent wrote in the panel.
@@ -501,7 +539,7 @@ impl AppView {
             return;
         }
         let mut doc = Doc::open(SharedString::default(), KitIcon::FileText, path);
-        doc.prepare(cx);
+        doc.prepare(false, cx);
         self.doc_prefetch = Some(doc);
     }
 
@@ -538,6 +576,7 @@ impl AppView {
         let doc = self.doc.as_ref()?;
         let theme = cx.theme().clone();
         let accent = accent(&theme);
+        let full = self.doc_full;
 
         // The icon of the file, in a tinted square.
         let badge = div()
@@ -558,7 +597,8 @@ impl AppView {
         let header = self
             .toolbar("doc-toolbar", cx)
             .h(px(TOOLBAR))
-            .pl_3()
+            // In the full view, the traffic lights are at the left of the header.
+            .pl(if full { px(TRAFFIC_LIGHTS - INSET) } else { px(12.) })
             .pr_1p5()
             .gap_2p5()
             .border_b_1()
@@ -574,6 +614,14 @@ impl AppView {
                     .tooltip("Copy the Markdown")
                     .on_click(move |_, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(text.clone())))
             })
+            .child(
+                Button::new("full-doc")
+                    .ghost()
+                    .small()
+                    .icon(if full { KitIcon::Minimize } else { KitIcon::Maximize })
+                    .tooltip(if full { "Show in the panel (Escape)" } else { "Show in full screen" })
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_full_doc(window, cx))),
+            )
             .child(
                 Button::new("close-doc")
                     .ghost()
@@ -596,6 +644,17 @@ impl AppView {
             .shadow_md()
             .child(header)
             .child(body);
+        if full {
+            return Some(
+                div()
+                    .id("doc-full")
+                    .track_focus(&self.doc_focus)
+                    .size_full()
+                    .p(px(INSET))
+                    .child(card)
+                    .into_any_element(),
+            );
+        }
         Some(self.side_panel("doc-panel", self.doc_width, WIDTH, |this, w| this.doc_width = w, card, window, cx))
     }
 

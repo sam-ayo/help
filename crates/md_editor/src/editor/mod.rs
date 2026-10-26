@@ -54,6 +54,12 @@ pub struct Editor {
     prev_visible_block_ids: Vec<EntityId>,
     row_stride_cache: HashMap<EntityId, f32>,
     prev_render_window: Option<(usize, usize)>,
+    /// The row at the top of the viewport, by the id of its first block, and the distance
+    /// from the viewport top to the top of the row. See `keep_scroll_anchor`.
+    scroll_anchor: Option<(EntityId, f32)>,
+    /// After a change of the viewport width, the anchor that the editor scrolls back to, and
+    /// the number of frames that it can still use.
+    pending_scroll_anchor: Option<((EntityId, f32), u8)>,
     context_menu: Option<ContextMenuState>,
     table_insert_dialog: Option<TableInsertDialogState>,
     context_menu_submenu_close_task: Option<Task<()>>,
@@ -260,6 +266,8 @@ impl Editor {
             prev_visible_block_ids: Vec::new(),
             row_stride_cache: HashMap::new(),
             prev_render_window: None,
+            scroll_anchor: None,
+            pending_scroll_anchor: None,
             context_menu: None,
             table_insert_dialog: None,
             context_menu_submenu_close_task: None,

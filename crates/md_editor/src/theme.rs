@@ -361,6 +361,10 @@ pub struct ThemeDimensions {
     pub centered_shrink_end: f32,
     /// Minimum content-column width as a fraction of available width.
     pub centered_min_ratio: f32,
+    /// The widest that the content column can be. The host sets it in code; theme files
+    /// do not have it.
+    #[serde(skip)]
+    pub max_column_width: Option<f32>,
     /// Width of the unsaved-changes dialog.
     pub dialog_width: f32,
     /// Padding inside the unsaved-changes dialog.
@@ -1013,6 +1017,7 @@ impl<'de> Deserialize<'de> for ThemeDimensions {
             centered_shrink_start: raw.centered_shrink_start,
             centered_shrink_end: raw.centered_shrink_end,
             centered_min_ratio: raw.centered_min_ratio,
+            max_column_width: None,
             dialog_width: raw.dialog_width,
             dialog_padding: raw.dialog_padding,
             dialog_gap: raw.dialog_gap,
@@ -1247,6 +1252,7 @@ impl Theme {
                 centered_shrink_start: 1100.0,
                 centered_shrink_end: 2200.0,
                 centered_min_ratio: 0.58,
+                max_column_width: None,
                 dialog_width: 460.0,
                 dialog_padding: 20.0,
                 dialog_gap: 14.0,

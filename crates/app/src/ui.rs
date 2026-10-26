@@ -40,7 +40,7 @@ mod mcp_app;
 mod memory;
 mod steps;
 
-gpui::actions!(help, [StopAgent, ToggleSidebar]);
+gpui::actions!(help, [StopAgent, ToggleSidebar, ExitFullView]);
 
 /// The app looks for a change to the MCP servers of the agent at this interval.
 const MCP_POLL: Duration = Duration::from_secs(3);
@@ -213,6 +213,10 @@ pub struct AppView {
     doc_prefetch: Option<doc::Doc>,
     /// The width of the document panel. The user changes it with a drag of the left edge.
     doc_width: f32,
+    /// The document shows across the full window, not in the panel. See `toggle_full_doc`.
+    doc_full: bool,
+    /// The keyboard focus of the full view, so that the Escape key closes it.
+    doc_focus: gpui::FocusHandle,
     /// The views send their messages here, with the generation of their panel.
     app_messages: async_channel::Sender<(u64, String)>,
     /// The context that a view gave for the next message to the agent: the name of the tool,
@@ -320,6 +324,8 @@ impl AppView {
             doc: None,
             doc_prefetch: None,
             doc_width: doc::WIDTH,
+            doc_full: false,
+            doc_focus: cx.focus_handle(),
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
@@ -3188,6 +3194,8 @@ impl AppView {
         let sidebar = self.sidebar_shows(window);
         let app_panel = self.render_panel(window, cx);
         let doc_panel = self.render_doc(window, cx);
+        // The full view of the document shows instead of the sidebar and the conversation.
+        let full = self.doc_full && doc_panel.is_some();
         let steps_panel = self.render_steps(window, cx);
         // The things that change the width of the conversation. See `text_id`.
         self.text_layout = (
@@ -3300,8 +3308,9 @@ impl AppView {
             .text_color(theme.foreground)
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
-            .when(sidebar, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
-            .child(
+            .on_action(cx.listener(|this, _: &ExitFullView, window, cx| this.exit_full_doc(window, cx)))
+            .when(sidebar && !full, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
+            .when(!full, |el| el.child(
                 v_flex()
                     .id("conversation")
                     .flex_1()
@@ -3321,7 +3330,7 @@ impl AppView {
                     .child(toolbar)
                     .child(body)
                     .children(self.render_demo_switch(cx)),
-            )
+            ))
             .children(app_panel)
             .children(doc_panel)
             .children(steps_panel)
