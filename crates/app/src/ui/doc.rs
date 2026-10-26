@@ -688,21 +688,44 @@ impl AppView {
                 }
             }));
         let room = self.panel_room(window);
+        let outer = (width + INSET * 2.).min(room);
+        // The text in the panel and in the conversation wraps again at each change of the
+        // width. Thus a drag moves only a line, and the panel gets the width when the drag stops.
+        let guide = self.panel_resize.map(|new| {
+            div()
+                .absolute()
+                .top(px(INSET + 12.))
+                .bottom(px(INSET + 12.))
+                .left(px(outer - INSET - new - 1.5))
+                .w(px(3.))
+                .rounded_full()
+                .bg(accent(cx.theme()))
+        });
+        let commit = move |this: &mut AppView, cx: &mut Context<Self>| {
+            if let Some(new) = this.panel_resize.take() {
+                set(this, new);
+                cx.notify();
+            }
+        };
         div()
             .id(id)
             .relative()
-            .w(px((width + INSET * 2.).min(room)))
+            .w(px(outer))
             .h_full()
             .flex_shrink_0()
             .p(px(INSET))
             .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<Resize>, window, cx| {
                 let right = f32::from(window.viewport_size().width) - INSET;
                 let width = right - f32::from(event.event.position.x);
-                set(this, width.min(room - INSET * 2.).max(MIN_PANEL));
+                this.panel_resize = Some(width.min(room - INSET * 2.).max(MIN_PANEL));
                 cx.notify();
             }))
+            // The drag stops at a mouse up in the panel or anywhere else in the window.
+            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| commit(this, cx)))
+            .on_mouse_up_out(gpui::MouseButton::Left, cx.listener(move |this, _, _, cx| commit(this, cx)))
             .child(card)
             .child(edge)
+            .children(guide)
             .into_any_element()
     }
 }

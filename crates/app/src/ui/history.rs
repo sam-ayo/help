@@ -65,6 +65,9 @@ enum SavedItem {
         parent: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<Attachment>,
+        /// The time of a subagent in seconds. An older version of the app kept no time.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        took: Option<i64>,
     },
     Plan { entries: Vec<(String, String)> },
     Notice { text: String },
@@ -73,6 +76,10 @@ enum SavedItem {
     /// An older version of the app had topics. The app reads them and drops them.
     #[allow(dead_code)]
     Topic {},
+    /// A test build of the app had a line after the subagents of a turn. The app reads it and
+    /// drops it.
+    #[allow(dead_code)]
+    SubagentsDone {},
 }
 
 fn status_key(s: ToolStatus) -> &'static str {
@@ -102,10 +109,11 @@ fn save_item(item: &Item) -> SavedItem {
         Item::Agent(text) => SavedItem::Agent { text: text.clone() },
         Item::AgentFiles(files) => SavedItem::AgentFiles { files: files.clone() },
         Item::Thought(text) => SavedItem::Thought { text: text.clone() },
-        Item::Tool { id, title, kind, status, detail, parent, files } => SavedItem::Tool {
+        Item::Tool { id, title, kind, status, detail, parent, files, took } => SavedItem::Tool {
             id: Some(id.clone()),
             parent: parent.clone(),
             files: files.clone(),
+            took: *took,
             title: title.clone(),
             kind: kind.clone(),
             status: status_key(*status).into(),
@@ -126,10 +134,11 @@ fn load_item(item: SavedItem, ix: usize) -> Option<Item> {
         SavedItem::Agent { text } => Item::Agent(text),
         SavedItem::AgentFiles { files } => Item::AgentFiles(files),
         SavedItem::Thought { text } => Item::Thought(text),
-        SavedItem::Tool { title, kind, status, detail, id, parent, files } => Item::Tool {
+        SavedItem::Tool { title, kind, status, detail, id, parent, files, took } => Item::Tool {
             id: id.unwrap_or_else(|| format!("saved-{ix}")),
             parent,
             files,
+            took,
             title,
             kind,
             status: status_from_key(&status),
@@ -141,7 +150,7 @@ fn load_item(item: SavedItem, ix: usize) -> Option<Item> {
         SavedItem::Notice { text } => Item::Notice(text),
         SavedItem::Error { text } => Item::Error(text),
         SavedItem::Compacted {} => Item::Compacted,
-        SavedItem::Topic {} => return None,
+        SavedItem::Topic {} | SavedItem::SubagentsDone {} => return None,
     })
 }
 
@@ -346,6 +355,7 @@ mod tests {
                 detail: Some("out".into()),
                 parent: Some("task".into()),
                 files: vec![file()],
+                took: Some(80),
             },
             Item::Plan(vec![("step".into(), ToolStatus::Done), ("next".into(), ToolStatus::Pending)]),
         ]);
@@ -364,7 +374,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 3);
         assert!(matches!(&loaded[0], Item::User { text, at: 1_700_000_000, attachments, .. } if text == "hello" && attachments == &[file()]));
-        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), parent: Some(p), files, .. } if d == "out" && p == "task" && files == &[file()]));
+        assert!(matches!(&loaded[1], Item::Tool { status: ToolStatus::Pending, detail: Some(d), parent: Some(p), files, took: Some(80), .. } if d == "out" && p == "task" && files == &[file()]));
         assert!(matches!(&loaded[2], Item::Plan(p) if p[0].1 == ToolStatus::Done && p[1].1 == ToolStatus::Pending));
     }
 

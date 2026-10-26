@@ -65,6 +65,8 @@ enum Item {
         parent: Option<String>,
         /// The images and other files in the result of the tool, for example a screenshot.
         files: Vec<Attachment>,
+        /// The time of a subagent in seconds, when it stopped and the time is known.
+        took: Option<i64>,
     },
     Plan(Vec<(String, ToolStatus)>),
     Notice(String),
@@ -116,6 +118,9 @@ struct Chat {
     compaction: Option<String>,
     /// The calls of MCP tools in this run of the app, by tool call ID. See `mcp_app`.
     mcp_calls: HashMap<String, mcp_app::McpCallState>,
+    /// The time that each subagent in this run of the app started, in seconds since 1970, by
+    /// tool call ID.
+    subagent_starts: HashMap<String, i64>,
 }
 
 impl Chat {
@@ -136,6 +141,7 @@ impl Chat {
             cwd,
             compaction: None,
             mcp_calls: HashMap::new(),
+            subagent_starts: HashMap::new(),
         }
     }
 }
@@ -217,6 +223,9 @@ pub struct AppView {
     doc_full: bool,
     /// The keyboard focus of the full view, so that the Escape key closes it.
     doc_focus: gpui::FocusHandle,
+    /// The new width of a panel at the right side while the user drags its edge. A line shows
+    /// the new edge, and the panel gets the width when the drag stops. See `side_panel`.
+    panel_resize: Option<f32>,
     /// The views send their messages here, with the generation of their panel.
     app_messages: async_channel::Sender<(u64, String)>,
     /// The context that a view gave for the next message to the agent: the name of the tool,
@@ -326,6 +335,7 @@ impl AppView {
             doc_width: doc::WIDTH,
             doc_full: false,
             doc_focus: cx.focus_handle(),
+            panel_resize: None,
             app_messages,
             app_context: None,
             app_servers: Vec::new(),
@@ -1086,12 +1096,12 @@ impl AppView {
 enum Row {
     /// The item at this index.
     Item(usize),
-    /// The final reply of a turn that has `count` steps. The receipt under the reply opens the
-    /// steps. `turn` is the index of the user message of the turn.
-    Reply { ix: usize, turn: usize, count: usize, open: bool },
-    /// The line at the end of a turn that has steps but no reply, for example a turn that
+    /// The final reply of a turn that has steps. A button next to the reply opens the steps.
+    /// `turn` is the index of the user message of the turn.
+    Reply { ix: usize, turn: usize, open: bool },
+    /// The button at the end of a turn that has steps but no reply, for example a turn that
     /// the user stopped.
-    Steps { turn: usize, count: usize, open: bool },
+    Steps { turn: usize, open: bool },
     /// The agent works. A permission request shows instead of this line. `steps` has the turn
     /// and the open state, if the turn has steps.
     Working { steps: Option<(usize, bool)> },
@@ -1276,9 +1286,9 @@ struct TurnParts {
     steps: Vec<usize>,
 }
 
-/// A turn shows the user message, the final reply of the agent, the subagent cards, and the
-/// errors and notices. The other items of the turn are steps: thoughts, tools, plans, and the
-/// text of the agent before the final reply. While the agent works, all of its text is a step.
+/// A turn shows the user message, the final reply of the agent, and the errors and notices.
+/// The other items of the turn are steps: thoughts, tools, subagents, plans, and the text of
+/// the agent before the final reply. While the agent works, all of its text is a step.
 fn turn_parts(chat: &Chat, turn: usize) -> TurnParts {
     let items = &chat.items;
     let end = items[turn + 1..]
@@ -1291,7 +1301,8 @@ fn turn_parts(chat: &Chat, turn: usize) -> TurnParts {
     } else {
         (turn + 1..end).rev().find(|&i| matches!(items[i], Item::Agent(_)))
     };
-    // The card of a subagent shows the tool calls of the subagent, so they show nowhere else.
+    // The card of a subagent in the steps panel shows the tool calls of the subagent, so they
+    // show nowhere else.
     let subagents: HashSet<&str> = items[turn + 1..end]
         .iter()
         .filter_map(|i| match i {
@@ -1303,8 +1314,6 @@ fn turn_parts(chat: &Chat, turn: usize) -> TurnParts {
     for (i, item) in items.iter().enumerate().take(end).skip(turn + 1) {
         match item {
             Item::Tool { parent: Some(p), .. } if subagents.contains(p.as_str()) => {}
-            // The subagent cards always show, so the user sees that the agent delegated work.
-            Item::Tool { kind, .. } if kind == SUBAGENT_KIND => parts.shown.push(i),
             Item::Notice(_) | Item::Error(_) | Item::Compacted | Item::AgentFiles(_) => parts.shown.push(i),
             _ if Some(i) == reply => parts.shown.push(i),
             _ => parts.steps.push(i),
@@ -1334,7 +1343,7 @@ fn build_rows(chat: &Chat, steps_turn: Option<usize>) -> Vec<Row> {
         rows.push(Row::Item(turn));
         for &i in &parts.shown {
             if count > 0 && Some(i) == parts.reply {
-                rows.push(Row::Reply { ix: i, turn, count, open });
+                rows.push(Row::Reply { ix: i, turn, open });
             } else {
                 rows.push(Row::Item(i));
             }
@@ -1343,7 +1352,7 @@ fn build_rows(chat: &Chat, steps_turn: Option<usize>) -> Vec<Row> {
             if parts.end == items.len() && chat.busy {
                 working_steps = Some((turn, open));
             } else if parts.reply.is_none() {
-                rows.push(Row::Steps { turn, count, open });
+                rows.push(Row::Steps { turn, open });
             }
         }
         ix = parts.end;
@@ -1352,6 +1361,31 @@ fn build_rows(chat: &Chat, steps_turn: Option<usize>) -> Vec<Row> {
         rows.push(Row::Working { steps: working_steps });
     }
     rows
+}
+
+/// The tool or subagent stopped: it is done, or it failed.
+fn stopped(s: ToolStatus) -> bool {
+    matches!(s, ToolStatus::Done | ToolStatus::Failed)
+}
+
+/// The subagents of the current turn: the number that are done, the number that failed, and
+/// the number of all of them.
+fn subagent_counts(items: &[Item]) -> (usize, usize, usize) {
+    let turn = items.iter().rposition(|i| matches!(i, Item::User { .. })).unwrap_or(0);
+    let (mut done, mut failed, mut all) = (0, 0, 0);
+    for item in &items[turn..] {
+        if let Item::Tool { kind, status, .. } = item
+            && kind == SUBAGENT_KIND
+        {
+            all += 1;
+            match status {
+                ToolStatus::Done => done += 1,
+                ToolStatus::Failed => failed += 1,
+                _ => {}
+            }
+        }
+    }
+    (done, failed, all)
 }
 
 /// The first item that `event` can change, or `None` if the event can change all of the turn.
@@ -1412,6 +1446,9 @@ fn apply(chat: &mut Chat, event: Event) {
             if let Some(call) = mcp {
                 chat.mcp_calls.insert(id.clone(), mcp_app::McpCallState::new(call, input, status));
             }
+            if kind == SUBAGENT_KIND {
+                chat.subagent_starts.entry(id.clone()).or_insert_with(|| chrono::Utc::now().timestamp());
+            }
             chat.items.push(Item::Tool {
                 id,
                 title,
@@ -1420,6 +1457,7 @@ fn apply(chat: &mut Chat, event: Event) {
                 detail: None,
                 parent,
                 files: Vec::new(),
+                took: None,
             })
         }
         Event::ToolUpdate {
@@ -1441,14 +1479,16 @@ fn apply(chat: &mut Chat, event: Event) {
                 Item::Tool {
                     id: tid,
                     title,
+                    kind,
                     status,
                     detail,
                     files,
+                    took,
                     ..
-                } if *tid == id => Some((title, status, detail, files)),
+                } if *tid == id => Some((title, &*kind, status, detail, files, took)),
                 _ => None,
             });
-            if let Some((title, status, detail, files)) = found {
+            if let Some((title, kind, status, detail, files, took)) = found {
                 for f in new_files {
                     if !files.contains(&f) {
                         files.push(f);
@@ -1458,7 +1498,14 @@ fn apply(chat: &mut Chat, event: Event) {
                     *title = t;
                 }
                 if let Some(s) = new_status {
+                    let stops = !stopped(*status) && stopped(s);
                     *status = s;
+                    if kind == SUBAGENT_KIND
+                        && stops
+                        && let Some(start) = chat.subagent_starts.get(&id)
+                    {
+                        *took = Some((chrono::Utc::now().timestamp() - start).max(0));
+                    }
                 }
                 if new_detail.is_some() {
                     *detail = new_detail;
@@ -1479,7 +1526,7 @@ fn apply(chat: &mut Chat, event: Event) {
         }
         Event::TurnEnded(reason) => {
             chat.busy = false;
-            // The receipt under the reply shows the time of the turn.
+            // The app keeps the time of the turn.
             if let Some(Item::User { at, took, .. }) = chat.items.iter_mut().rev().find(|i| matches!(i, Item::User { .. }))
                 && *at > 0
             {
@@ -1650,6 +1697,20 @@ fn avatar_image(id: Option<&'static str>, size: f32) -> gpui::AnyElement {
         Some(id) => image.id(id).into_any_element(),
         None => image.into_any_element(),
     }
+}
+
+/// The progress of the subagents of the current turn, for example "2 of 3 subagents done…",
+/// if one or more work.
+fn delegated_text(items: &[Item]) -> Option<String> {
+    let (done, failed, all) = subagent_counts(items);
+    if done + failed >= all {
+        return None;
+    }
+    Some(match (done, failed) {
+        (0, 0) => format!("Delegated to {}…", plural(all, "subagent", "subagents")),
+        (done, 0) => format!("{done} of {all} subagents done…"),
+        (done, failed) => format!("{done} of {all} subagents done, {failed} failed…"),
+    })
 }
 
 fn status_icon(s: ToolStatus, theme: &Theme) -> gpui::AnyElement {
@@ -2141,23 +2202,21 @@ impl AppView {
                 Some(item) => self.render_item(ix, item, None, cx),
                 None => div().into_any_element(),
             },
-            Some(&Row::Reply { ix, turn, count, open }) => match self.chat.items.get(ix) {
-                Some(item) => self.render_item(ix, item, Some((turn, count, open)), cx),
+            Some(&Row::Reply { ix, turn, open }) => match self.chat.items.get(ix) {
+                Some(item) => self.render_item(ix, item, Some((turn, open)), cx),
                 None => div().into_any_element(),
             },
-            Some(&Row::Steps { turn, count, open }) => h_flex()
-                .id(("steps", turn))
+            Some(&Row::Steps { turn, open }) => h_flex()
                 .ml(px(TAIL_INSET))
                 .mt(px(-8.))
-                .gap_1p5()
-                .flex_none()
-                .self_start()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .cursor_pointer()
-                .child(Icon::new(KitIcon::Layers).size(px(12.)))
-                .child(if open { "Hide the steps".to_string() } else { plural(count, "step", "steps") })
-                .on_click(cx.listener(move |this, _, _, cx| this.toggle_steps(turn, cx)))
+                .child(
+                    Button::new(("steps", turn))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(KitIcon::Layers).text_color(theme.muted_foreground))
+                        .tooltip(if open { "Hide the steps" } else { "Show the steps" })
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_steps(turn, cx))),
+                )
                 .into_any_element(),
             Some(&Row::Working { steps }) => h_flex()
                 .group("working")
@@ -2165,14 +2224,8 @@ impl AppView {
                 .gap_3()
                 .pl(px(TAIL_INSET))
                 .child(typing_bubble(theme))
-                .when_some(self.delegated(), |el, n| {
-                    el.child(
-                        div()
-                            .pb_2()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Delegated to {}…", plural(n, "subagent", "subagents"))),
-                    )
+                .when_some(self.delegated(), |el, text| {
+                    el.child(div().pb_2().text_sm().text_color(theme.muted_foreground).child(text))
                 })
                 .when(self.chat.compaction.is_some(), |el| {
                     el.child(
@@ -2189,23 +2242,15 @@ impl AppView {
         }
     }
 
-    /// The number of subagents that work in the current turn, if one or more work.
-    fn delegated(&self) -> Option<usize> {
-        let items = &self.chat.items;
-        let turn = items.iter().rposition(|i| matches!(i, Item::User { .. })).unwrap_or(0);
-        let n = items[turn..]
-            .iter()
-            .filter(|i| {
-                matches!(i, Item::Tool { kind, status: ToolStatus::Pending | ToolStatus::Running, .. }
-                    if kind == SUBAGENT_KIND)
-            })
-            .count();
-        (n > 0).then_some(n)
+    /// The progress of the subagents of the current turn, if one or more work.
+    fn delegated(&self) -> Option<String> {
+        delegated_text(&self.chat.items)
     }
 
     /// The line below the title of a subagent card: the number of steps of the subagent, and
-    /// while it works, its newest step.
-    fn subagent_line(&self, ix: usize, id: &str, status: ToolStatus, theme: &Theme) -> Div {
+    /// while it works, its newest step. When it stops, the line starts with "Done" or "Failed"
+    /// and tells the time of the subagent.
+    fn subagent_line(&self, ix: usize, id: &str, status: ToolStatus, took: Option<i64>, theme: &Theme) -> Div {
         let mut steps = 0;
         let mut newest = None;
         for item in &self.chat.items[ix + 1..] {
@@ -2216,11 +2261,25 @@ impl AppView {
                 newest = Some(title.clone());
             }
         }
-        let working = matches!(status, ToolStatus::Pending | ToolStatus::Running);
-        let mut text = format!("Subagent · {}", plural(steps, "step", "steps"));
-        if let Some(newest) = newest.filter(|_| working) {
-            text.push_str(" · ");
-            text.push_str(&newest);
+        let (label, color) = match status {
+            ToolStatus::Done => ("Done", theme.success),
+            ToolStatus::Failed => ("Failed", theme.danger),
+            _ => ("Subagent", theme.muted_foreground),
+        };
+        let mut text = format!(" · {}", plural(steps, "step", "steps"));
+        match status {
+            ToolStatus::Pending | ToolStatus::Running => {
+                if let Some(newest) = newest {
+                    text.push_str(" · ");
+                    text.push_str(&newest);
+                }
+            }
+            _ => {
+                if let Some(took) = took {
+                    text.push_str(" · ");
+                    text.push_str(&duration(took));
+                }
+            }
         }
         h_flex()
             .px_3()
@@ -2229,7 +2288,8 @@ impl AppView {
             .pl(px(34.))
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child(div().flex_1().min_w_0().truncate().child(text))
+            .child(div().flex_none().font_medium().text_color(color).child(label))
+            .child(div().flex_1().min_w_0().truncate().whitespace_nowrap().child(text))
     }
 
     /// The button that opens or closes the steps panel for a turn. It shows when the pointer is
@@ -2249,34 +2309,6 @@ impl AppView {
             )
     }
 
-    /// The line under the final reply of a turn, as "Delivered" in Messages: the number of
-    /// steps, the time of the turn, and a link that opens the steps panel.
-    fn receipt(&self, turn: usize, count: usize, open: bool, cx: &mut Context<Self>) -> Div {
-        let theme = cx.theme();
-        let took = match self.chat.items.get(turn) {
-            Some(Item::User { took: Some(took), .. }) => Some(duration(*took)),
-            _ => None,
-        };
-        let text = std::iter::once(plural(count, "step", "steps")).chain(took).collect::<Vec<_>>().join(" · ");
-        h_flex()
-            .pl(px(TAIL_INSET + 4.))
-            .pt_1()
-            .gap_1()
-            .text_xs()
-            .text_color(theme.muted_foreground.opacity(0.75))
-            .child(text)
-            .child("·")
-            .child(
-                div()
-                    .id(("receipt", turn))
-                    .cursor_pointer()
-                    .text_color(if open { theme.foreground } else { theme.muted_foreground })
-                    .hover(|s| s.text_color(theme.foreground))
-                    .child(if open { "Hide work" } else { "Show work" })
-                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_steps(turn, cx))),
-            )
-    }
-
     /// Open or close the output of the tool `key` at the item `ix`, in the chat and in the
     /// steps panel.
     fn toggle_tool(&mut self, ix: usize, key: &str, cx: &mut Context<Self>) {
@@ -2292,13 +2324,13 @@ impl AppView {
         cx.notify();
     }
 
-    /// `steps` has the turn, the number of steps, and the open state, if the item is the final
-    /// reply of a turn that has steps.
+    /// `steps` has the turn and the open state, if the item is the final reply of a turn that
+    /// has steps.
     fn render_item(
         &self,
         ix: usize,
         item: &Item,
-        steps: Option<(usize, usize, bool)>,
+        steps: Option<(usize, bool)>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
@@ -2455,10 +2487,11 @@ impl AppView {
                                     .bg(theme.background),
                             ),
                     )
-                    // The buttons show when the pointer is on the message. They are in a column at
-                    // the right, so the message gets no empty line below it.
+                    // The buttons show when the pointer is on the message. They are at the right,
+                    // so the message gets no empty line below it. The steps button also shows
+                    // while the panel shows the steps of the turn.
                     .child(
-                        div().flex_shrink_0().invisible().group_hover(group, |s| s.visible()).child(
+                        div().flex_shrink_0().invisible().group_hover(group.clone(), |s| s.visible()).child(
                             Button::new(("copy", ix))
                                 .ghost()
                                 .xsmall()
@@ -2468,11 +2501,9 @@ impl AppView {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
                                 }),
                         ),
-                    );
-                match steps {
-                    Some((turn, count, open)) => v_flex().child(row).child(self.receipt(turn, count, open, cx)).into_any_element(),
-                    None => row.into_any_element(),
-                }
+                    )
+                    .when_some(steps, |el, (turn, open)| el.child(self.steps_button(turn, open, group, cx)));
+                row.into_any_element()
             }
             Item::Thought(text) => h_flex()
                 .items_start()
@@ -2489,6 +2520,7 @@ impl AppView {
                 status,
                 detail,
                 files,
+                took,
                 ..
             } => {
                 // A click on the header opens or closes the output. A failed tool starts open.
@@ -2552,7 +2584,7 @@ impl AppView {
                                 )
                             }),
                     )
-                    .when(tool_kind == SUBAGENT_KIND, |el| el.child(self.subagent_line(ix, id, *status, &theme)))
+                    .when(tool_kind == SUBAGENT_KIND, |el| el.child(self.subagent_line(ix, id, *status, *took, &theme)))
                     // The images of the tool always show, for example the screenshots of the agent Mac.
                     .when(!files.is_empty(), |el| {
                         el.child(
@@ -3381,14 +3413,14 @@ mod tests {
     #[test]
     fn a_done_turn_shows_the_final_reply_and_hides_the_steps() {
         let rows = build_rows(&chat(turn(), false), None);
-        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, count: 2, open: false }]);
+        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, open: false }]);
     }
 
     #[test]
     fn open_steps_show_in_the_panel_not_in_the_chat() {
         let chat = chat(turn(), false);
         let rows = build_rows(&chat, Some(0));
-        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, count: 2, open: true }]);
+        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, open: true }]);
         assert_eq!(turn_parts(&chat, 0).steps, [1, 2]);
     }
 
@@ -3404,7 +3436,7 @@ mod tests {
     }
 
     #[test]
-    fn the_receipt_shows_a_short_time() {
+    fn a_time_is_short() {
         assert_eq!(duration(0), "0s");
         assert_eq!(duration(45), "45s");
         assert_eq!(duration(147), "2m 27s");
@@ -3450,11 +3482,44 @@ mod tests {
             detail: None,
             parent: parent.map(Into::into),
             files: Vec::new(),
+            took: None,
+        }
+    }
+
+    fn stop(id: &str, status: ToolStatus) -> Event {
+        Event::ToolUpdate { id: id.into(), title: None, status: Some(status), detail: None, files: Vec::new(), input: None, output: None }
+    }
+
+    fn start(id: &str) -> Event {
+        Event::ToolCall {
+            id: id.into(),
+            title: id.into(),
+            kind: SUBAGENT_KIND.into(),
+            status: ToolStatus::Pending,
+            parent: None,
+            mcp: None,
+            input: None,
         }
     }
 
     #[test]
-    fn a_subagent_card_always_shows_and_holds_its_tool_calls() {
+    fn the_progress_counts_the_subagents_that_stopped() {
+        let mut c = chat(vec![Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None }], true);
+        for id in ["a", "b", "c"] {
+            apply(&mut c, start(id));
+        }
+        assert_eq!(delegated_text(&c.items).as_deref(), Some("Delegated to 3 subagents…"));
+        apply(&mut c, stop("a", ToolStatus::Done));
+        assert_eq!(delegated_text(&c.items).as_deref(), Some("1 of 3 subagents done…"));
+        apply(&mut c, stop("b", ToolStatus::Failed));
+        assert_eq!(delegated_text(&c.items).as_deref(), Some("1 of 3 subagents done, 1 failed…"));
+        apply(&mut c, stop("c", ToolStatus::Done));
+        assert_eq!(delegated_text(&c.items), None);
+        assert!(matches!(&c.items[1], Item::Tool { took: Some(t), .. } if (0..=2).contains(t)));
+    }
+
+    #[test]
+    fn a_subagent_is_a_step_and_holds_its_tool_calls() {
         let items = vec![
             Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None },
             tool("task", SUBAGENT_KIND, None),
@@ -3464,12 +3529,12 @@ mod tests {
         ];
         let chat_done = chat(items, false);
         let rows = build_rows(&chat_done, None);
-        assert!(rows == [Row::Item(0), Row::Item(1), Row::Reply { ix: 4, turn: 0, count: 1, open: false }]);
-        assert_eq!(turn_parts(&chat_done, 0).steps, [3]);
+        assert!(rows == [Row::Item(0), Row::Reply { ix: 4, turn: 0, open: false }]);
+        assert_eq!(turn_parts(&chat_done, 0).steps, [1, 3]);
         let mut items = vec![Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None }, tool("task", SUBAGENT_KIND, None)];
         items.push(tool("read", "read", Some("task")));
         let rows = build_rows(&chat(items, true), Some(0));
-        assert!(rows == [Row::Item(0), Row::Item(1), Row::Working { steps: None }]);
+        assert!(rows == [Row::Item(0), Row::Working { steps: Some((0, true)) }]);
     }
 
     #[test]

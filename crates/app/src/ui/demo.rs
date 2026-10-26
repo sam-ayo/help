@@ -65,7 +65,16 @@ fn child(id: &str, title: &str, kind: &str, status: ToolStatus, detail: Option<&
         detail: detail.map(Into::into),
         parent: parent.map(Into::into),
         files: Vec::new(),
+        took: None,
     }
+}
+
+/// A subagent card that took `secs` seconds.
+fn took(mut item: Item, secs: i64) -> Item {
+    if let Item::Tool { took, .. } = &mut item {
+        *took = Some(secs);
+    }
+    item
 }
 
 /// A message from the user, `ago` minutes before now. Its turn took 1m 27s.
@@ -137,10 +146,10 @@ pub fn chat() -> Chat {
         Item::Agent("The test passed 50 times in a row. The fix is in `tests/login.spec.ts`.".into()),
         user("Find where the app reads its settings, and check the docs for each option.", 50),
         Item::Agent("I will delegate this to two subagents: one reads the code, and one reads the docs.".into()),
-        tool("s1", "Find where the settings are read", acp_host::SUBAGENT_KIND, ToolStatus::Done, Some("The settings are read in `src/config.ts`.")),
+        took(tool("s1", "Find where the settings are read", acp_host::SUBAGENT_KIND, ToolStatus::Done, Some("The settings are read in `src/config.ts`.")), 80),
         child("s1a", "Search for \"settings\" in src/", "search", ToolStatus::Done, None, Some("s1")),
         child("s1b", "Read src/config.ts", "read", ToolStatus::Done, None, Some("s1")),
-        tool("s2", "Check the docs for each option", acp_host::SUBAGENT_KIND, ToolStatus::Done, Some("All 6 options have docs.")),
+        took(tool("s2", "Check the docs for each option", acp_host::SUBAGENT_KIND, ToolStatus::Done, Some("All 6 options have docs.")), 42),
         child("s2a", "Read docs/settings.md", "read", ToolStatus::Done, None, Some("s2")),
         Item::Agent("The app reads its settings in `src/config.ts`. The docs cover all 6 options.".into()),
         user("Add a dark mode switch to the settings page. Keep the choice in local storage.", 2),

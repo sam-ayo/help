@@ -2,7 +2,7 @@
 //! calls, the plans, and the text of the agent before the final reply. The chat does not show
 //! the steps, so the reply stays near the message of the user. See `turn_parts`.
 
-use acp_host::ToolStatus;
+use acp_host::{SUBAGENT_KIND, ToolStatus};
 use gpui::{
     AppContext as _, Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _,
     StyleRefinement, Styled as _, Window, div, prelude::FluentBuilder as _, px,
@@ -289,7 +289,7 @@ impl AppView {
                 .text_sm()
                 .child(TextView::markdown(self.text_id(ix), SharedString::from(text.clone())).style(message_style()).selectable(true))
                 .into_any_element(),
-            Item::Tool { id, title, kind, status, detail, files, .. } => {
+            Item::Tool { id, title, kind, status, detail, files, .. } if kind != SUBAGENT_KIND => {
                 let open = detail.is_some() && (self.toggled_tools.contains(id) != (*status == ToolStatus::Failed));
                 let (verb, subject) = step_title(kind, title);
                 let mono = kind.eq_ignore_ascii_case("execute");
@@ -396,7 +396,9 @@ impl AppView {
                 .child(Icon::new(KitIcon::Brain).size(px(13.)).mt_0p5())
                 .child(div().flex_1().min_w_0().child(text.clone()))
                 .into_any_element(),
-            // A plan is a card in the list. The chat card has a margin for the tail of the bubbles.
+            // A plan or a subagent is a card in the list. The card of a subagent has its state, its
+            // number of steps, and its time, and a click on it opens its reply. The chat card has
+            // a margin for the tail of the bubbles.
             item => div()
                 .ml(px(INDENT))
                 .pl_3()
@@ -431,6 +433,7 @@ fn phase_label(phase: usize, kinds: &[&str], working: bool) -> String {
             "edit" | "delete" | "move" => ("edit", "edits"),
             "execute" => ("command", "commands"),
             "think" => ("thought", "thoughts"),
+            SUBAGENT_KIND => ("subagent", "subagents"),
             _ => ("tool", "tools"),
         };
         match counts.iter_mut().find(|(o, _, _)| *o == one) {
@@ -489,6 +492,7 @@ mod tests {
     fn labels_phases() {
         assert_eq!(phase_label(0, &["Search", "Search", "Fetch"], false), "Phase 1 · 2 searches · 1 page");
         assert_eq!(phase_label(2, &[], true), "Phase 3 · Working");
+        assert_eq!(phase_label(0, &["subagent", "subagent"], false), "Phase 1 · 2 subagents");
     }
 
     #[test]
