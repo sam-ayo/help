@@ -432,6 +432,7 @@ impl AppView {
         self.close_doc(cx);
         if !same {
             self.close_app(cx);
+            self.close_steps(cx);
             // A hover on the link made the document and its editor already. The file can
             // change after the hover, and then the app reads it again.
             let mut doc = self
@@ -595,10 +596,25 @@ impl AppView {
             .shadow_md()
             .child(header)
             .child(body);
-        // The left edge of the panel. A drag of it changes the width. The panel keeps
-        // `MIN_PANEL`, and the conversation keeps its minimum width.
+        Some(self.side_panel("doc-panel", self.doc_width, WIDTH, |this, w| this.doc_width = w, card, window, cx))
+    }
+
+    /// A panel at the right side of the window, inset from the window edges, as the sidebar
+    /// is. A drag of its left edge changes the width with `set`. The panel keeps `MIN_PANEL`,
+    /// and the conversation keeps its minimum width. A double click gives back `default`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn side_panel(
+        &self,
+        id: &'static str,
+        width: f32,
+        default: f32,
+        set: fn(&mut AppView, f32),
+        card: impl IntoElement,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let edge = div()
-            .id("doc-edge")
+            .id((id, 0usize))
             .absolute()
             .left_0()
             .top_0()
@@ -606,32 +622,29 @@ impl AppView {
             .w(px(INSET))
             .cursor_col_resize()
             .on_drag(Resize, |drag, _, _, cx| cx.new(|_| drag.clone()))
-            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
-                // A double click gives the panel its first width again.
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 if event.click_count() == 2 {
-                    this.doc_width = WIDTH;
+                    set(this, default);
                     cx.notify();
                 }
             }));
         let room = self.panel_room(window);
-        Some(
-            div()
-                .id("doc-panel")
-                .relative()
-                .w(px((self.doc_width + INSET * 2.).min(room)))
-                .h_full()
-                .flex_shrink_0()
-                .p(px(INSET))
-                .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<Resize>, window, cx| {
-                    let right = f32::from(window.viewport_size().width) - INSET;
-                    let width = right - f32::from(event.event.position.x);
-                    this.doc_width = width.min(room - INSET * 2.).max(MIN_PANEL);
-                    cx.notify();
-                }))
-                .child(card)
-                .child(edge)
-                .into_any_element(),
-        )
+        div()
+            .id(id)
+            .relative()
+            .w(px((width + INSET * 2.).min(room)))
+            .h_full()
+            .flex_shrink_0()
+            .p(px(INSET))
+            .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<Resize>, window, cx| {
+                let right = f32::from(window.viewport_size().width) - INSET;
+                let width = right - f32::from(event.event.position.x);
+                set(this, width.min(room - INSET * 2.).max(MIN_PANEL));
+                cx.notify();
+            }))
+            .child(card)
+            .child(edge)
+            .into_any_element()
     }
 }
 

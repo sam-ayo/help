@@ -68,9 +68,9 @@ fn child(id: &str, title: &str, kind: &str, status: ToolStatus, detail: Option<&
     }
 }
 
-/// A message from the user, `ago` minutes before now.
+/// A message from the user, `ago` minutes before now. Its turn took 1m 27s.
 fn user(text: &str, ago: i64) -> Item {
-    Item::User { text: text.into(), at: chrono::Utc::now().timestamp() - ago * 60, attachments: Vec::new() }
+    Item::User { text: text.into(), at: chrono::Utc::now().timestamp() - ago * 60, attachments: Vec::new(), took: Some(87) }
 }
 
 /// A sample document for the long reply of the demo. See `doc::links`.
@@ -412,6 +412,7 @@ fn worst(home: &str) -> Chat {
                 image_file(&dir, "tall-screenshot.png", 200, 4000),
                 image_file(&dir, "panorama.png", 4000, 200),
             ],
+            took: None,
         },
         Item::Agent("Done.".into()),
         // An unbreakable URL and email, Markdown characters, and HTML.

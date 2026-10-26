@@ -391,6 +391,7 @@ impl AppView {
         }
         self.close_app(cx);
         self.close_doc(cx);
+        self.close_steps(cx);
         self.panel_generation += 1;
         self.panel = Some(Panel {
             tool_id,

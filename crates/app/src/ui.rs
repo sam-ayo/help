@@ -38,6 +38,7 @@ mod dock;
 mod history;
 mod mcp_app;
 mod memory;
+mod steps;
 
 gpui::actions!(help, [StopAgent, ToggleSidebar]);
 
@@ -46,8 +47,9 @@ const MCP_POLL: Duration = Duration::from_secs(3);
 
 enum Item {
     /// `at` is the time that the user sent the message, in seconds since 1970, or 0 if the
-    /// time is not known. `attachments` has the files that the user attached.
-    User { text: String, at: i64, attachments: Vec<Attachment> },
+    /// time is not known. `attachments` has the files that the user attached. `took` is the
+    /// time of the turn in seconds, when the turn ended and the time is known.
+    User { text: String, at: i64, attachments: Vec<Attachment>, took: Option<i64> },
     Agent(String),
     /// Images and other files that the agent sent in its message.
     AgentFiles(Vec<Attachment>),
@@ -192,8 +194,10 @@ pub struct AppView {
     /// The tool cards that the user opened or closed, by tool id. A card for a failed tool
     /// starts open. The other cards start closed.
     toggled_tools: HashSet<String>,
-    /// The turns that show their steps, by the index of the user message of the turn.
-    open_steps: HashSet<usize>,
+    /// The steps of a turn, at the right side of the window. See `steps`.
+    steps: Option<steps::Steps>,
+    /// The width of the steps panel. The user changes it with a drag of the left edge.
+    steps_width: f32,
     /// The files where the agent reads its MCP servers. See `poll_mcp_config`.
     mcp_watch: Option<McpConfigWatch>,
     /// The MCP connections of the app, for MCP Apps, with the agent and the folder that they
@@ -276,7 +280,7 @@ impl AppView {
             let items = Thread::Main.load(&env);
             Chat::new(load_agent(&env.agent_file), items, cwd)
         };
-        let rows = build_rows(&chat, &HashSet::new());
+        let rows = build_rows(&chat, None);
         let count = rows.len();
         let scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
         let (app_messages, app_inbox) = async_channel::unbounded::<(u64, String)>();
@@ -307,7 +311,8 @@ impl AppView {
             drag_pending: false,
             sidebar_open: true,
             toggled_tools: HashSet::new(),
-            open_steps: HashSet::new(),
+            steps: None,
+            steps_width: steps::WIDTH,
             mcp_watch: None,
             apps: None,
             panel: None,
@@ -589,7 +594,7 @@ impl AppView {
             return Ok(());
         }
         if demo::live() {
-            self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments });
+            self.chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments, took: None });
             self.chat.busy = true;
             self.scroll_to_end(cx);
             cx.notify();
@@ -731,7 +736,7 @@ impl AppView {
         }
         session.send(Command::Prompt { text: prompt, attachments: attachments.clone() });
         chat.primed = true;
-        chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments });
+        chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments, took: None });
         chat.busy = true;
         self.scroll_to_end(cx);
         self.save(cx);
@@ -875,7 +880,7 @@ impl AppView {
     /// Make the rows again, and measure again only the rows from the row of the item `item`.
     /// The rows above keep their heights, so the text above does not move while the user reads.
     fn rows_changed_from(&mut self, item: usize, cx: &mut Context<Self>) {
-        let rows = build_rows(&self.chat, &self.open_steps);
+        let rows = build_rows(&self.chat, self.steps.as_ref().map(|s| s.turn));
         let old = std::mem::replace(&mut self.rows, rows);
         let rows = &self.rows;
         let same = old.iter().zip(rows).take_while(|(a, b)| a == b).count();
@@ -891,15 +896,7 @@ impl AppView {
                 s.remeasure_items(from..rows.len(), cx);
             }
         });
-    }
-
-    /// Show or hide the steps of the turn that starts at the user message `turn`.
-    fn toggle_steps(&mut self, turn: usize, cx: &mut Context<Self>) {
-        if !self.open_steps.remove(&turn) {
-            self.open_steps.insert(turn);
-        }
-        self.rows_changed(cx);
-        cx.notify();
+        self.steps_changed(item, cx);
     }
 
     /// Show the end of the conversation, and follow the new text again.
@@ -955,9 +952,9 @@ impl AppView {
         self.chat = Chat::new(self.chat.kind, thread.load(&self.env), self.chat.cwd.clone());
         self.chat.generation = generation;
         self.toggled_tools.clear();
-        self.open_steps.clear();
+        self.steps = None;
         // The rows of the old thread are not in the new thread, so the scroller starts again.
-        self.rows = build_rows(&self.chat, &self.open_steps);
+        self.rows = build_rows(&self.chat, None);
         let count = self.rows.len();
         self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
         self.connect(None, cx);
@@ -970,6 +967,8 @@ impl AppView {
     fn sidebar_shows(&self, window: &Window) -> bool {
         let panel = if self.doc.is_some() {
             self.doc_width + INSET * 2.
+        } else if self.steps.is_some() {
+            self.steps_width + INSET * 2.
         } else if self.panel.is_some() {
             mcp_app::PANEL
         } else {
@@ -992,6 +991,7 @@ impl AppView {
         if self.sidebar_open && !self.sidebar_shows(window) {
             self.close_doc(cx);
             self.close_app(cx);
+            self.close_steps(cx);
         } else {
             self.sidebar_open = !self.sidebar_open;
         }
@@ -1009,8 +1009,8 @@ impl AppView {
         self.chat = data.chat();
         self.attachments = data.composer_files();
         self.toggled_tools.clear();
-        self.open_steps.clear();
-        self.rows = build_rows(&self.chat, &self.open_steps);
+        self.steps = None;
+        self.rows = build_rows(&self.chat, None);
         let count = self.rows.len();
         self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
         self.load_app_servers(cx);
@@ -1080,9 +1080,9 @@ impl AppView {
 enum Row {
     /// The item at this index.
     Item(usize),
-    /// The final reply of a turn that has steps. The reply has the button that shows or hides
-    /// the steps. `turn` is the index of the user message of the turn.
-    Reply { ix: usize, turn: usize, open: bool },
+    /// The final reply of a turn that has `count` steps. The receipt under the reply opens the
+    /// steps. `turn` is the index of the user message of the turn.
+    Reply { ix: usize, turn: usize, count: usize, open: bool },
     /// The line at the end of a turn that has steps but no reply, for example a turn that
     /// the user stopped.
     Steps { turn: usize, count: usize, open: bool },
@@ -1243,17 +1243,74 @@ fn more_below(scroll: &gpui::ScrollHandle) -> bool {
     max > px(1.) && -scroll.offset().y < max - px(1.)
 }
 
+/// A time in seconds, in short words: "45s", "2m 27s", "1h 5m".
+fn duration(secs: i64) -> String {
+    match secs {
+        ..60 => format!("{}s", secs.max(0)),
+        60..3600 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, secs % 3600 / 60),
+    }
+}
+
 /// Count `n` of a thing: "1 step", "2 steps".
 fn plural(n: usize, one: &str, many: &str) -> String {
     if n == 1 { format!("1 {one}") } else { format!("{n} {many}") }
 }
 
-/// A turn shows the user message, the final reply of the agent, and the errors and notices.
-/// The other items of the turn are steps: thoughts, tools, plans, and the text of the agent
-/// before the final reply. The steps show only when the user opens them. The button that opens
-/// them shows only when the pointer is on the reply. While the agent works, all of its text is
-/// a step.
-fn build_rows(chat: &Chat, open_steps: &HashSet<usize>) -> Vec<Row> {
+/// The parts of the turn that starts at the user message `turn`. See `turn_parts`.
+struct TurnParts {
+    /// The index after the last item of the turn.
+    end: usize,
+    /// The final reply. A turn that runs has no final reply yet.
+    reply: Option<usize>,
+    /// The items that the chat shows, after the user message. The final reply is one of them.
+    shown: Vec<usize>,
+    /// The thoughts, tools, plans, and the text of the agent before the final reply. They
+    /// show in the steps panel. See `steps`.
+    steps: Vec<usize>,
+}
+
+/// A turn shows the user message, the final reply of the agent, the subagent cards, and the
+/// errors and notices. The other items of the turn are steps: thoughts, tools, plans, and the
+/// text of the agent before the final reply. While the agent works, all of its text is a step.
+fn turn_parts(chat: &Chat, turn: usize) -> TurnParts {
+    let items = &chat.items;
+    let end = items[turn + 1..]
+        .iter()
+        .position(|i| matches!(i, Item::User { .. }))
+        .map_or(items.len(), |n| turn + 1 + n);
+    let working = end == items.len() && chat.busy;
+    let reply = if working {
+        None
+    } else {
+        (turn + 1..end).rev().find(|&i| matches!(items[i], Item::Agent(_)))
+    };
+    // The card of a subagent shows the tool calls of the subagent, so they show nowhere else.
+    let subagents: HashSet<&str> = items[turn + 1..end]
+        .iter()
+        .filter_map(|i| match i {
+            Item::Tool { id, kind, .. } if kind == SUBAGENT_KIND => Some(id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut parts = TurnParts { end, reply, shown: Vec::new(), steps: Vec::new() };
+    for (i, item) in items.iter().enumerate().take(end).skip(turn + 1) {
+        match item {
+            Item::Tool { parent: Some(p), .. } if subagents.contains(p.as_str()) => {}
+            // The subagent cards always show, so the user sees that the agent delegated work.
+            Item::Tool { kind, .. } if kind == SUBAGENT_KIND => parts.shown.push(i),
+            Item::Notice(_) | Item::Error(_) | Item::Compacted | Item::AgentFiles(_) => parts.shown.push(i),
+            _ if Some(i) == reply => parts.shown.push(i),
+            _ => parts.steps.push(i),
+        }
+    }
+    parts
+}
+
+/// The chat rows of each turn. See `turn_parts`. The steps show in the panel, not in the chat.
+/// `steps_turn` is the turn that the panel shows. The button that opens the panel shows only
+/// when the pointer is on the reply, or while the panel shows the steps of the turn.
+fn build_rows(chat: &Chat, steps_turn: Option<usize>) -> Vec<Row> {
     let items = &chat.items;
     let mut rows = Vec::new();
     let mut working_steps = None;
@@ -1265,53 +1322,25 @@ fn build_rows(chat: &Chat, open_steps: &HashSet<usize>) -> Vec<Row> {
             continue;
         }
         let turn = ix;
-        let end = items[turn + 1..]
-            .iter()
-            .position(|i| matches!(i, Item::User { .. }))
-            .map_or(items.len(), |n| turn + 1 + n);
-        let working = end == items.len() && chat.busy;
-        let reply = if working {
-            None
-        } else {
-            (turn + 1..end).rev().find(|&i| matches!(items[i], Item::Agent(_)))
-        };
-        // The card of a subagent shows the tool calls of the subagent, so they get no rows.
-        let subagents: HashSet<&str> = items[turn + 1..end]
-            .iter()
-            .filter_map(|i| match i {
-                Item::Tool { id, kind, .. } if kind == SUBAGENT_KIND => Some(id.as_str()),
-                _ => None,
-            })
-            .collect();
-        let in_card = |i: usize| matches!(&items[i], Item::Tool { parent: Some(p), .. } if subagents.contains(p.as_str()));
-        // The subagent cards always show, so the user sees that the agent delegated work.
-        let is_step = |i: usize| {
-            Some(i) != reply
-                && !in_card(i)
-                && !matches!(&items[i], Item::Tool { kind, .. } if kind == SUBAGENT_KIND)
-                && !matches!(items[i], Item::Notice(_) | Item::Error(_) | Item::Compacted | Item::AgentFiles(_))
-        };
-        let count = (turn + 1..end).filter(|&i| is_step(i)).count();
-        let open = open_steps.contains(&turn);
+        let parts = turn_parts(chat, turn);
+        let count = parts.steps.len();
+        let open = steps_turn == Some(turn);
         rows.push(Row::Item(turn));
-        for i in turn + 1..end {
-            if in_card(i) {
-                continue;
-            }
-            if count > 0 && Some(i) == reply {
-                rows.push(Row::Reply { ix: i, turn, open });
-            } else if open || !is_step(i) {
+        for &i in &parts.shown {
+            if count > 0 && Some(i) == parts.reply {
+                rows.push(Row::Reply { ix: i, turn, count, open });
+            } else {
                 rows.push(Row::Item(i));
             }
         }
         if count > 0 {
-            if working {
+            if parts.end == items.len() && chat.busy {
                 working_steps = Some((turn, open));
-            } else if reply.is_none() {
+            } else if parts.reply.is_none() {
                 rows.push(Row::Steps { turn, count, open });
             }
         }
-        ix = end;
+        ix = parts.end;
     }
     if chat.busy && chat.permission.is_none() {
         rows.push(Row::Working { steps: working_steps });
@@ -1444,6 +1473,12 @@ fn apply(chat: &mut Chat, event: Event) {
         }
         Event::TurnEnded(reason) => {
             chat.busy = false;
+            // The receipt under the reply shows the time of the turn.
+            if let Some(Item::User { at, took, .. }) = chat.items.iter_mut().rev().find(|i| matches!(i, Item::User { .. }))
+                && *at > 0
+            {
+                *took = Some((chrono::Utc::now().timestamp() - *at).max(0));
+            }
             // The user stops a turn on purpose, so a "Cancelled" notice tells them nothing new.
             if reason != "EndTurn" && reason != "Cancelled" {
                 chat.items.push(Item::Notice(format!("Turn ended: {reason}")));
@@ -1632,8 +1667,9 @@ fn status_icon(s: ToolStatus, theme: &Theme) -> gpui::AnyElement {
     }
 }
 
+/// The agents send the kind with a capital letter ("Execute") or without one ("execute").
 fn tool_icon(kind: &str) -> KitIcon {
-    match kind {
+    match kind.to_ascii_lowercase().as_str() {
         "read" => KitIcon::FileText,
         "edit" | "delete" | "move" => KitIcon::Pencil,
         "search" => KitIcon::Search,
@@ -2099,8 +2135,8 @@ impl AppView {
                 Some(item) => self.render_item(ix, item, None, cx),
                 None => div().into_any_element(),
             },
-            Some(&Row::Reply { ix, turn, open }) => match self.chat.items.get(ix) {
-                Some(item) => self.render_item(ix, item, Some((turn, open)), cx),
+            Some(&Row::Reply { ix, turn, count, open }) => match self.chat.items.get(ix) {
+                Some(item) => self.render_item(ix, item, Some((turn, count, open)), cx),
                 None => div().into_any_element(),
             },
             Some(&Row::Steps { turn, count, open }) => h_flex()
@@ -2190,8 +2226,8 @@ impl AppView {
             .child(div().flex_1().min_w_0().truncate().child(text))
     }
 
-    /// The button that shows or hides the steps of a turn. It shows when the pointer is on the
-    /// `group` element, and always while the steps show.
+    /// The button that opens or closes the steps panel for a turn. It shows when the pointer is
+    /// on the `group` element, and always while the panel shows the steps of the turn.
     fn steps_button(&self, turn: usize, open: bool, group: impl Into<SharedString>, cx: &mut Context<Self>) -> gpui::Div {
         let theme = cx.theme();
         div()
@@ -2207,18 +2243,61 @@ impl AppView {
             )
     }
 
-    /// `steps` has the turn and the open state, if the item is the final reply of a turn
-    /// that has steps.
+    /// The line under the final reply of a turn, as "Delivered" in Messages: the number of
+    /// steps, the time of the turn, and a link that opens the steps panel.
+    fn receipt(&self, turn: usize, count: usize, open: bool, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let took = match self.chat.items.get(turn) {
+            Some(Item::User { took: Some(took), .. }) => Some(duration(*took)),
+            _ => None,
+        };
+        let text = std::iter::once(plural(count, "step", "steps")).chain(took).collect::<Vec<_>>().join(" · ");
+        h_flex()
+            .pl(px(TAIL_INSET + 4.))
+            .pt_1()
+            .gap_1()
+            .text_xs()
+            .text_color(theme.muted_foreground.opacity(0.75))
+            .child(text)
+            .child("·")
+            .child(
+                div()
+                    .id(("receipt", turn))
+                    .cursor_pointer()
+                    .text_color(if open { theme.foreground } else { theme.muted_foreground })
+                    .hover(|s| s.text_color(theme.foreground))
+                    .child(if open { "Hide work" } else { "Show work" })
+                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_steps(turn, cx))),
+            )
+    }
+
+    /// Open or close the output of the tool `key` at the item `ix`, in the chat and in the
+    /// steps panel.
+    fn toggle_tool(&mut self, ix: usize, key: &str, cx: &mut Context<Self>) {
+        if !self.toggled_tools.remove(key) {
+            self.toggled_tools.insert(key.to_string());
+        }
+        if let Some(row) = self.rows.iter().position(|r| *r == Row::Item(ix)) {
+            self.scroller.update(cx, |s, cx| {
+                s.remeasure_items(row..row + 1, cx);
+            });
+        }
+        self.remeasure_step(ix, cx);
+        cx.notify();
+    }
+
+    /// `steps` has the turn, the number of steps, and the open state, if the item is the final
+    /// reply of a turn that has steps.
     fn render_item(
         &self,
         ix: usize,
         item: &Item,
-        steps: Option<(usize, bool)>,
+        steps: Option<(usize, usize, bool)>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         match item {
-            Item::User { text, at, attachments } => {
+            Item::User { text, at, attachments, .. } => {
                 let prev = self.chat.items[..ix].iter().rev().find_map(|i| match i {
                     Item::User { at, .. } => Some(*at),
                     _ => None,
@@ -2321,7 +2400,7 @@ impl AppView {
                     });
                 let hovered = self.reply_hover == Some(ix) || self.doc_button_hover.is_some_and(|(r, _)| r == ix);
                 let first_doc = docs.first().cloned();
-                h_flex()
+                let row = h_flex()
                     .id(("agent-message", ix))
                     .group(group.clone())
                     .on_hover(cx.listener(move |this, hover: &bool, _, cx| {
@@ -2372,7 +2451,6 @@ impl AppView {
                     )
                     // The buttons show when the pointer is on the message. They are in a column at
                     // the right, so the message gets no empty line below it.
-                    .when_some(steps, |el, (turn, open)| el.child(self.steps_button(turn, open, group.clone(), cx)))
                     .child(
                         div().flex_shrink_0().invisible().group_hover(group, |s| s.visible()).child(
                             Button::new(("copy", ix))
@@ -2384,8 +2462,11 @@ impl AppView {
                                     cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy.clone()))
                                 }),
                         ),
-                    )
-                    .into_any_element()
+                    );
+                match steps {
+                    Some((turn, count, open)) => v_flex().child(row).child(self.receipt(turn, count, open, cx)).into_any_element(),
+                    None => row.into_any_element(),
+                }
             }
             Item::Thought(text) => h_flex()
                 .items_start()
@@ -2423,17 +2504,7 @@ impl AppView {
                             .when(detail.is_some(), |el| {
                                 el.cursor_pointer()
                                     .hover(|el| el.bg(theme.foreground.opacity(0.03)))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if !this.toggled_tools.remove(&key) {
-                                            this.toggled_tools.insert(key.clone());
-                                        }
-                                        if let Some(row) = this.rows.iter().position(|r| *r == Row::Item(ix)) {
-                                            this.scroller.update(cx, |s, cx| {
-                                                s.remeasure_items(row..row + 1, cx);
-                                            });
-                                        }
-                                        cx.notify();
-                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| this.toggle_tool(ix, &key, cx)))
                             })
                             // A long title, such as a command, is cut. The tooltip has all of it.
                             .when(title.chars().count() > LONG_TITLE, |el| {
@@ -3117,12 +3188,16 @@ impl AppView {
         let sidebar = self.sidebar_shows(window);
         let app_panel = self.render_panel(window, cx);
         let doc_panel = self.render_doc(window, cx);
+        let steps_panel = self.render_steps(window, cx);
         // The things that change the width of the conversation. See `text_id`.
         self.text_layout = (
             f32::from(window.viewport_size().width) as i32,
             self.sidebar_open,
             if self.doc.is_some() {
                 self.doc_width as i32
+            } else if self.steps.is_some() {
+                // The text in the steps panel also wraps at this width.
+                self.steps_width as i32
             } else {
                 i32::from(self.panel.is_some())
             },
@@ -3249,6 +3324,7 @@ impl AppView {
             )
             .children(app_panel)
             .children(doc_panel)
+            .children(steps_panel)
     }
 }
 
@@ -3264,7 +3340,7 @@ mod tests {
 
     fn turn() -> Vec<Item> {
         vec![
-            Item::User { text: "hi".into(), at: 0, attachments: Vec::new() },
+            Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None },
             Item::Thought("hmm".into()),
             Item::Agent("Let me look.".into()),
             Item::Error("oops".into()),
@@ -3295,15 +3371,43 @@ mod tests {
 
     #[test]
     fn a_done_turn_shows_the_final_reply_and_hides_the_steps() {
-        let rows = build_rows(&chat(turn(), false), &HashSet::new());
-        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, open: false }]);
+        let rows = build_rows(&chat(turn(), false), None);
+        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, count: 2, open: false }]);
     }
 
     #[test]
-    fn open_steps_show_all_items() {
-        let rows = build_rows(&chat(turn(), false), &HashSet::from([0]));
-        let reply = Row::Reply { ix: 4, turn: 0, open: true };
-        assert!(rows == [Row::Item(0), Row::Item(1), Row::Item(2), Row::Item(3), reply]);
+    fn open_steps_show_in_the_panel_not_in_the_chat() {
+        let chat = chat(turn(), false);
+        let rows = build_rows(&chat, Some(0));
+        assert!(rows == [Row::Item(0), Row::Item(3), Row::Reply { ix: 4, turn: 0, count: 2, open: true }]);
+        assert_eq!(turn_parts(&chat, 0).steps, [1, 2]);
+    }
+
+    #[test]
+    fn a_working_turn_puts_all_agent_text_in_the_steps() {
+        let mut items = turn();
+        items.push(Item::User { text: "again".into(), at: 0, attachments: Vec::new(), took: None });
+        items.push(Item::Agent("Sure.".into()));
+        let chat = chat(items, true);
+        assert_eq!(turn_parts(&chat, 0).steps, [1, 2]);
+        let parts = turn_parts(&chat, 5);
+        assert!(parts.reply.is_none() && parts.steps == [6] && parts.shown.is_empty());
+    }
+
+    #[test]
+    fn the_receipt_shows_a_short_time() {
+        assert_eq!(duration(0), "0s");
+        assert_eq!(duration(45), "45s");
+        assert_eq!(duration(147), "2m 27s");
+        assert_eq!(duration(3_900), "1h 5m");
+    }
+
+    #[test]
+    fn a_turn_keeps_its_time_when_it_ends() {
+        let at = chrono::Utc::now().timestamp() - 30;
+        let mut c = chat(vec![Item::User { text: "hi".into(), at, attachments: Vec::new(), took: None }], true);
+        apply(&mut c, Event::TurnEnded("EndTurn".into()));
+        assert!(matches!(c.items[0], Item::User { took: Some(t), .. } if (30..=32).contains(&t)));
     }
 
     #[test]
@@ -3343,23 +3447,25 @@ mod tests {
     #[test]
     fn a_subagent_card_always_shows_and_holds_its_tool_calls() {
         let items = vec![
-            Item::User { text: "hi".into(), at: 0, attachments: Vec::new() },
+            Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None },
             tool("task", SUBAGENT_KIND, None),
             tool("read", "read", Some("task")),
             tool("ls", "execute", None),
             Item::Agent("Done.".into()),
         ];
-        let rows = build_rows(&chat(items, false), &HashSet::new());
-        assert!(rows == [Row::Item(0), Row::Item(1), Row::Reply { ix: 4, turn: 0, open: false }]);
-        let mut items = vec![Item::User { text: "hi".into(), at: 0, attachments: Vec::new() }, tool("task", SUBAGENT_KIND, None)];
+        let chat_done = chat(items, false);
+        let rows = build_rows(&chat_done, None);
+        assert!(rows == [Row::Item(0), Row::Item(1), Row::Reply { ix: 4, turn: 0, count: 1, open: false }]);
+        assert_eq!(turn_parts(&chat_done, 0).steps, [3]);
+        let mut items = vec![Item::User { text: "hi".into(), at: 0, attachments: Vec::new(), took: None }, tool("task", SUBAGENT_KIND, None)];
         items.push(tool("read", "read", Some("task")));
-        let rows = build_rows(&chat(items, true), &HashSet::from([0]));
+        let rows = build_rows(&chat(items, true), Some(0));
         assert!(rows == [Row::Item(0), Row::Item(1), Row::Working { steps: None }]);
     }
 
     #[test]
     fn a_working_turn_hides_all_agent_text() {
-        let rows = build_rows(&chat(turn(), true), &HashSet::new());
+        let rows = build_rows(&chat(turn(), true), None);
         assert!(rows == [Row::Item(0), Row::Item(3), Row::Working { steps: Some((0, false)) }]);
     }
 }
