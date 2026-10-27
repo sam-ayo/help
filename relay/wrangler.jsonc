@@ -1,0 +1,16 @@
+// The relay between the phones and the laptops. See `src/index.ts`.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "help-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "durable_objects": {
+    "bindings": [{ "name": "LAPTOP", "class_name": "Laptop" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Laptop"] }],
+  // The WebSocket connections from one IP address, before the relay sends them to a laptop.
+  "ratelimits": [
+    { "name": "CONNECTIONS", "namespace_id": "1001", "simple": { "limit": 60, "period": 60 } }
+  ]
+}
