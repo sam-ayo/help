@@ -1,0 +1,19 @@
+{
+  "name": "help-pwa",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/noise.test.ts test/pairing.test.ts",
+    "test:interop": "cargo build --manifest-path ../desktop/Cargo.toml -p remote --example noise_peer && node --test test/interop.test.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2"
+  }
+}
