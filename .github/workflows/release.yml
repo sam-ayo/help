@@ -18,7 +18,7 @@
 #
 # The message of an annotated tag becomes the release notes, which the update alert shows.
 #
-# The tag sets the version. The build writes it into Cargo.toml before it compiles, so
+# The tag sets the version. The build writes it into desktop/Cargo.toml before it compiles, so
 # Cargo.toml in the repository does not need a change.
 
 name: Release
@@ -34,6 +34,10 @@ jobs:
   release:
     # An Apple silicon runner. Help runs only on Apple silicon.
     runs-on: macos-15
+    # The desktop app is in desktop/. The PWA and the relay are in other folders.
+    defaults:
+      run:
+        working-directory: desktop
     steps:
       - uses: actions/checkout@v5
 
@@ -45,6 +49,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release
+          workspaces: desktop -> target
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Compile
