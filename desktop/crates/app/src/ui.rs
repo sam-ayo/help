@@ -38,6 +38,7 @@ mod dock;
 mod history;
 mod mcp_app;
 mod memory;
+mod phone;
 mod steps;
 
 gpui::actions!(help, [StopAgent, ToggleSidebar, ExitFullView]);
@@ -87,6 +88,8 @@ struct Queued {
 }
 
 struct PendingPermission {
+    /// The number of the request, for the phones. See `phone`.
+    request: u64,
     title: String,
     options: Vec<PermissionOptionView>,
     reply: oneshot::Sender<Option<String>>,
@@ -121,6 +124,8 @@ struct Chat {
     /// The time that each subagent in this run of the app started, in seconds since 1970, by
     /// tool call ID.
     subagent_starts: HashMap<String, i64>,
+    /// The number of the last permission request.
+    last_request: u64,
 }
 
 impl Chat {
@@ -142,6 +147,7 @@ impl Chat {
             compaction: None,
             mcp_calls: HashMap::new(),
             subagent_starts: HashMap::new(),
+            last_request: 0,
         }
     }
 }
@@ -252,6 +258,8 @@ pub struct AppView {
     text_layout: (i32, bool, i32),
     /// The set of sample data that the demo shows. See `demo::Data`.
     demo_data: demo::Data,
+    /// The remote control from a phone. See `phone`.
+    phone: phone::Phone,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -346,6 +354,7 @@ impl AppView {
             doc_button_hover: None,
             text_layout: (0, false, 0),
             demo_data,
+            phone: phone::Phone::default(),
             _subs: subs,
         };
         for event in demo::app_call() {
@@ -358,8 +367,12 @@ impl AppView {
         // The Dock icon moves while the agent works, as the "working" row does. This is not in
         // `render`, because a hidden window does not render.
         view._subs.push(cx.observe_self(|this, cx| {
-            dock::set_moving(this.chat.busy && this.chat.permission.is_none(), cx)
+            dock::set_moving(this.chat.busy && this.chat.permission.is_none(), cx);
+            this.sync_remote_status();
         }));
+        if !demo::enabled() {
+            view.start_remote(cx);
+        }
         // The agent starts now, so that it is ready for the first message.
         view.poll_mcp_config(cx);
         view.connect(None, cx);
@@ -424,6 +437,7 @@ impl AppView {
         chat.compaction = None;
         if let Some(p) = chat.permission.take() {
             let _ = p.reply.send(None);
+            self.forward_permission_closed(p.request);
         }
         cx.spawn(async move |this, cx| {
             while let Some(event) = rx.recv().await {
@@ -441,7 +455,12 @@ impl AppView {
                         // Keep the conversation at the end of each turn, and when the agent stops.
                         let ended = matches!(event, Event::TurnEnded(_));
                         let save = ended || matches!(event, Event::Closed);
+                        let permission = matches!(event, Event::Permission { .. });
+                        this.forward(&event);
                         apply(&mut this.chat, event);
+                        if permission {
+                            this.forward_permission();
+                        }
                         if ended {
                             this.finish_reply(cx);
                         }
@@ -749,6 +768,8 @@ impl AppView {
         }
         session.send(Command::Prompt { text: prompt, attachments: attachments.clone() });
         chat.primed = true;
+        self.forward_user_text(&text);
+        let chat = &mut self.chat;
         chat.items.push(Item::User { text, at: chrono::Utc::now().timestamp(), attachments, took: None });
         chat.busy = true;
         self.scroll_to_end(cx);
@@ -867,6 +888,7 @@ impl AppView {
     fn cancel(&mut self, cx: &mut Context<Self>) {
         if let Some(p) = self.chat.permission.take() {
             let _ = p.reply.send(None);
+            self.forward_permission_closed(p.request);
         }
         if let Some(s) = &self.chat.session {
             s.send(Command::Cancel);
@@ -878,6 +900,7 @@ impl AppView {
     fn answer_permission(&mut self, option: Option<String>, cx: &mut Context<Self>) {
         if let Some(p) = self.chat.permission.take() {
             let _ = p.reply.send(option);
+            self.forward_permission_closed(p.request);
         }
         self.rows_changed(cx);
         cx.notify();
@@ -971,6 +994,8 @@ impl AppView {
         let count = self.rows.len();
         self.scroller = cx.new(|cx| MessageScrollerState::new(count, cx));
         self.connect(None, cx);
+        // The phones show the conversation of the new thread.
+        self.reset_remote();
         self.scroll_to_end(cx);
         cx.notify();
     }
@@ -1517,7 +1542,9 @@ fn apply(chat: &mut Chat, event: Event) {
             }
         }
         Event::Permission { title, options, reply } => {
-            if let Some(old) = chat.permission.replace(PendingPermission { title, options, reply }) {
+            chat.last_request += 1;
+            let request = chat.last_request;
+            if let Some(old) = chat.permission.replace(PendingPermission { request, title, options, reply }) {
                 let _ = old.reply.send(None);
             }
         }
@@ -1899,6 +1926,25 @@ impl AppView {
             .on_click(cx.listener(|this, _, _, cx| this.open_history(cx)))
             .child(Icon::new(KitIcon::BookOpen).size(px(16.)).text_color(theme.muted_foreground))
             .child(div().flex_1().child("History"));
+        // The remote control from a phone. See `phone`.
+        let phone = h_flex()
+            .id("phone")
+            .mx_2()
+            .px_2()
+            .h(px(32.))
+            .gap_2p5()
+            .rounded(px(8.))
+            .text_sm()
+            .font_medium()
+            .cursor_pointer()
+            .hover(|el| el.bg(accent.opacity(0.08)))
+            .when(self.phone.open, |el| el.bg(accent.opacity(0.12)))
+            .on_click(cx.listener(|this, _, _, cx| this.open_phone(cx)))
+            .child(Icon::new(KitIcon::Smartphone).size(px(16.)).text_color(theme.muted_foreground))
+            .child(div().flex_1().child("Phone"))
+            .when(!self.phone.state.connected.is_empty(), |el| {
+                el.child(div().size(px(6.)).rounded_full().bg(theme.success))
+            });
         // Start the agent again in the same session, so that it gets new MCP tools. The app
         // does this itself when it sees a change. See `AppView::refresh_tools`.
         let refresh = h_flex()
@@ -1943,7 +1989,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .when(cfg!(debug_assertions), |el| el.child(threads))
-                    .child(div().pt_2().child(memory).child(history).child(refresh))
+                    .child(div().pt_2().child(memory).child(history).child(phone).child(refresh))
                     .children(self.render_app_list(cx))
                     .children(self.render_cli_list(cx)),
             )
@@ -3337,6 +3383,8 @@ impl AppView {
             .children(app_panel)
             .children(doc_panel)
             .children(steps_panel)
+            .relative()
+            .children(self.render_phone(cx))
     }
 }
 

@@ -5,3 +5,4 @@
 pub mod message;
 pub mod noise;
 pub mod pairing;
+pub mod service;

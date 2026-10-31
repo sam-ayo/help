@@ -5,6 +5,9 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": true,
+  // The PWA (`pwa/dist`, from `pnpm build` in `pwa/`) on the same address. The relay addresses
+  // go to the Worker first.
+  "assets": { "directory": "../pwa/dist", "run_worker_first": ["/v1/*"] },
   "durable_objects": {
     "bindings": [{ "name": "LAPTOP", "class_name": "Laptop" }]
   },

@@ -161,6 +161,48 @@ export async function dial(phone: StaticKey, laptop: Uint8Array, payload: Uint8A
   };
 }
 
+// A laptop that read the first message of a phone. The demo laptop (`dev/laptop.ts`) and the
+// tests use it. The real laptop is `desktop/crates/remote/src/noise.rs`.
+export interface Accept {
+  payload: Uint8Array;
+  // The static public key of the phone.
+  phone: Uint8Array;
+  reply(payload: Uint8Array): Promise<{ message: Uint8Array; transport: Transport }>;
+}
+
+// Read the first message of a phone. `laptop` is the static key of the laptop.
+export async function accept(laptop: StaticKey, message: Uint8Array): Promise<Accept> {
+  if (message.length < 32 + 32 + TAG + TAG) throw new Error("bad phone hello");
+  if (message.length > MAX_MESSAGE) throw new Error("the phone hello is too large");
+  const state = new Symmetric();
+  state.mixHash(PROLOGUE);
+  state.mixHash(laptop.publicKey);
+
+  const re = message.slice(0, 32);
+  state.mixHash(re);
+  state.mixKey(await laptop.dh(re));
+  const phone = state.decryptAndHash(message.subarray(32, 32 + 32 + TAG));
+  state.mixKey(await laptop.dh(phone));
+  const payload = state.decryptAndHash(message.subarray(32 + 32 + TAG));
+
+  let used = false;
+  return {
+    payload,
+    phone,
+    async reply(body) {
+      if (used) throw new Error("the handshake is complete");
+      used = true;
+      const e = memoryKey();
+      state.mixHash(e.publicKey);
+      state.mixKey(await e.dh(re));
+      state.mixKey(await e.dh(phone));
+      const message = concat(e.publicKey, state.encryptAndHash(body));
+      const [receive, send] = state.split();
+      return { message, transport: new Transport(send, receive) };
+    },
+  };
+}
+
 // An encrypted channel after the handshake. The messages must arrive in the order that the
 // peer sent them. A lost, changed, or repeated message makes `open` fail. Then close the
 // connection.

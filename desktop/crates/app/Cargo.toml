@@ -13,6 +13,9 @@ mcp_apps.workspace = true
 md_editor.workspace = true
 vm.workspace = true
 protocol.workspace = true
+remote.workspace = true
+# The QR code of the pairing link of a phone. See src/ui/phone.rs.
+qrcode = { version = "0.14", default-features = false }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

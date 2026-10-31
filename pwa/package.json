@@ -5,7 +5,11 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test test/noise.test.ts test/pairing.test.ts",
-    "test:interop": "cargo build --manifest-path ../desktop/Cargo.toml -p remote --example noise_peer && node --test test/interop.test.ts"
+    "test:interop": "cargo build --manifest-path ../desktop/Cargo.toml -p remote --example noise_peer && node --test test/interop.test.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "demo": "node dev/demo.ts"
   },
   "dependencies": {
     "@noble/ciphers": "2.4.0",
@@ -14,6 +18,8 @@
   },
   "devDependencies": {
     "@types/node": "26.6.5",
-    "typescript": "7.0.2"
-  }
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  },
+  "packageManager": "pnpm@11.8.0"
 }

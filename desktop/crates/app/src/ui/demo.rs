@@ -165,6 +165,7 @@ pub fn chat() -> Chat {
     let (reply, _) = oneshot::channel();
     chat.busy = true;
     chat.permission = Some(PendingPermission {
+        request: 1,
         title: "Run `npm install next-themes`".into(),
         options: vec![
             PermissionOptionView { id: "allow".into(), name: "Allow".into(), allow: true },
@@ -509,6 +510,7 @@ fn worst(home: &str) -> Chat {
     let (reply, _) = oneshot::channel();
     chat.busy = true;
     chat.permission = Some(PendingPermission {
+        request: 1,
         title: format!("Run `{heredoc}`"),
         options: vec![
             PermissionOptionView { id: "allow".into(), name: "Allow".into(), allow: true },

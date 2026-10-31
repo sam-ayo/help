@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { generateWebCryptoKey, memoryKey } from "../src/keys.ts";
-import { dial, transportPairForTests, type Transport } from "../src/noise.ts";
+import { accept, dial, transportPairForTests, type Transport } from "../src/noise.ts";
 
 function receive(to: Transport, chunks: Uint8Array[]): Uint8Array {
   for (const chunk of chunks.slice(0, -1)) assert.equal(to.open(chunk), null);
@@ -49,4 +49,23 @@ test("the phone hello has the expected size", async () => {
   const hello = await dial(memoryKey(), memoryKey().publicKey, new Uint8Array(10));
   // e (32) + encrypted s (32 + 16) + encrypted payload (10 + 16)
   assert.equal(hello.message.length, 106);
+});
+
+test("handshake of the phone and the TypeScript laptop", async () => {
+  const phone = memoryKey();
+  const laptop = memoryKey();
+  const hello = await dial(phone, laptop.publicKey, new TextEncoder().encode("phone"));
+  const accepted = await accept(laptop, hello.message);
+  assert.deepEqual(accepted.payload, new TextEncoder().encode("phone"));
+  assert.deepEqual(accepted.phone, phone.publicKey);
+  const reply = await accepted.reply(new TextEncoder().encode("laptop"));
+  const done = await hello.finish(reply.message);
+  assert.deepEqual(done.payload, new TextEncoder().encode("laptop"));
+  assert.deepEqual(receive(reply.transport, done.transport.seal(new TextEncoder().encode("up"))), new TextEncoder().encode("up"));
+  assert.deepEqual(receive(done.transport, reply.transport.seal(new TextEncoder().encode("down"))), new TextEncoder().encode("down"));
+});
+
+test("a phone hello for a different laptop fails", async () => {
+  const hello = await dial(memoryKey(), memoryKey().publicKey, new Uint8Array());
+  await assert.rejects(accept(memoryKey(), hello.message));
 });

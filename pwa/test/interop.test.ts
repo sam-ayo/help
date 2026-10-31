@@ -1,5 +1,5 @@
 // The TypeScript phone against the Rust laptop (`desktop/crates/remote/examples/noise_peer.rs`).
-// Run it with `npm run test:interop`, which builds the Rust program first.
+// Run it with `pnpm test:interop`, which builds the Rust program first.
 
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";

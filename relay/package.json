@@ -3,10 +3,12 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "npm run build:pwa && wrangler dev",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test",
     "test": "node --test test/relay.test.ts",
-    "deploy": "wrangler deploy"
+    "deploy": "npm run build:pwa && wrangler deploy",
+    "build:pwa": "pnpm --dir ../pwa install --frozen-lockfile && pnpm --dir ../pwa build",
+    "pretest": "npm run build:pwa"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "5.20261027.1",

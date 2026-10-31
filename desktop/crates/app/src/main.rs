@@ -48,6 +48,24 @@ pub struct Env {
     /// try the app without a change to the main conversation. See `ui::Thread`.
     pub test_conversation_file: PathBuf,
     pub test_history_file: PathBuf,
+    /// The remote control from a phone. See `ui::phone`.
+    pub remote: remote::service::Config,
+}
+
+/// The relay and the PWA of the remote control. `HELP_RELAY` and `HELP_PWA` change them, for
+/// example to `ws://localhost:8787` and `http://localhost:5173` for a test with `wrangler dev`.
+const RELAY: &str = "wss://help-relay.samayo.me";
+const PWA: &str = "https://help-relay.samayo.me";
+
+/// The name of this Mac, for example "Sam's MacBook Pro". The phones show it.
+fn computer_name() -> String {
+    std::process::Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "Mac".into())
 }
 
 fn app_support() -> PathBuf {
@@ -169,6 +187,12 @@ fn main() {
         docs_dir: support.join("documents"),
         test_conversation_file: support.join("test-conversation.json"),
         test_history_file: support.join("test-memory.md"),
+        remote: remote::service::Config {
+            relay: std::env::var("HELP_RELAY").unwrap_or_else(|_| RELAY.into()),
+            pwa: std::env::var("HELP_PWA").unwrap_or_else(|_| PWA.into()),
+            state_file: support.join("remote.json"),
+            name: computer_name(),
+        },
     };
     let _ = std::fs::create_dir_all(&env.docs_dir);
 
