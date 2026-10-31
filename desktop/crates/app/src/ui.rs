@@ -247,8 +247,6 @@ pub struct AppView {
     reply_hover: Option<usize>,
     /// The document button under the pointer: the reply, and the index of the document.
     doc_button_hover: Option<(usize, usize)>,
-    /// The document button that the pointer went off last. Its arrow moves back.
-    doc_button_left: Option<(usize, usize)>,
     /// The window width, the sidebar, and the width of the panel, as of the last render. See
     /// `text_id`.
     text_layout: (i32, bool, i32),
@@ -346,7 +344,6 @@ impl AppView {
             doc_clicks,
             reply_hover: None,
             doc_button_hover: None,
-            doc_button_left: None,
             text_layout: (0, false, 0),
             demo_data,
             _subs: subs,
@@ -2773,10 +2770,6 @@ impl AppView {
     /// Record that the pointer came onto or went off a reply.
     fn set_reply_hover(&mut self, ix: usize, hover: bool, cx: &mut Context<Self>) {
         let next = if hover { Some(ix) } else { self.reply_hover.filter(|&i| i != ix) };
-        // The buttons go, so the arrow of a new button starts at rest.
-        if !hover && self.doc_button_left.is_some_and(|(r, _)| r == ix) {
-            self.doc_button_left = None;
-        }
         if self.reply_hover != next {
             self.reply_hover = next;
             cx.notify();
@@ -2787,12 +2780,8 @@ impl AppView {
     fn set_doc_button_hover(&mut self, button: (usize, usize), hover: bool, cx: &mut Context<Self>) {
         if hover {
             self.doc_button_hover = Some(button);
-            self.doc_button_left = None;
         } else if self.doc_button_hover == Some(button) {
             self.doc_button_hover = None;
-            // The arrow moves back only if the button stays. It goes when the pointer is off
-            // the reply too.
-            self.doc_button_left = (self.reply_hover == Some(button.0)).then_some(button);
         } else {
             return;
         }
@@ -2831,25 +2820,7 @@ impl AppView {
                 } else {
                     doc::title(path)
                 };
-                // The arrow moves to the right when the pointer comes onto the button, and back
-                // when the pointer goes off it.
-                let arrow = (found && !shown).then(|| {
-                    let arrow = || div().relative().child(Icon::new(KitIcon::ArrowRight).size(px(12.)));
-                    let slide = |id: &str, from: f32, to: f32| {
-                        arrow().with_animation(
-                            ElementId::NamedInteger(format!("{id}-{ix}").into(), i as u64),
-                            Animation::new(Duration::from_millis(180)).with_easing(gpui::ease_out_quint()),
-                            move |el, delta| el.left(px(from + (to - from) * delta)),
-                        )
-                    };
-                    if self.doc_button_hover == Some((ix, i)) {
-                        slide("doc-arrow-in", 0., 3.).into_any_element()
-                    } else if self.doc_button_left == Some((ix, i)) {
-                        slide("doc-arrow-out", 3., 0.).into_any_element()
-                    } else {
-                        arrow().into_any_element()
-                    }
-                });
+                let arrow = (found && !shown).then(|| Icon::new(KitIcon::ArrowRight).size(px(12.)));
                 let path = path.clone();
                 h_flex()
                     .id(ElementId::NamedInteger(format!("doc-button-{ix}").into(), i as u64))
