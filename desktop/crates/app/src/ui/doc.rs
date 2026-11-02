@@ -655,27 +655,31 @@ impl AppView {
                     .into_any_element(),
             );
         }
-        Some(self.side_panel("doc-panel", self.doc_width, WIDTH, |this, w| this.doc_width = w, card, window, cx))
+        Some(self.side_panel("doc-panel", self.doc_width, WIDTH, INSET, |this, w| this.doc_width = w, card, window, cx))
     }
 
-    /// A panel at the right side of the window, inset from the window edges, as the sidebar
-    /// is. A drag of its left edge changes the width with `set`. The panel keeps `MIN_PANEL`,
-    /// and the conversation keeps its minimum width. A double click gives back `default`.
+    /// A panel at the right side of the window, with `pad` of space between the panel and the
+    /// window edges. A drag of its left edge changes the width with `set`. The panel keeps
+    /// `MIN_PANEL`, and the conversation keeps its minimum width. A double click gives back
+    /// `default`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn side_panel(
         &self,
         id: &'static str,
         width: f32,
         default: f32,
+        pad: f32,
         set: fn(&mut AppView, f32),
         card: impl IntoElement,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // The edge is the `INSET` at the left side of the card. Without `pad`, the edge is at
+        // the left side of the panel, above the conversation.
         let edge = div()
             .id((id, 0usize))
             .absolute()
-            .left_0()
+            .left(px(pad - INSET))
             .top_0()
             .h_full()
             .w(px(INSET))
@@ -688,7 +692,7 @@ impl AppView {
                 }
             }));
         let room = self.panel_room(window);
-        let outer = (width + INSET * 2.).min(room);
+        let outer = (width + pad * 2.).min(room);
         // The text in the panel and in the conversation wraps again at each change of the
         // width. Thus a drag moves only a line, and the panel gets the width when the drag stops.
         let guide = self.panel_resize.map(|new| {
@@ -696,7 +700,7 @@ impl AppView {
                 .absolute()
                 .top(px(INSET + 12.))
                 .bottom(px(INSET + 12.))
-                .left(px(outer - INSET - new - 1.5))
+                .left(px(outer - pad - new - 1.5))
                 .w(px(3.))
                 .rounded_full()
                 .bg(accent(cx.theme()))
@@ -713,11 +717,11 @@ impl AppView {
             .w(px(outer))
             .h_full()
             .flex_shrink_0()
-            .p(px(INSET))
+            .p(px(pad))
             .on_drag_move(cx.listener(move |this, event: &DragMoveEvent<Resize>, window, cx| {
-                let right = f32::from(window.viewport_size().width) - INSET;
+                let right = f32::from(window.viewport_size().width) - pad;
                 let width = right - f32::from(event.event.position.x);
-                this.panel_resize = Some(width.min(room - INSET * 2.).max(MIN_PANEL));
+                this.panel_resize = Some(width.min(room - pad * 2.).max(MIN_PANEL));
                 cx.notify();
             }))
             // The drag stops at a mouse up in the panel or anywhere else in the window.

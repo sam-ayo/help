@@ -203,6 +203,10 @@ pub struct AppView {
     drag_pending: bool,
     /// The sidebar shows. The user can hide it to give the conversation more room.
     sidebar_open: bool,
+    /// The width of the sidebar panel. The user changes it with a drag of the right edge.
+    sidebar_width: f32,
+    /// The new width of the sidebar while the user drags its edge. See `sidebar_edge`.
+    sidebar_resize: Option<f32>,
     /// The tool cards that the user opened or closed, by tool id. A card for a failed tool
     /// starts open. The other cards start closed.
     toggled_tools: HashSet<String>,
@@ -218,6 +222,8 @@ pub struct AppView {
     /// The view of an MCP App, at the right side of the window.
     panel: Option<mcp_app::Panel>,
     panel_generation: u64,
+    /// The width of the panel of an MCP App. The user changes it with a drag of the left edge.
+    app_width: f32,
     /// The memory file or the conversation summary, at the right side of the window. It
     /// shows instead of the view of an MCP App.
     doc: Option<doc::Doc>,
@@ -255,7 +261,7 @@ pub struct AppView {
     doc_button_hover: Option<(usize, usize)>,
     /// The window width, the sidebar, and the width of the panel, as of the last render. See
     /// `text_id`.
-    text_layout: (i32, bool, i32),
+    text_layout: (i32, i32, i32),
     /// The set of sample data that the demo shows. See `demo::Data`.
     demo_data: demo::Data,
     /// The remote control from a phone. See `phone`.
@@ -329,6 +335,8 @@ impl AppView {
             scroller,
             drag_pending: false,
             sidebar_open: true,
+            sidebar_width: SIDEBAR,
+            sidebar_resize: None,
             toggled_tools: HashSet::new(),
             steps: None,
             steps_width: steps::WIDTH,
@@ -336,6 +344,7 @@ impl AppView {
             apps: None,
             panel: None,
             panel_generation: 0,
+            app_width: mcp_app::PANEL,
             doc: None,
             doc_prefetch: None,
             doc_width: doc::WIDTH,
@@ -352,7 +361,7 @@ impl AppView {
             doc_clicks,
             reply_hover: None,
             doc_button_hover: None,
-            text_layout: (0, false, 0),
+            text_layout: (0, 0, 0),
             demo_data,
             phone: phone::Phone::default(),
             _subs: subs,
@@ -1000,26 +1009,32 @@ impl AppView {
         cx.notify();
     }
 
-    /// The sidebar shows if the user did not hide it, and the window has room for it next to the
-    /// panel at the right side. A narrow window hides it while a panel shows.
-    fn sidebar_shows(&self, window: &Window) -> bool {
-        let panel = if self.doc.is_some() {
+    /// The width that the panel at the right side asks for, with its space to the window edges,
+    /// or 0 if no panel shows.
+    fn right_panel(&self) -> f32 {
+        if self.doc.is_some() {
             self.doc_width + INSET * 2.
         } else if self.steps.is_some() {
             self.steps_width + INSET * 2.
         } else if self.panel.is_some() {
-            mcp_app::PANEL
+            self.app_width
         } else {
             0.
-        };
+        }
+    }
+
+    /// The sidebar shows if the user did not hide it, and the window has room for it next to the
+    /// panel at the right side. A narrow window hides it while a panel shows.
+    fn sidebar_shows(&self, window: &Window) -> bool {
+        let panel = self.right_panel();
         let width = f32::from(window.viewport_size().width);
-        self.sidebar_open && (panel == 0. || width >= SIDEBAR + INSET * 2. + MIN_CONVERSATION + panel)
+        self.sidebar_open && (panel == 0. || width >= self.sidebar_width + INSET * 2. + MIN_CONVERSATION + panel)
     }
 
     /// The width that a panel at the right side can have, so that the conversation keeps
     /// `MIN_CONVERSATION`.
     pub(super) fn panel_room(&self, window: &Window) -> f32 {
-        let sidebar = if self.sidebar_shows(window) { SIDEBAR + INSET * 2. } else { 0. };
+        let sidebar = if self.sidebar_shows(window) { self.sidebar_width + INSET * 2. } else { 0. };
         (f32::from(window.viewport_size().width) - sidebar - MIN_CONVERSATION).max(MIN_PANEL)
     }
 
@@ -1602,8 +1617,22 @@ const MIN_CONVERSATION: f32 = 320.;
 const MIN_PANEL: f32 = 280.;
 /// The highest text of a permission request. Longer text scrolls.
 const PERMISSION_TITLE: f32 = 112.;
-/// The width of the sidebar panel.
+/// The width of the sidebar panel at the start. The user can drag its edge to change the
+/// width from `MIN_SIDEBAR` to `MAX_SIDEBAR`.
 const SIDEBAR: f32 = 232.;
+const MIN_SIDEBAR: f32 = 200.;
+const MAX_SIDEBAR: f32 = 400.;
+
+/// A drag of the right edge of the sidebar, which changes the width of the sidebar.
+#[derive(Clone)]
+struct SidebarResize;
+
+/// A drag shows no image under the pointer.
+impl Render for SidebarResize {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
 /// The space between the sidebar panel and the window edges.
 const INSET: f32 = 8.;
 
@@ -1995,7 +2024,7 @@ impl AppView {
             )
             .child(self.render_theme_footer(cx));
         div()
-            .w(px(SIDEBAR + INSET))
+            .w(px(self.sidebar_width + INSET))
             .h_full()
             .flex_shrink_0()
             .pl(px(INSET))
@@ -3196,45 +3225,108 @@ impl AppView {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("App")
             .to_string();
-        Some(
-            v_flex()
-                .w(px(mcp_app::PANEL.min(self.panel_room(window))))
-                .h_full()
-                .flex_shrink_0()
-                .border_l_1()
-                .border_color(theme.border)
-                .bg(theme.background)
-                .child(
-                    self.toolbar("app-toolbar", cx)
-                        .h(px(TOOLBAR))
-                        .px_3()
-                        .gap_2()
-                        .child(Icon::new(KitIcon::AppWindow).size(px(14.)).text_color(theme.muted_foreground))
-                        .child(div().flex_1().min_w_0().truncate().text_sm().font_medium().child(title))
-                        .child(div().text_xs().text_color(theme.muted_foreground).child(panel.ui.server.clone()))
-                        .child(
-                            Button::new("close-app")
-                                .ghost()
-                                .small()
-                                .icon(KitIcon::PanelRightClose)
-                                .tooltip("Close the app")
-                                .on_click(cx.listener(|this, _, _, cx| this.close_app(cx))),
-                        ),
-                )
-                .child(
-                    div().flex_1().min_h_0().child(
-                        // The web view is a native view on top of the window. It follows the place
-                        // of this element.
-                        gpui::canvas(
-                            move |b, _, _| {
-                                bounds.set(Some(b));
-                                mcp_app::place(&webview, b);
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .size_full(),
+        // The web view is a native view on top of the window, so it hides while the user drags
+        // the edge. Then the line that shows the new edge is visible above the panel.
+        let _ = webview.set_visible(self.panel_resize.is_none());
+        let card = v_flex()
+            .size_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .child(
+                self.toolbar("app-toolbar", cx)
+                    .h(px(TOOLBAR))
+                    .px_3()
+                    .gap_2()
+                    .child(Icon::new(KitIcon::AppWindow).size(px(14.)).text_color(theme.muted_foreground))
+                    .child(div().flex_1().min_w_0().truncate().text_sm().font_medium().child(title))
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(panel.ui.server.clone()))
+                    .child(
+                        Button::new("close-app")
+                            .ghost()
+                            .small()
+                            .icon(KitIcon::PanelRightClose)
+                            .tooltip("Close the app")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_app(cx))),
                     ),
-                )
+            )
+            .child(
+                div().flex_1().min_h_0().child(
+                    // The web view is a native view on top of the window. It follows the place
+                    // of this element.
+                    gpui::canvas(
+                        move |b, _, _| {
+                            bounds.set(Some(b));
+                            mcp_app::place(&webview, b);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .size_full(),
+                ),
+            );
+        let default = mcp_app::PANEL;
+        Some(self.side_panel("app-panel", self.app_width, default, 0., Self::set_app_width, card, window, cx))
+    }
+
+    /// Give the panel of an MCP App a new width, and tell the view about the new width.
+    fn set_app_width(&mut self, width: f32) {
+        self.app_width = width;
+        if let Some(panel) = &self.panel {
+            panel.resized(width);
+        }
+    }
+
+    /// The space between the sidebar and the conversation. A drag of it changes the width of the
+    /// sidebar. A line shows the new edge, and the sidebar gets the width when the drag stops,
+    /// as in `side_panel`. A double click gives back the default width.
+    fn sidebar_edge(&self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // The conversation and the panel at the right side keep their widths.
+        let room = f32::from(window.viewport_size().width) - INSET * 2. - MIN_CONVERSATION - self.right_panel();
+        let most = MAX_SIDEBAR.min(room).max(MIN_SIDEBAR);
+        let commit = |this: &mut AppView, cx: &mut Context<Self>| {
+            if let Some(new) = this.sidebar_resize.take() {
+                this.sidebar_width = new;
+                cx.notify();
+            }
+        };
+        div()
+            .id("sidebar-edge")
+            .relative()
+            .w(px(INSET))
+            .h_full()
+            .flex_shrink_0()
+            .cursor_col_resize()
+            .on_drag(SidebarResize, |drag, _, _, cx| cx.new(|_| drag.clone()))
+            .on_drag_move(cx.listener(move |this, event: &gpui::DragMoveEvent<SidebarResize>, _, cx| {
+                let width = f32::from(event.event.position.x) - INSET;
+                this.sidebar_resize = Some(width.min(most).max(MIN_SIDEBAR));
+                cx.notify();
+            }))
+            .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                if event.click_count() == 2 {
+                    this.sidebar_width = SIDEBAR;
+                    cx.notify();
+                }
+            }))
+            // The drag stops at a mouse up on the edge or anywhere else in the window.
+            .capture_any_mouse_up(cx.listener(move |this, _, _, cx| commit(this, cx)))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(move |this, _, _, cx| commit(this, cx)))
+            .into_any_element()
+    }
+
+    /// The line at the new edge of the sidebar while the user drags the edge. It is a child of
+    /// the window, so that the conversation does not cover it.
+    fn sidebar_guide(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let new = self.sidebar_resize?;
+        Some(
+            div()
+                .absolute()
+                .top(px(INSET + 12.))
+                .bottom(px(INSET + 12.))
+                .left(px(INSET + new + INSET / 2. - 1.5))
+                .w(px(3.))
+                .rounded_full()
+                .bg(accent(cx.theme()))
                 .into_any_element(),
         )
     }
@@ -3249,14 +3341,16 @@ impl AppView {
         // The things that change the width of the conversation. See `text_id`.
         self.text_layout = (
             f32::from(window.viewport_size().width) as i32,
-            self.sidebar_open,
+            if self.sidebar_open { self.sidebar_width as i32 } else { 0 },
             if self.doc.is_some() {
                 self.doc_width as i32
             } else if self.steps.is_some() {
                 // The text in the steps panel also wraps at this width.
                 self.steps_width as i32
+            } else if self.panel.is_some() {
+                self.app_width as i32
             } else {
-                i32::from(self.panel.is_some())
+                0
             },
         );
         let theme = cx.theme().clone();
@@ -3358,7 +3452,7 @@ impl AppView {
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.cancel(cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
             .on_action(cx.listener(|this, _: &ExitFullView, window, cx| this.exit_full_doc(window, cx)))
-            .when(sidebar && !full, |el| el.child(self.render_sidebar(cx)).child(div().w(px(INSET)).h_full()))
+            .when(sidebar && !full, |el| el.child(self.render_sidebar(cx)).child(self.sidebar_edge(window, cx)))
             .when(!full, |el| el.child(
                 v_flex()
                     .id("conversation")
@@ -3384,6 +3478,7 @@ impl AppView {
             .children(doc_panel)
             .children(steps_panel)
             .relative()
+            .children(self.sidebar_guide(cx))
             .children(self.render_phone(cx))
     }
 }

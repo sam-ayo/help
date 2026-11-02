@@ -17,7 +17,7 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName as KitIcon;
 
-use super::{AppView, Context, Item, LONG_TITLE, TOOL_DETAIL, TOOLBAR, accent, attach, message_style, plural, tool_icon, turn_parts};
+use super::{AppView, Context, INSET, Item, LONG_TITLE, TOOL_DETAIL, TOOLBAR, accent, attach, message_style, plural, tool_icon, turn_parts};
 
 /// The size of the number of a phase.
 const BADGE: f32 = 18.;
@@ -199,7 +199,7 @@ impl AppView {
             .shadow_md()
             .child(header)
             .child(body);
-        Some(self.side_panel("steps-panel", self.steps_width, WIDTH, |this, w| this.steps_width = w, card, window, cx))
+        Some(self.side_panel("steps-panel", self.steps_width, WIDTH, INSET, |this, w| this.steps_width = w, card, window, cx))
     }
 
     /// The phases of the steps: the first row of each phase. A note of the agent starts a new

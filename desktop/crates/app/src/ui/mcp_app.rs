@@ -168,6 +168,18 @@ impl Panel {
         }
     }
 
+    /// Tell the view that the panel has a new width.
+    pub(super) fn resized(&self, width: f32) {
+        if !self.initialized {
+            return;
+        }
+        let height = self.bounds.get().map_or(600., |b| f32::from(b.size.height));
+        self.notify(
+            "ui/notifications/host-context-changed",
+            json!({ "containerDimensions": { "width": width, "maxHeight": height } }),
+        );
+    }
+
     fn notify(&self, method: &str, params: Value) {
         tracing::debug!("the app sent {method} to the MCP App view");
         self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }));
