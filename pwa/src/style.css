@@ -96,6 +96,16 @@ header {
   border-bottom: 1px solid var(--line);
 }
 
+header .actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+#notify[aria-pressed="true"] {
+  color: var(--accent);
+}
+
 header div {
   display: flex;
   flex-direction: column;

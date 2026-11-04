@@ -19,5 +19,10 @@ Open the link in a browser on this computer. The test laptop answers each prompt
 turn. A prompt with the word "run" also asks for a permission. The demo keeps its state in
 `.demo/`. Delete that folder to start again.
 
+"Notify me" turns on the notifications at the end of each turn that this phone started. On an
+iPhone, notifications work only when you open the app from the Home Screen (Share, then Add to
+Home Screen). The service worker shows them, so they need `pnpm build`, not `pnpm dev`. See
+`relay/README.md` for the keys of the relay.
+
 The PWA needs a secure origin (`https://`, or `http://localhost`) for WebCrypto and the
 service worker. To use it on a phone, put `dist/` on an HTTPS host and use the deployed relay.

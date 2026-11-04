@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "npm run build:pwa && wrangler dev",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "node --test test/relay.test.ts",
+    "vapid": "node scripts/vapid.ts",
+    "test": "node --test test/push.test.ts test/relay.test.ts",
     "deploy": "npm run build:pwa && wrangler deploy",
     "build:pwa": "pnpm --dir ../pwa install --frozen-lockfile && pnpm --dir ../pwa build",
     "pretest": "npm run build:pwa"

@@ -4,18 +4,48 @@ import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
+import { generateVapid } from "../src/push.ts";
 
 const PORT = 8790 + Math.floor(Math.random() * 100);
 const BASE = `ws://127.0.0.1:${PORT}/v1`;
 let wrangler: ChildProcess;
 let state: string;
+const vapid = await generateVapid();
+
+// A push service on this computer. It keeps the requests for `pushed`.
+const pushes: IncomingMessage[] = [];
+let pushWaiting: ((request: IncomingMessage) => void) | null = null;
+let pushStatus = 201;
+let pushService: Server;
+
+function pushed(): Promise<IncomingMessage> {
+  const request = pushes.shift();
+  if (request) return Promise.resolve(request);
+  return new Promise((resolve, reject) => {
+    pushWaiting = resolve;
+    setTimeout(() => reject(new Error("no push")), 5000);
+  });
+}
 
 before(async () => {
+  pushService = createServer((request, response) => {
+    request.resume();
+    request.on("end", () => {
+      response.writeHead(pushStatus).end();
+      if (pushWaiting) pushWaiting(request);
+      else pushes.push(request);
+      pushWaiting = null;
+    });
+  });
+  await new Promise<void>((resolve) => pushService.listen(0, "127.0.0.1", resolve));
   state = mkdtempSync(join(tmpdir(), "help-relay-"));
-  wrangler = spawn("npx", ["wrangler", "dev", "--ip", "127.0.0.1", "--port", String(PORT), "--persist-to", state], {
+  const vars = [`VAPID_PUBLIC_KEY:${vapid.publicKey}`, `VAPID_PRIVATE_KEY:${vapid.privateKey}`, "PUSH_HTTP:1"];
+  const args = ["wrangler", "dev", "--ip", "127.0.0.1", "--port", String(PORT), "--persist-to", state];
+  wrangler = spawn("npx", [...args, ...vars.flatMap((v) => ["--var", v])], {
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, WRANGLER_SEND_METRICS: "false" },
   });
@@ -37,6 +67,7 @@ before(async () => {
 
 after(() => {
   wrangler.kill();
+  pushService.close();
   rmSync(state, { recursive: true, force: true });
 });
 
@@ -274,4 +305,90 @@ test("the relay answers 404 to an unknown address", async () => {
   assert.equal(response.status, 404);
   const plain = await fetch(`http://127.0.0.1:${PORT}/v1/laptop/${id()}`);
   assert.equal(plain.status, 426);
+});
+
+// A push subscription with a real P-256 key, at `path` of the push service of the test.
+async function subscription(path: string) {
+  const pair = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const { port } = pushService.address() as { port: number };
+  return {
+    endpoint: `http://127.0.0.1:${port}${path}`,
+    keys: {
+      p256dh: Buffer.from(await crypto.subtle.exportKey("raw", pair.publicKey)).toString("base64url"),
+      auth: randomBytes(16).toString("base64url"),
+    },
+  };
+}
+
+test("the relay gives the VAPID public key", async () => {
+  const response = await fetch(`http://127.0.0.1:${PORT}/v1/push`);
+  assert.deepEqual(await response.json(), { key: vapid.publicKey });
+});
+
+test("the laptop sends a notification to a paired phone that is not connected", async () => {
+  const { laptop, client: lap } = await newLaptop();
+  const device = id();
+  lap.send(JSON.stringify({ type: "devices", ids: [device] }));
+  await lap.quiet();
+  const phone = new Client(`phone/${laptop}/${device}`);
+  await phone.json();
+  await lap.json();
+  phone.send(JSON.stringify({ type: "push", subscription: await subscription(`/push/${device}`) }));
+  await phone.quiet();
+
+  // The phone is connected, so it gets no notification.
+  lap.send(JSON.stringify({ type: "notify", kind: "turn_end" }));
+  await lap.quiet();
+  assert.equal(pushes.length, 0);
+
+  phone.close();
+  assert.deepEqual(await lap.json(), { type: "closed", device });
+  lap.send(JSON.stringify({ type: "notify", kind: "permission" }));
+  const request = await pushed();
+  assert.equal(request.url, `/push/${device}`);
+  assert.equal(request.headers["content-encoding"], "aes128gcm");
+  assert.equal(request.headers.urgency, "high");
+  assert.match(request.headers.authorization!, new RegExp(`^vapid t=.+, k=${vapid.publicKey}$`));
+
+  // The push service does not know the subscription now. The relay forgets it.
+  pushStatus = 410;
+  lap.send(JSON.stringify({ type: "notify", kind: "turn_end" }));
+  await pushed();
+  pushStatus = 201;
+  lap.send(JSON.stringify({ type: "notify", kind: "turn_end" }));
+  await lap.quiet();
+  assert.equal(pushes.length, 0);
+  lap.close();
+});
+
+test("the relay forgets the subscription of a removed phone", async () => {
+  const { laptop, client: lap } = await newLaptop();
+  const device = id();
+  lap.send(JSON.stringify({ type: "devices", ids: [device] }));
+  await lap.quiet();
+  const phone = new Client(`phone/${laptop}/${device}`);
+  await phone.json();
+  await lap.json();
+  phone.send(JSON.stringify({ type: "push", subscription: await subscription("/push/x") }));
+  await phone.quiet();
+  lap.send(JSON.stringify({ type: "devices", ids: [] }));
+  assert.equal(await phone.closed, 4403);
+  await lap.json(); // closed
+  lap.send(JSON.stringify({ type: "devices", ids: [device] }));
+  lap.send(JSON.stringify({ type: "notify", kind: "turn_end" }));
+  await lap.quiet();
+  assert.equal(pushes.length, 0);
+  lap.close();
+});
+
+test("the relay closes a phone that sends a bad subscription", async () => {
+  const { laptop, client: lap } = await newLaptop();
+  const device = id();
+  lap.send(JSON.stringify({ type: "devices", ids: [device] }));
+  await lap.quiet();
+  const phone = new Client(`phone/${laptop}/${device}`);
+  await phone.json();
+  phone.send(JSON.stringify({ type: "push", subscription: { endpoint: "ftp://x", keys: {} } }));
+  assert.equal(await phone.closed, 4400);
+  lap.close();
 });

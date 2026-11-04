@@ -10,6 +10,7 @@
 //
 //   GET /v1/laptop/<laptop>            with `Authorization: Bearer <secret>`
 //   GET /v1/phone/<laptop>/<device>
+//   GET /v1/push                       `{"key":<VAPID public key>}`, or 404 with no Web Push
 //
 // The first connection of a laptop ID keeps the SHA-256 of the secret. Each later connection of
 // that laptop must have the same secret. A new laptop connection closes the old one.
@@ -23,17 +24,27 @@
 // Frames between a phone and the relay:
 //
 //   binary  A frame for the laptop, or from the laptop.
-//   text    From the relay only: `{"type":"laptop","online":<boolean>}`.
+//   text    From the relay: `{"type":"laptop","online":<boolean>}`.
+//           From a paired phone: `{"type":"push","subscription":<subscription or null>}`, the
+//           Web Push subscription of the phone. See `src/push.ts`.
 //
 // A phone can connect only if its device ID is in the device list of the laptop, or during a
 // pairing period that the laptop opens. When the relay refuses or closes a connection, the
 // close code tells why. See `Close`.
 
 import { DurableObject } from "cloudflare:workers";
+import { isSubscription, send, type Kind, type Subscription, type Vapid } from "./push.ts";
 
 export interface Env {
   LAPTOP: DurableObjectNamespace<Laptop>;
   CONNECTIONS: RateLimit;
+  // The VAPID keys for Web Push. Set them with `wrangler secret put`. See `npm run vapid`. With
+  // no keys, the relay does not send notifications.
+  VAPID_PUBLIC_KEY?: string;
+  VAPID_PRIVATE_KEY?: string;
+  VAPID_SUBJECT?: string;
+  // "1" lets a subscription have an `http:` endpoint. Only the tests set it.
+  PUSH_HTTP?: string;
 }
 
 // Control messages from the laptop to the relay.
@@ -44,7 +55,9 @@ export type ToRelay =
   // Let phones that are not in the list connect, for `seconds`. 0 stops the pairing period.
   | { type: "pairing"; seconds: number }
   // Close the connection of a phone, for example after a failed handshake.
-  | { type: "close"; device: string };
+  | { type: "close"; device: string }
+  // Send a notification to the paired phones that are not connected now.
+  | { type: "notify"; kind: Kind };
 
 // Control messages from the relay to the laptop.
 export type FromRelay =
@@ -84,11 +97,29 @@ const LAPTOP_CONNECTIONS_PER_MINUTE = 10;
 const PAIRING_ATTEMPTS = 5;
 // The frames from one connection, for each 10 seconds.
 const FRAMES_PER_10_SECONDS = 1000;
+const NOTIFICATIONS_PER_MINUTE = 10;
+const KINDS: Kind[] = ["turn_end", "permission"];
+
+function vapid(env: Env): Vapid | null {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_KEY) return null;
+  return {
+    publicKey: env.VAPID_PUBLIC_KEY,
+    privateKey: env.VAPID_PRIVATE_KEY,
+    subject: env.VAPID_SUBJECT ?? "mailto:help-relay@example.com",
+  };
+}
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/") return new Response("help relay\n");
+    if (url.pathname === "/v1/push") {
+      // The PWA can be on a different address in development, so any page can read the key.
+      const headers = { "Access-Control-Allow-Origin": "*" };
+      const keys = vapid(env);
+      if (!keys) return new Response("no web push\n", { status: 404, headers });
+      return Response.json({ key: keys.publicKey }, { headers });
+    }
     const parts = url.pathname.split("/");
     const laptop = parts[3];
     const role = parts[1] === "v1" ? parts[2] : undefined;
@@ -142,6 +173,7 @@ class Counter {
 export class Laptop extends DurableObject<Env> {
   #phoneConnections = new Counter(PHONE_CONNECTIONS_PER_MINUTE, 60_000);
   #laptopConnections = new Counter(LAPTOP_CONNECTIONS_PER_MINUTE, 60_000);
+  #notifications = new Counter(NOTIFICATIONS_PER_MINUTE, 60_000);
   #frames = new WeakMap<WebSocket, Counter>();
 
   async fetch(request: Request): Promise<Response> {
@@ -211,7 +243,8 @@ export class Laptop extends DurableObject<Env> {
 
     const from = ws.deserializeAttachment() as Attachment;
     if (from.role === "phone") {
-      if (typeof message === "string" || message.byteLength > 65535) {
+      if (typeof message === "string") return this.#phoneControl(ws, from, message);
+      if (message.byteLength > 65535) {
         return ws.close(Close.BAD_FRAME, "send binary frames of 65535 bytes or less");
       }
       const id = new TextEncoder().encode(from.device!);
@@ -247,6 +280,10 @@ export class Laptop extends DurableObject<Env> {
         return ws.close(Close.BAD_FRAME, "bad device list");
       }
       await this.ctx.storage.put("devices", ids);
+      // Forget the push subscriptions of the removed phones.
+      const subscriptions = await this.ctx.storage.list({ prefix: "push:" });
+      const removed = [...subscriptions.keys()].filter((key) => !ids.includes(key.slice(5)));
+      if (removed.length) await this.ctx.storage.delete(removed);
       const open = await this.#pairingOpen();
       for (const phone of this.ctx.getWebSockets("phone")) {
         const attachment = phone.deserializeAttachment() as Attachment;
@@ -270,9 +307,52 @@ export class Laptop extends DurableObject<Env> {
     } else if (control.type === "close") {
       if (typeof control.device !== "string") return ws.close(Close.BAD_FRAME, "bad device");
       for (const phone of this.ctx.getWebSockets(`phone:${control.device}`)) phone.close(Close.NOT_PAIRED, "closed by the laptop");
+    } else if (control.type === "notify") {
+      if (!KINDS.includes(control.kind)) return ws.close(Close.BAD_FRAME, "bad notification");
+      if (this.#notifications.take()) await this.#notify(control.kind);
     } else {
       return ws.close(Close.BAD_FRAME, "unknown control message");
     }
+  }
+
+  // A text frame from a phone: its push subscription.
+  async #phoneControl(ws: WebSocket, from: Attachment, message: string) {
+    let control: { type: string; subscription: unknown };
+    try {
+      if (message.length > 4096) throw new Error("too large");
+      control = JSON.parse(message);
+    } catch {
+      return ws.close(Close.BAD_FRAME, "bad control message");
+    }
+    if (control?.type !== "push") return ws.close(Close.BAD_FRAME, "unknown control message");
+    // A phone that pairs now can send its subscription after the pairing.
+    if (from.pairing) return;
+    const key = `push:${from.device}`;
+    if (control.subscription === null) return void (await this.ctx.storage.delete(key));
+    if (!isSubscription(control.subscription, this.env.PUSH_HTTP === "1")) {
+      return ws.close(Close.BAD_FRAME, "bad subscription");
+    }
+    await this.ctx.storage.put(key, control.subscription);
+  }
+
+  // Send a notification to each paired phone with a subscription and with no connection now. A
+  // phone with a connection shows the page, so it does not need a notification.
+  async #notify(kind: Kind) {
+    const keys = vapid(this.env);
+    if (!keys) return;
+    const subscriptions = await this.ctx.storage.list<Subscription>({ prefix: "push:" });
+    await Promise.all(
+      [...subscriptions].map(async ([key, sub]) => {
+        if (this.ctx.getWebSockets(`phone:${key.slice(5)}`).length) return;
+        try {
+          const response = await send(sub, kind, keys);
+          if (response.status === 404 || response.status === 410) await this.ctx.storage.delete(key);
+          else if (!response.ok) console.warn(`push service answered ${response.status}`);
+        } catch (error) {
+          console.warn(`cannot send a notification: ${error}`);
+        }
+      }),
+    );
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string): Promise<void> {

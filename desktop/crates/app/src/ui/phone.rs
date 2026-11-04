@@ -6,6 +6,9 @@
 //! The relay connection stops while the Mac sleeps. While a phone is connected, `caffeinate`
 //! stops the sleep when the user does not use the Mac. A sleep when the lid closes needs
 //! `pmset disablesleep`, which the user can set in the card. See `set_lid`.
+//!
+//! A closed Mac that runs in a bag can become hot, and it can use all of its battery. Thus
+//! `set_lid` also starts `BATTERY_WATCH`, which turns the setting off below `MIN_BATTERY`.
 
 use std::process::{Child, Command};
 use std::sync::Arc;
@@ -32,6 +35,28 @@ const QR_MODULE: u32 = 8;
 /// The size of the QR code on the screen.
 const QR_SIZE: f32 = 240.;
 
+/// The battery level, in percent, below which `BATTERY_WATCH` turns `disablesleep` off.
+const MIN_BATTERY: u8 = 20;
+/// The time between two checks of the battery, in seconds.
+const BATTERY_CHECK: u32 = 60;
+/// The name of the watcher process, for `battery_watch_runs`.
+const BATTERY_WATCH_NAME: &str = "help-battery-watch";
+/// A shell script that runs as root, because only root can change `disablesleep`. It turns the
+/// setting off when the Mac uses its battery and the level is below `$2` percent. It stops when
+/// the setting is off. `$1` is the time between two checks. The app cannot do this itself,
+/// because nobody can type the password while the lid is closed. The script has no single
+/// quotes, so `pmset_command` can put it in single quotes.
+const BATTERY_WATCH: &str = r#"while pmset -g | grep -Eq "^ *SleepDisabled[[:space:]]+1"; do
+  batt=$(pmset -g batt)
+  case "$batt" in
+    *"Battery Power"*)
+      level=$(printf "%s\n" "$batt" | grep -Eo "[0-9]+%" | head -n 1 | tr -d %)
+      if [ "${level:-100}" -lt "$2" ]; then pmset -a disablesleep 0; exit 0; fi
+      ;;
+  esac
+  sleep "$1"
+done"#;
+
 /// The state of the remote control in the app.
 #[derive(Default)]
 pub(super) struct Phone {
@@ -49,6 +74,8 @@ pub(super) struct Phone {
     lid: bool,
     /// The password prompt for `lid` shows.
     lid_busy: bool,
+    /// `BATTERY_WATCH` runs. It stops when the Mac restarts, but `lid` stays on.
+    battery_watch: bool,
 }
 
 impl Phone {
@@ -85,6 +112,7 @@ impl AppView {
         let (service, mut rx) = service::start(&self.env.runtime, self.env.remote.clone());
         self.phone.service = Some(service);
         self.phone.lid = sleep_disabled();
+        self.phone.battery_watch = battery_watch_runs();
         self.reset_remote();
         cx.spawn(async move |this, cx| {
             while let Some(message) = rx.recv().await {
@@ -178,6 +206,9 @@ impl AppView {
 
     pub(super) fn open_phone(&mut self, cx: &mut Context<Self>) {
         self.phone.open = true;
+        // The watcher stops when the battery is low, and when the Mac restarts.
+        self.phone.lid = sleep_disabled();
+        self.phone.battery_watch = battery_watch_runs();
         // A laptop with no phone shows the QR code at once.
         if self.phone.state.devices.is_empty() && self.phone.state.pairing.is_none() {
             self.phone.send(ToService::StartPairing);
@@ -199,6 +230,7 @@ impl AppView {
             let _ = this.update(cx, |this, cx| {
                 this.phone.lid_busy = false;
                 this.phone.lid = sleep_disabled();
+                this.phone.battery_watch = battery_watch_runs();
                 cx.notify();
             });
         })
@@ -284,8 +316,9 @@ impl AppView {
         let devices = state.devices.iter().enumerate().map(|(i, d)| {
             let id = d.id.clone();
             let connected = state.connected.contains(&d.id);
-            let paired = chrono::DateTime::from_timestamp(d.paired_at, 0)
-                .map(|t| t.with_timezone(&chrono::Local).format("Paired %b %-d, %Y").to_string())
+            let (label, at) = if d.last_seen > 0 { ("Last connected", d.last_seen) } else { ("Paired", d.paired_at) };
+            let seen = chrono::DateTime::from_timestamp(at, 0)
+                .map(|t| format!("{label} {}", t.with_timezone(&chrono::Local).format("%b %-d, %Y, %-I:%M %p")))
                 .unwrap_or_default();
             h_flex()
                 .gap_2p5()
@@ -300,7 +333,7 @@ impl AppView {
                             div()
                                 .text_xs()
                                 .text_color(if connected { theme.success } else { theme.muted_foreground })
-                                .child(if connected { "Connected now".to_string() } else { paired }),
+                                .child(if connected { "Connected now".to_string() } else { seen }),
                         ),
                 )
                 .child(
@@ -372,8 +405,13 @@ impl AppView {
                         div()
                             .text_xs()
                             .text_color(theme.muted_foreground)
-                            .child("Your phone can then connect when the lid is closed. macOS asks for your password. The setting stays on after you quit the app. Do not put the Mac in a bag while this setting is on, because the Mac can become hot."),
-                    ),
+                            .child(format!("Your phone can then connect when the lid is closed. macOS asks for your password. The setting stays on after you quit the app. On battery power, the Mac turns the setting off below {MIN_BATTERY}%. Do not put the Mac in a bag while this setting is on, because the Mac can become hot.")),
+                    )
+                    .when(self.phone.lid && !self.phone.battery_watch, |el| {
+                        el.child(div().text_xs().text_color(theme.warning).child(format!(
+                            "The {MIN_BATTERY}% battery limit stopped, for example after a restart of the Mac. Turn the setting off and on again."
+                        )))
+                    }),
             )
             .child(
                 div()
@@ -495,13 +533,31 @@ fn sleep_disabled() -> bool {
     })
 }
 
+/// True if `BATTERY_WATCH` runs.
+fn battery_watch_runs() -> bool {
+    Command::new("/usr/bin/pgrep").args(["-f", BATTERY_WATCH_NAME]).output().is_ok_and(|out| out.status.success())
+}
+
+/// The command that `run_pmset` runs as root. With `on`, it also starts `BATTERY_WATCH`.
+fn pmset_command(on: bool) -> String {
+    if !on {
+        return "/usr/bin/pmset -a disablesleep 0".into();
+    }
+    // `do shell script` waits until the output closes, so the watcher has no output.
+    format!(
+        "/usr/bin/pmset -a disablesleep 1 && PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/nohup /bin/sh -c '{BATTERY_WATCH}' {BATTERY_WATCH_NAME} {BATTERY_CHECK} {MIN_BATTERY} >/dev/null 2>&1 &"
+    )
+}
+
+/// The AppleScript that runs `pmset_command` as root, with the password prompt of macOS.
+fn pmset_applescript(on: bool) -> String {
+    let command = pmset_command(on).replace('\\', "\\\\").replace('"', "\\\"");
+    format!("do shell script \"{command}\" with administrator privileges")
+}
+
 /// Set `pmset disablesleep` with the password prompt of macOS.
 fn run_pmset(on: bool) -> anyhow::Result<()> {
-    let script = format!(
-        "do shell script \"/usr/bin/pmset -a disablesleep {}\" with administrator privileges",
-        u8::from(on)
-    );
-    let out = Command::new("/usr/bin/osascript").args(["-e", &script]).output()?;
+    let out = Command::new("/usr/bin/osascript").args(["-e", &pmset_applescript(on)]).output()?;
     if !out.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -544,6 +600,66 @@ mod tests {
         let bytes = image.as_bytes(0).expect("one frame");
         assert_eq!(&bytes[..4], &[255, 255, 255, 255]);
         assert!(bytes.chunks(4).any(|p| p == [0, 0, 0, 255]));
+    }
+
+    /// Run `BATTERY_WATCH` with a fake `pmset`, which shows `batt` and keeps `disablesleep` in a
+    /// file. A fake `sleep` writes "slept" in that file, so the watcher stops after one check.
+    /// Returns the content of the file at the end.
+    fn watch(name: &str, batt: &str) -> String {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("help-battery-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |file: &str, body: &str| {
+            let path = dir.join(file);
+            std::fs::write(&path, format!("#!/bin/sh\ncd {}\n{body}\n", dir.display())).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        std::fs::write(dir.join("batt"), batt).unwrap();
+        std::fs::write(dir.join("state"), "1").unwrap();
+        script(
+            "pmset",
+            r#"case "$*" in
+  "-g batt") cat batt ;;
+  "-g") printf " SleepDisabled\t\t%s\n" "$(cat state)" ;;
+  "-a disablesleep "*) echo "$3" > state ;;
+esac"#,
+        );
+        script("sleep", "echo slept > state");
+        let status = Command::new("/bin/sh")
+            .args(["-c", BATTERY_WATCH, BATTERY_WATCH_NAME, "1", &MIN_BATTERY.to_string()])
+            .env("PATH", format!("{}:/usr/bin:/bin", dir.display()))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let state = std::fs::read_to_string(dir.join("state")).unwrap().trim().to_string();
+        let _ = std::fs::remove_dir_all(&dir);
+        state
+    }
+
+    #[test]
+    fn the_battery_watch_turns_the_setting_off_only_on_a_low_battery() {
+        let batt = |source: &str, level: u8| {
+            format!("Now drawing from '{source}'\n -InternalBattery-0 (id=1)\t{level}%; discharging; present: true\n")
+        };
+        assert_eq!(watch("low", &batt("Battery Power", 19)), "0");
+        assert_eq!(watch("high", &batt("Battery Power", 66)), "slept");
+        assert_eq!(watch("ac", &batt("AC Power", 5)), "slept");
+        assert_eq!(watch("desktop", "Now drawing from 'AC Power'\n"), "slept");
+    }
+
+    /// The script and the command are correct, but they do not run.
+    #[test]
+    fn the_pmset_script_has_a_correct_syntax() {
+        assert!(!BATTERY_WATCH.contains('\''), "pmset_command puts the watcher in single quotes");
+        for on in [true, false] {
+            let shell = Command::new("/bin/sh").args(["-n", "-c", &pmset_command(on)]).status().unwrap();
+            assert!(shell.success());
+            let out = std::env::temp_dir().join(format!("help-pmset-{}-{on}.scpt", std::process::id()));
+            let script =
+                Command::new("/usr/bin/osacompile").arg("-e").arg(pmset_applescript(on)).arg("-o").arg(&out).status();
+            assert!(script.unwrap().success());
+            let _ = std::fs::remove_file(out);
+        }
     }
 
     #[test]

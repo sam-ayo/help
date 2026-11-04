@@ -22,11 +22,14 @@ const prompt = $<HTMLTextAreaElement>("prompt");
 const sendButton = $<HTMLButtonElement>("send");
 const stopButton = $<HTMLButtonElement>("stop");
 const unpairButton = $<HTMLButtonElement>("unpair");
+const notifyButton = $<HTMLButtonElement>("notify");
 
 const timeline = new Timeline();
 let connection: Connection | null = null;
 let state: State = { kind: "connecting" };
 let status: { agent: string; busy: boolean; queued: number } | null = null;
+// The relay of the paired laptop.
+let relay = "";
 
 function showPairing(error = "") {
   connection?.close();
@@ -54,7 +57,9 @@ async function connect(laptop: Laptop, pair?: string) {
   pairScreen.hidden = true;
   chatScreen.hidden = false;
   nameView.textContent = laptop.name;
+  relay = laptop.relay;
   render();
+  void showNotify();
   const { device, key } = await identity();
   const current: Connection = new Connection({
     relay: laptop.relay,
@@ -76,6 +81,8 @@ async function connect(laptop: Laptop, pair?: string) {
       nameView.textContent = name;
       void saveLaptop({ ...laptop, name });
       current.send({ type: "sync", after: timeline.seq });
+      // The relay can lose the subscription, and the browser can change it. Send it again.
+      void subscription().then((sub) => sub && current.control({ type: "push", subscription: sub.toJSON() }));
     },
     onMessage: receive,
   });
@@ -204,6 +211,62 @@ prompt.onkeydown = (event) => {
 };
 
 stopButton.onclick = () => connection?.send({ type: "cancel" });
+
+// Notifications at the end of a turn that this phone started. The relay sends them with Web Push.
+// See `relay/src/push.ts` and `public/sw.js`.
+const pushSupported = "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+const iOS = /iPhone|iPad/.test(navigator.userAgent);
+let subscribed = false;
+
+async function subscription(): Promise<PushSubscription | null> {
+  if (!pushSupported) return null;
+  const registration = await navigator.serviceWorker.getRegistration();
+  return (await registration?.pushManager.getSubscription()) ?? null;
+}
+
+async function showNotify() {
+  // Safari on iOS has Web Push only in an app on the Home Screen. The button tells how to do that.
+  notifyButton.hidden = !pushSupported && !iOS;
+  subscribed = (await subscription()) !== null;
+  notifyButton.textContent = subscribed ? "Notifications on" : "Notify me";
+  notifyButton.setAttribute("aria-pressed", String(subscribed));
+}
+
+async function pushKey(): Promise<string | null> {
+  const response = await fetch(`${relay.replace(/^ws/, "http")}/v1/push`).catch(() => null);
+  if (!response?.ok) return null;
+  return ((await response.json()) as { key: string }).key;
+}
+
+notifyButton.onclick = async () => {
+  if (!pushSupported) {
+    alert("To get notifications, add this app to the Home Screen: tap Share, then Add to Home Screen. Then open the app from the Home Screen.");
+    return;
+  }
+  if (subscribed) {
+    await (await subscription())?.unsubscribe();
+    connection?.control({ type: "push", subscription: null });
+    return showNotify();
+  }
+  // Safari shows the prompt only from a click, so ask before the first `await`.
+  if ((await Notification.requestPermission()) !== "granted") {
+    alert("The browser does not let this app show notifications. Change that in the settings of the browser.");
+    return;
+  }
+  const key = await pushKey();
+  if (!key) {
+    alert("The relay of this laptop does not send notifications.");
+    return;
+  }
+  try {
+    const registration = await navigator.serviceWorker.ready;
+    const sub = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+    connection?.control({ type: "push", subscription: sub.toJSON() });
+  } catch (error) {
+    alert(`Cannot turn on the notifications: ${(error as Error).message}`);
+  }
+  void showNotify();
+};
 
 unpairButton.onclick = async () => {
   if (!confirm("Unpair this phone from the laptop?")) return;

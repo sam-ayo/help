@@ -37,6 +37,9 @@ const STOP: Record<number, { reason: string; unpaired: boolean }> = {
 
 const MAX_DELAY = 30_000;
 
+// The control messages from a phone to the relay. See `relay/src/index.ts`.
+export type PhoneControl = { type: "push"; subscription: PushSubscriptionJSON | null };
+
 export class Connection {
   #options: Options;
   #ws: WebSocket | null = null;
@@ -60,6 +63,14 @@ export class Connection {
   send(message: ToLaptop): boolean {
     if (!this.#transport || this.#ws?.readyState !== WebSocket.OPEN) return false;
     for (const chunk of this.#transport.seal(encode(message))) this.#ws.send(chunk as BufferSource);
+    return true;
+  }
+
+  // Send a control message to the relay, for example the push subscription. Returns false if
+  // the connection is not ready.
+  control(message: PhoneControl): boolean {
+    if (!this.#transport || this.#ws?.readyState !== WebSocket.OPEN) return false;
+    this.#ws.send(JSON.stringify(message));
     return true;
   }
 
