@@ -923,7 +923,7 @@ impl Block {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(move |block, event: &MouseUpEvent, _window, cx| {
-                        if event.modifiers.secondary() {
+                        if event.modifiers.secondary(cx) {
                             block.open_rendered_link(&link, cx);
                         }
                     }),
@@ -3027,7 +3027,7 @@ impl Element for LinkFollowCursor {
         window: &mut Window,
         cx: &mut App,
     ) {
-        if hitbox.is_hovered(window) && window.modifiers().secondary() {
+        if hitbox.is_hovered(window) && window.modifiers().secondary(cx) {
             // The editor root repaints on follow-modifier toggles, so the hand
             // cursor re-evaluates here even while the pointer stays still.
             window.set_cursor_style(CursorStyle::PointingHand, hitbox);
@@ -3161,7 +3161,6 @@ mod tests {
 
     #[gpui::test]
     async fn code_language_input_docks_to_right_edge(cx: &mut TestAppContext) {
-        cx.update(|cx| {});
         let (block, cx) = cx.add_window_view(|_window, cx| {
             Block::with_record(
                 cx,

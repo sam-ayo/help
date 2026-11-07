@@ -3025,7 +3025,7 @@ impl AppView {
                                             .max_h(px(PERMISSION_TITLE))
                                             .overflow_y_scroll()
                                             .track_scroll(&self.permission_scroll)
-                                            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
+                                            .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
                                             .text_sm()
                                             .text_color(theme.muted_foreground)
                                             .child(TextView::markdown("permission-title", SharedString::from(p.title.clone()))),

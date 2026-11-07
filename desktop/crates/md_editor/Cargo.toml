@@ -59,7 +59,7 @@ base64 = "0.22.1"
 cssparser = "0.37"
 directories = "6"
 futures = "0.3"
-gpui = { package = "gpui-pre", version = "=0.3.9" }
+gpui = { package = "gpui-pre", version = "=0.3.11" }
 mermaid-rs-renderer = { version = "0.3.0", default-features = false }
 ratex-layout = "0.1.9"
 ratex-parser = "0.1.9"
@@ -91,4 +91,4 @@ tree-sitter-yaml = { version = "0.7", optional = true }
 tree-sitter-toml = { package = "adot-tree-sitter-toml", version = "0.1", optional = true }
 
 [dev-dependencies]
-gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }
