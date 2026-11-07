@@ -379,7 +379,7 @@ impl AppView {
             dock::set_moving(this.chat.busy && this.chat.permission.is_none(), cx);
             this.sync_remote_status();
         }));
-        if !demo::enabled() {
+        if !demo::enabled() && phone::enabled() {
             view.start_remote(cx);
         }
         // The agent starts now, so that it is ready for the first message.
@@ -2018,7 +2018,7 @@ impl AppView {
                     .min_h_0()
                     .overflow_y_scroll()
                     .when(cfg!(debug_assertions), |el| el.child(threads))
-                    .child(div().pt_2().child(memory).child(history).child(phone).child(refresh))
+                    .child(div().pt_2().child(memory).child(history).when(phone::enabled(), |el| el.child(phone)).child(refresh))
                     .children(self.render_app_list(cx))
                     .children(self.render_cli_list(cx)),
             )

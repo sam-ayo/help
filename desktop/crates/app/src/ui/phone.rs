@@ -30,6 +30,12 @@ use remote::service::{self, FromService, Service, State, ToService};
 
 use super::{AppView, Chat, Item, Queued, TOOL_DETAIL};
 
+/// The remote control is on. The relay is not live yet, so release builds hide the feature.
+/// Debug builds, and builds that get `HELP_RELAY` (for example for `wrangler dev`), show it.
+pub(super) fn enabled() -> bool {
+    cfg!(debug_assertions) || std::env::var_os("HELP_RELAY").is_some()
+}
+
 /// The size of one module of the QR code, in pixels of the image.
 const QR_MODULE: u32 = 8;
 /// The size of the QR code on the screen.
