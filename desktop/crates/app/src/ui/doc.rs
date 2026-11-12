@@ -641,8 +641,14 @@ impl AppView {
                     .on_click(cx.listener(|this, _, _, cx| this.close_doc(cx))),
             );
 
-        // The space below the editor keeps the round corners of the card.
-        let body = div().flex_1().min_h_0().pb_3().child(editor);
+        // The space below the editor keeps the round corners of the card. An animation in the
+        // app view, such as the typing bubble, draws the window again on each frame. The cached
+        // editor renders again only when it changes, not on each of these frames.
+        let body = div()
+            .flex_1()
+            .min_h_0()
+            .pb_3()
+            .child(editor.cached(gpui::StyleRefinement::default().size_full()));
 
         let card = v_flex()
             .size_full()

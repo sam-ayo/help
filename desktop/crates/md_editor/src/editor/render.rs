@@ -21,6 +21,9 @@ const CULL_ROWS: bool = false;
 /// viewport width. See `Editor::keep_scroll_anchor`.
 const ANCHOR_FRAMES: u8 = 8;
 
+/// The most rechecks of a pending scroll-into-view, about half a second of frames.
+const MAX_SCROLL_RECHECKS: u8 = 30;
+
 /// The rows of the last frame, for `Editor::keep_scroll_anchor`.
 struct ScrollAnchorRows<'a> {
     /// The id of the first block of each row.
@@ -251,15 +254,28 @@ impl Editor {
             return;
         }
 
+        self.end_scroll_into_view();
+    }
+
+    fn end_scroll_into_view(&mut self) {
         self.pending_scroll_active_block_into_view = false;
         self.scroll_recheck_task = None;
+        self.scroll_recheck_tries = 0;
     }
 
     /// Requests a repaint one frame out so a still-pending scroll-into-view can
     /// retry once the target block has been laid out. `cx.notify()` is swallowed
     /// when called from within `render`, so without this the retry would wait
     /// for the next external notify (e.g. the cursor blink, ~0.5s later).
+    ///
+    /// With no focused block, the retry never finds bounds. Each retry renders
+    /// all blocks again, so the editor stops after `MAX_SCROLL_RECHECKS`.
     fn schedule_scroll_recheck(&mut self, cx: &mut Context<Self>) {
+        if self.scroll_recheck_tries >= MAX_SCROLL_RECHECKS {
+            self.end_scroll_into_view();
+            return;
+        }
+        self.scroll_recheck_tries += 1;
         self.scroll_recheck_task = Some(cx.spawn(async move |this: WeakEntity<Self>, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(16))

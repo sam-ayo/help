@@ -2966,3 +2966,20 @@ async fn typing_destination_into_empty_link_parens_keeps_caret_inside(cx: &mut T
         assert_eq!(block.selected_range, close..close);
     });
 }
+
+#[test]
+fn the_cursor_shows_then_blinks_on_and_off() {
+    use super::{cursor_opacity_at, until_cursor_blink};
+    use std::time::Duration;
+    let ms = Duration::from_millis;
+    assert_eq!(cursor_opacity_at(ms(0)), 1.0);
+    assert_eq!(cursor_opacity_at(ms(499)), 1.0);
+    assert_eq!(cursor_opacity_at(ms(500)), 0.0);
+    assert_eq!(cursor_opacity_at(ms(999)), 0.0);
+    assert_eq!(cursor_opacity_at(ms(1000)), 1.0);
+    // The loop wakes once for each change, just after it.
+    assert_eq!(until_cursor_blink(ms(0)), ms(501));
+    assert_eq!(until_cursor_blink(ms(499)), ms(2));
+    assert_eq!(until_cursor_blink(ms(750)), ms(251));
+    assert_eq!(cursor_opacity_at(ms(750) + until_cursor_blink(ms(750))), 1.0);
+}

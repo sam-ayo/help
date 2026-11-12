@@ -72,6 +72,9 @@ pub struct Editor {
     scrollbar_visible_until: Instant,
     scrollbar_fade_task: Option<Task<()>>,
     scroll_recheck_task: Option<Task<()>>,
+    /// The rechecks of the pending scroll-into-view since the last request. See
+    /// `schedule_scroll_recheck`.
+    scroll_recheck_tries: u8,
     scrollbar_drag: Option<ScrollbarDragSession>,
     undo_history: Vec<HistoryEntry>,
     redo_history: Vec<HistoryEntry>,
@@ -280,6 +283,7 @@ impl Editor {
             scrollbar_visible_until: Instant::now(),
             scrollbar_fade_task: None,
             scroll_recheck_task: None,
+            scroll_recheck_tries: 0,
             scrollbar_drag: None,
             undo_history: Vec::new(),
             redo_history: Vec::new(),

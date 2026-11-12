@@ -2038,12 +2038,10 @@ impl Block {
         cx.notify();
     }
 
-    /// Starts the cursor blink loop: a repeating background timer every 33ms
-    /// that calls `cx.notify()` to repaint the cursor — but only while the
-    /// cursor opacity is actually animating. During the first 0.5 s after
-    /// each `cursor_blink_epoch` reset (which arrow keys / typing trigger),
-    /// opacity is pinned to 1.0, so a repaint would just re-do the full
-    /// projection rebuild for no visible change.
+    /// Starts the cursor blink loop. The loop wakes only when the cursor
+    /// shows or hides, and then calls `cx.notify()`. A notify of a block also
+    /// makes the editor render all blocks again, so a smooth fade at 30 frames
+    /// a second kept a large document busy on the main thread all the time.
     ///
     /// The blink task is automatically cancelled when the block loses focus
     /// (the task handle is dropped in [`Block::render`]).
@@ -2051,15 +2049,14 @@ impl Block {
         self.cursor_blink_epoch = Instant::now();
         self.cursor_blink_task = Some(cx.spawn(
             async |this: WeakEntity<Block>, cx: &mut AsyncApp| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
+                let Ok(wait) = this.update(cx, |this: &mut Block, _| {
+                    until_cursor_blink(this.cursor_blink_epoch.elapsed())
+                }) else {
+                    break;
+                };
+                cx.background_executor().timer(wait).await;
                 if this
-                    .update(cx, |this: &mut Block, cx: &mut Context<Block>| {
-                        if this.cursor_blink_epoch.elapsed().as_secs_f32() >= 0.5 {
-                            cx.notify();
-                        }
-                    })
+                    .update(cx, |_: &mut Block, cx: &mut Context<Block>| cx.notify())
                     .is_err()
                 {
                     break;
@@ -2068,15 +2065,11 @@ impl Block {
         ));
     }
 
-    /// Cosine-based smooth blink: fully opaque for 0.5s, then oscillates
-    /// with a period of ~1s (33ms x 30 ticks ~= 1s).
+    /// The cursor shows for `CURSOR_BLINK` after each `cursor_blink_epoch`
+    /// reset (which arrow keys / typing trigger), then hides and shows in
+    /// turn, for `CURSOR_BLINK` each time.
     pub fn cursor_opacity(&self) -> f32 {
-        let elapsed = self.cursor_blink_epoch.elapsed().as_secs_f32();
-        if elapsed < 0.5 {
-            return 1.0;
-        }
-        let t = elapsed - 0.5;
-        (f32::cos(t * std::f32::consts::TAU) + 1.0) / 2.0
+        cursor_opacity_at(self.cursor_blink_epoch.elapsed())
     }
 
     pub fn cursor_offset(&self) -> usize {
@@ -2284,6 +2277,24 @@ impl Block {
             self.text_align(),
         )
     }
+}
+
+/// How long the cursor shows, and then how long it hides, in each blink.
+const CURSOR_BLINK: Duration = Duration::from_millis(500);
+
+/// The opacity of the cursor `elapsed` after the last reset: 1 in the first
+/// `CURSOR_BLINK` and in each even one after it, 0 in each odd one.
+fn cursor_opacity_at(elapsed: Duration) -> f32 {
+    let phase = elapsed.as_millis() / CURSOR_BLINK.as_millis();
+    if phase.is_multiple_of(2) { 1.0 } else { 0.0 }
+}
+
+/// The time from `elapsed` to the next change of the cursor opacity. The
+/// extra millisecond puts the wake after the change, not on it.
+fn until_cursor_blink(elapsed: Duration) -> Duration {
+    let blink = CURSOR_BLINK.as_millis();
+    let into = elapsed.as_millis() % blink;
+    Duration::from_millis((blink - into) as u64 + 1)
 }
 
 #[cfg(test)]

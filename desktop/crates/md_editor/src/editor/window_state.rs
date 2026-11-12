@@ -322,6 +322,7 @@ impl Editor {
 
     pub(super) fn request_active_block_scroll_into_view(&mut self, cx: &mut Context<Self>) {
         self.pending_scroll_recheck_after_layout = true;
+        self.scroll_recheck_tries = 0;
         if !self.pending_scroll_active_block_into_view {
             self.pending_scroll_active_block_into_view = true;
             cx.notify();

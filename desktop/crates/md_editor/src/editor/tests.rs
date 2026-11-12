@@ -157,3 +157,23 @@ fn rows_after_a_long_paragraph_keep_their_width() {
         assert!(widths.iter().all(|width| *width > 100.0), "{widths:?}");
     });
 }
+
+/// With no focused block, a pending scroll-into-view never finds the caret. The
+/// editor must stop the rechecks, because each one renders all blocks again.
+#[test]
+fn an_editor_without_focus_stops_the_scroll_rechecks() {
+    let mut cx = TestAppContext::single();
+    let (editor, cx) = cx.add_window_view(|_window, cx| {
+        Editor::new("# Title\n\nFirst.\n\nSecond.", MarkdownEditorOptions::default(), cx)
+    });
+    cx.update(|window, cx| window.blur(cx));
+    for _ in 0..100 {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().advance_clock(std::time::Duration::from_millis(20));
+        cx.run_until_parked();
+    }
+    editor.read_with(cx, |editor, _| {
+        assert!(!editor.pending_scroll_active_block_into_view);
+        assert!(editor.scroll_recheck_task.is_none());
+    });
+}
