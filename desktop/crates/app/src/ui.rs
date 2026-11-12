@@ -229,7 +229,8 @@ pub struct AppView {
     doc: Option<doc::Doc>,
     /// A document that the app read before the user opened it. See `prefetch_document`.
     doc_prefetch: Option<doc::Doc>,
-    /// The width of the document panel. The user changes it with a drag of the left edge.
+    /// The width of the document panel. The user changes it with a drag of the left edge, and
+    /// the app keeps it for the next start. See `doc::load_width`.
     doc_width: f32,
     /// The document shows across the full window, not in the panel. See `toggle_full_doc`.
     doc_full: bool,
@@ -326,6 +327,7 @@ impl AppView {
             }
         })
         .detach();
+        let doc_width_file = env.doc_width_file.clone();
         let mut view = Self {
             env,
             thread: Thread::Main,
@@ -347,7 +349,7 @@ impl AppView {
             app_width: mcp_app::PANEL,
             doc: None,
             doc_prefetch: None,
-            doc_width: doc::WIDTH,
+            doc_width: doc::load_width(&doc_width_file),
             doc_full: false,
             doc_focus: cx.focus_handle(),
             panel_resize: None,

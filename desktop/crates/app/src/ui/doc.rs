@@ -33,6 +33,16 @@ const FULL_COLUMN: f32 = 680.;
 /// The space at the left side of the window for the traffic lights.
 const TRAFFIC_LIGHTS: f32 = 84.;
 
+/// The width of the document panel that the user set last, from `file`, or `WIDTH`.
+/// `side_panel` keeps the width in the room of the window.
+pub(super) fn load_width(file: &Path) -> f32 {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|text| text.trim().parse::<f32>().ok())
+        .filter(|width| width.is_finite())
+        .map_or(WIDTH, |width| width.max(MIN_PANEL))
+}
+
 /// A drag of the left edge of the panel, which changes the width of the panel.
 #[derive(Clone)]
 struct Resize;
@@ -655,7 +665,15 @@ impl AppView {
                     .into_any_element(),
             );
         }
-        Some(self.side_panel("doc-panel", self.doc_width, WIDTH, INSET, |this, w| this.doc_width = w, card, window, cx))
+        Some(self.side_panel("doc-panel", self.doc_width, WIDTH, INSET, Self::set_doc_width, card, window, cx))
+    }
+
+    /// Give the document panel a new width, and keep the width for the next start.
+    fn set_doc_width(&mut self, width: f32) {
+        self.doc_width = width;
+        if let Err(e) = std::fs::write(&self.env.doc_width_file, format!("{}", width.round())) {
+            tracing::warn!("cannot save the width of the document panel: {e}");
+        }
     }
 
     /// A panel at the right side of the window, with `pad` of space between the panel and the
@@ -675,15 +693,29 @@ impl AppView {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         // The edge is the `INSET` at the left side of the card. Without `pad`, the edge is at
-        // the left side of the panel, above the conversation.
+        // the left side of the panel, above the conversation. A line shows on the edge while
+        // the pointer is on it, so that the user sees where to drag.
+        let group = SharedString::from(format!("{id}-edge"));
+        let handle = div()
+            .absolute()
+            .top(px(INSET + 12.))
+            .bottom(px(INSET + 12.))
+            .left(px(INSET / 2. - 1.5))
+            .w(px(3.))
+            .rounded_full()
+            .bg(accent(cx.theme()).opacity(0.5))
+            .invisible()
+            .when(self.panel_resize.is_none(), |el| el.group_hover(group.clone(), |s| s.visible()));
         let edge = div()
             .id((id, 0usize))
+            .group(group)
             .absolute()
             .left(px(pad - INSET))
             .top_0()
             .h_full()
             .w(px(INSET))
             .cursor_col_resize()
+            .child(handle)
             .on_drag(Resize, |drag, _, _, cx| cx.new(|_| drag.clone()))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                 if event.click_count() == 2 {
@@ -747,6 +779,20 @@ mod tests {
                     Not /Users/me/notes.md, not /Users/me/Library/Application Support/Help/documents/sub/x.md.";
         assert_eq!(links(text, dir), vec![dir.join("trip-plan.md"), dir.join("budget.md")]);
         assert!(links("no documents", dir).is_empty());
+    }
+
+    #[test]
+    fn the_panel_starts_with_the_saved_width() {
+        let file = std::env::temp_dir().join(format!("help-doc-width-{}", std::process::id()));
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(load_width(&file), WIDTH);
+        std::fs::write(&file, "620\n").unwrap();
+        assert_eq!(load_width(&file), 620.);
+        std::fs::write(&file, "10").unwrap();
+        assert_eq!(load_width(&file), MIN_PANEL);
+        std::fs::write(&file, "wide").unwrap();
+        assert_eq!(load_width(&file), WIDTH);
+        std::fs::remove_file(&file).unwrap();
     }
 
     #[test]

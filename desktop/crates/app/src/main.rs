@@ -39,6 +39,8 @@ pub struct Env {
     pub history_file: PathBuf,
     /// The colors of the avatar that the user picked.
     pub avatar_file: PathBuf,
+    /// The width of the document panel that the user set last. See `ui::doc`.
+    pub doc_width_file: PathBuf,
     /// The images that the user pastes, and the files that the agent sends. The conversation
     /// keeps the paths of these files.
     pub files_dir: PathBuf,
@@ -183,6 +185,7 @@ fn main() {
         memory_file: support.join("memory.md"),
         history_file: support.join("help-memory.md"),
         avatar_file: support.join("avatar"),
+        doc_width_file: support.join("doc-width"),
         files_dir: support.join("files"),
         docs_dir: support.join("documents"),
         test_conversation_file: support.join("test-conversation.json"),
