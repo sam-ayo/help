@@ -267,6 +267,10 @@ pub struct AppView {
     demo_data: demo::Data,
     /// The remote control from a phone. See `phone`.
     phone: phone::Phone,
+    /// The frame of the moving avatar that shows, and the timer of the next frame. See
+    /// `live_avatar`.
+    avatar_frame: usize,
+    avatar_tick: Option<gpui::Task<()>>,
     _subs: Vec<gpui::Subscription>,
 }
 
@@ -366,6 +370,8 @@ impl AppView {
             text_layout: (0, 0, 0),
             demo_data,
             phone: phone::Phone::default(),
+            avatar_frame: 0,
+            avatar_tick: None,
             _subs: subs,
         };
         for event in demo::app_call() {
@@ -1718,11 +1724,6 @@ fn avatar(size: f32) -> gpui::AnyElement {
     avatar_image(None, size)
 }
 
-/// The avatar with the moving gradient, for the places that show the assistant alone.
-fn live_avatar(id: &'static str, size: f32) -> gpui::AnyElement {
-    avatar_image(Some(id), size)
-}
-
 /// A menu item with the three colors of an avatar palette before the label.
 fn avatar_item(palette: &'static avatar::Palette) -> PopupMenuItem {
     PopupMenuItem::element(move |_, _| {
@@ -1739,19 +1740,15 @@ fn avatar_item(palette: &'static avatar::Palette) -> PopupMenuItem {
     })
 }
 
-fn avatar_image(id: Option<&'static str>, size: f32) -> gpui::AnyElement {
+/// The avatar with the frame `index` of the moving avatar, or the still avatar.
+fn avatar_image(index: Option<usize>, size: f32) -> gpui::AnyElement {
     let Some(images) = avatar::images() else {
         // The frames render at startup. Until then, a circle of the background color.
         let color = avatar::hex(avatar::selected().background);
         return div().flex_shrink_0().size(px(size)).rounded_full().bg(rgb(color)).into_any_element();
     };
-    let source = if id.is_some() { images.moving.clone() } else { images.still.clone() };
-    let image = gpui::img(source).flex_shrink_0().size(px(size));
-    // GPUI plays the frames only for an image with an id.
-    match id {
-        Some(id) => image.id(id).into_any_element(),
-        None => image.into_any_element(),
-    }
+    let source = index.and_then(|i| images.frames.get(i)).unwrap_or(&images.still).clone();
+    gpui::img(source).flex_shrink_0().size(px(size)).into_any_element()
 }
 
 /// The progress of the subagents of the current turn, for example "2 of 3 subagents done…",
@@ -3064,6 +3061,26 @@ impl AppView {
         .into_any_element()
     }
 
+    /// The avatar with the moving gradient, for the places that show the assistant alone.
+    /// GPUI plays an image with many frames at the rate of the display, and draws the whole
+    /// window for each frame. This shows one frame, and draws the window again only for the
+    /// next frame, 30 times a second. The avatar stops when the window is not active, and
+    /// when "Reduce motion" is on.
+    fn live_avatar(&mut self, size: f32, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if window.is_window_active() && !cx.reduce_motion() && self.avatar_tick.is_none() {
+            let (_, next) = avatar::frame_now();
+            self.avatar_tick = Some(cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(next).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.avatar_frame = avatar::frame_now().0;
+                    this.avatar_tick = None;
+                    cx.notify();
+                });
+            }));
+        }
+        avatar_image(Some(self.avatar_frame), size)
+    }
+
     /// The top of a new chat, as a new message in Messages: a "To:" line with the assistant
     /// as the recipient. A click on the recipient opens a menu to change the agent.
     fn render_to_line(&self, sidebar: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -3356,10 +3373,12 @@ impl AppView {
             },
         );
         let theme = cx.theme().clone();
+        // The header shows the moving avatar when the conversation has messages.
+        let empty = self.chat.items.iter().all(|i| matches!(i, Item::Notice(_) | Item::Error(_)));
+        let live = (!empty).then(|| self.live_avatar(56., window, cx));
         let chat = &self.chat;
         let busy = chat.busy;
         // Before the first message, the pane shows the "To:" line and no messages.
-        let empty = chat.items.iter().all(|i| matches!(i, Item::Notice(_) | Item::Error(_)));
         let permission = chat.permission.as_ref().map(|p| self.render_permission(p, cx));
         let queue = self.render_queue(cx);
         let composer = v_flex()
@@ -3395,7 +3414,7 @@ impl AppView {
                 v_flex()
                     .pt(px(2.))
                     .items_center()
-                    .child(live_avatar("avatar-header", 56.))
+                    .children(live)
                     .child(div().text_xs().font_medium().child(ASSISTANT_NAME)),
             )
             .child(div().flex_1())

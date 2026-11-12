@@ -3,8 +3,9 @@
 //! of boring-avatars 2.0.4.
 //!
 //! The moving avatar is a loop of frames. The two blobs of color turn and drift, so the
-//! gradient moves. GPUI plays the frames as it plays a GIF. It stops when the window is not
-//! active, and when "Reduce motion" is on in the macOS settings.
+//! gradient moves. The app shows one frame at a time, 30 frames a second. See `frame_now`.
+//! It stops when the window is not active, and when "Reduce motion" is on in the macOS
+//! settings.
 //!
 //! The Dock icon and the menu bar item are the avatar too, in the same colors. See `dock`
 //! and `presence`.
@@ -21,7 +22,7 @@ use std::{
 use super::dock;
 use crate::presence;
 use gpui::{App, DevicePixels, RenderImage, SvgRenderer, SvgSize, size};
-use image::{Delay, Frame, ImageEncoder, RgbaImage};
+use image::ImageEncoder;
 
 /// The colors of an avatar. The user picks one in the theme menu.
 pub struct Palette {
@@ -80,7 +81,22 @@ const SCALE: f32 = 0.6;
 pub struct Images {
     /// The first frame, for the avatars next to the messages.
     pub still: Arc<RenderImage>,
-    pub moving: Arc<RenderImage>,
+    /// The frames of the moving avatar, each a separate image.
+    pub frames: Vec<Arc<RenderImage>>,
+}
+
+/// The frame of the moving avatar now, and the time until the next frame. All windows show
+/// the same frame, because the loop starts at the first call.
+pub fn frame_now() -> (usize, std::time::Duration) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    frame_at(START.get_or_init(std::time::Instant::now).elapsed())
+}
+
+fn frame_at(elapsed: std::time::Duration) -> (usize, std::time::Duration) {
+    let frame = 1_000_000_000 / u128::from(FPS);
+    let n = elapsed.as_nanos() / frame;
+    let next = (n + 1) * frame - elapsed.as_nanos();
+    ((n % u128::from(FRAMES)) as usize, std::time::Duration::from_nanos(next as u64))
 }
 
 /// The palette that the user picked, as an index in `PALETTES`.
@@ -181,7 +197,9 @@ fn show(index: usize, cx: &mut App) {
                 for window in cx.windows() {
                     let _ = window.update(cx, |_, window, _| {
                         let _ = window.drop_image(old.still.clone());
-                        let _ = window.drop_image(old.moving.clone());
+                        for frame in &old.frames {
+                            let _ = window.drop_image(frame.clone());
+                        }
                     });
                 }
             }
@@ -192,24 +210,13 @@ fn show(index: usize, cx: &mut App) {
 }
 
 fn render(renderer: &SvgRenderer, palette: &Palette) -> anyhow::Result<Images> {
-    let delay = Delay::from_numer_denom_ms(1000, FPS);
-    let mut frames = Vec::with_capacity(FRAMES as usize);
-    let mut still = None;
-    for i in 0..FRAMES {
-        let svg = renderer.parse_svg(svg(palette, i as f32 / FRAMES as f32, ROUND).as_bytes())?;
-        let image = renderer.render_parsed(&svg, SCALE)?;
-        let size = image.size(0);
-        let bytes = image.as_bytes(0).unwrap_or_default().to_vec();
-        // The bytes are BGRA, as RenderImage keeps them. RgbaImage is only the container.
-        let buffer = RgbaImage::from_raw(size.width.0 as u32, size.height.0 as u32, bytes)
-            .ok_or_else(|| anyhow::anyhow!("the frame has the wrong size"))?;
-        frames.push(Frame::from_parts(buffer, 0, 0, delay));
-        still.get_or_insert(image);
-    }
-    Ok(Images {
-        still: still.ok_or_else(|| anyhow::anyhow!("no frames"))?,
-        moving: Arc::new(RenderImage::new(frames)),
-    })
+    let frames = (0..FRAMES)
+        .map(|i| {
+            let svg = renderer.parse_svg(svg(palette, i as f32 / FRAMES as f32, ROUND).as_bytes())?;
+            Ok(renderer.render_parsed(&svg, SCALE)?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Images { still: frames.first().cloned().ok_or_else(|| anyhow::anyhow!("no frames"))?, frames })
 }
 
 /// The Dock icon at the time `t` of the loop, as a PNG `width` pixels wide. The avatar has the
@@ -348,7 +355,20 @@ mod tests {
         let start = std::time::Instant::now();
         let images = render(&renderer, &PALETTES[0]).unwrap();
         eprintln!("{FRAMES} frames in {:?}", start.elapsed());
-        assert_eq!(images.moving.frame_count(), FRAMES as usize);
+        assert_eq!(images.frames.len(), FRAMES as usize);
+    }
+
+    #[test]
+    fn the_frames_follow_the_clock() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        assert_eq!(frame_at(ms(0)).0, 0);
+        assert_eq!(frame_at(ms(34)).0, 1);
+        // The wake is at the start of the next frame.
+        let (_, next) = frame_at(ms(10));
+        assert_eq!(frame_at(ms(10) + next).0, 1);
+        // After 6 seconds the loop starts again.
+        assert_eq!(frame_at(ms(6_000)).0, 0);
     }
 
     #[test]
@@ -415,7 +435,7 @@ mod tests {
             for pixel in bytes.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
-            let image = RgbaImage::from_raw(DMG_WIDTH, DMG_HEIGHT, bytes).unwrap();
+            let image = image::RgbaImage::from_raw(DMG_WIDTH, DMG_HEIGHT, bytes).unwrap();
             let (x, y, w, h) = if i == 0 { (0, 0, DMG_WIDTH, DMG_HEIGHT) } else { (left, top, width, width) };
             let mut part = image::imageops::crop_imm(&image, x, y, w, h).to_image().into_raw();
             let mut frame = gif::Frame::from_rgba_speed(w as u16, h as u16, &mut part, 10);
