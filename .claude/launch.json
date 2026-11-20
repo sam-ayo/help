@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pwa-demo",
+      "runtimeExecutable": "pnpm",
+      "runtimeArgs": ["--dir", "pwa", "demo"],
+      "port": 5173
+    }
+  ]
+}
