@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { ArrowUpIcon, BellIcon, BellRingIcon, SquareIcon } from "lucide-react";
 import { TimelineItem } from "@/components/timeline-item.tsx";
+import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupTextarea } from "@/components/ui/input-group";
 import {
@@ -84,6 +85,14 @@ function Timeline() {
                 <TimelineItem item={item} last={index === items.length - 1} />
               </MessageScrollerItem>
             ))}
+            {remote.state.kind === "stopped" && (
+              // The connection does not start again, so tell why at the end of the timeline.
+              <MessageScrollerItem messageId="stopped">
+                <Bubble variant="destructive">
+                  <BubbleContent>{remote.state.reason}</BubbleContent>
+                </Bubble>
+              </MessageScrollerItem>
+            )}
           </MessageScrollerContent>
         </MessageScrollerViewport>
         <MessageScrollerButton />
