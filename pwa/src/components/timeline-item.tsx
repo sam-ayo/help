@@ -20,7 +20,7 @@ import {
   WrenchIcon,
   type LucideIcon,
 } from "lucide-react";
-import { Streamdown } from "streamdown";
+import { Markdown } from "@/components/markdown.tsx";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
 import { CodeBlock, CodeBlockContent } from "@/components/ui/code-block";
@@ -58,9 +58,7 @@ export function TimelineItem({ item, last }: { item: Item; last: boolean }) {
       return (
         <Message>
           <MessageContent>
-            <Streamdown className="text-sm leading-relaxed" isAnimating={streaming}>
-              {item.text}
-            </Streamdown>
+            <Markdown streaming={streaming}>{item.text}</Markdown>
           </MessageContent>
         </Message>
       );
