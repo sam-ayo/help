@@ -28,6 +28,7 @@ export function Chat() {
 
 function Header() {
   const remote = useRemote();
+  const status = stateText(remote);
   const tone = remote.busy ? "bg-amber-400" : remote.ready ? "bg-emerald-500" : remote.state.kind === "stopped" ? "bg-destructive" : "bg-muted-foreground";
 
   async function notify() {
@@ -47,10 +48,12 @@ function Header() {
     <header className="flex items-center gap-2 border-b px-4 py-2">
       <div className="flex min-w-0 flex-1 flex-col">
         <strong className="truncate text-sm font-semibold">{remote.name}</strong>
-        <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-          <span className={`size-1.5 shrink-0 rounded-full ${tone}`} />
-          <span className="truncate">{stateText(remote)}</span>
-        </span>
+        {status && (
+          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+            <span className={`size-1.5 shrink-0 rounded-full ${tone}`} />
+            <span className="truncate">{status}</span>
+          </span>
+        )}
       </div>
       {(pushSupported || iOS) && (
         <Button variant="ghost" size="sm" aria-pressed={remote.notifications} onClick={notify}>
@@ -71,6 +74,7 @@ function Header() {
   );
 }
 
+// The status line under the name of the laptop. It is empty when the agent is ready.
 function stateText(remote: ReturnType<typeof useRemote>): string {
   const { state, status } = remote;
   switch (state.kind) {
@@ -81,9 +85,9 @@ function stateText(remote: ReturnType<typeof useRemote>): string {
     case "stopped":
       return state.reason;
     case "ready": {
-      if (!status) return "Connected";
+      if (!status) return "";
       const queued = status.queued ? `, ${status.queued} queued` : "";
-      return `${status.agent}: ${status.busy ? "working" : "ready"}${queued}`;
+      return status.busy ? `Working${queued}` : "";
     }
   }
 }
