@@ -5,9 +5,6 @@
 //!
 //! The app gives the events to the service. The service keeps the newest events in a log, so a
 //! phone that connects again gets the events that it did not get.
-//!
-//! When a turn that a phone started ends, or asks for permission, the service tells the relay to
-//! send a notification to the phones that are not connected. See `relay/src/push.ts`.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -30,8 +27,6 @@ use crate::pairing::{CODE_LIFETIME, PairingLink, random_token};
 const LOG: usize = 5000;
 /// The prompt IDs that the service remembers, to ignore a prompt that a phone sends again.
 const PROMPT_IDS: usize = 200;
-/// The prompts from phones that wait in the queue of the app, for `remote_turn`.
-const PHONE_PROMPTS: usize = 50;
 const PING: Duration = Duration::from_secs(15);
 /// The relay must send a message (a pong at least) in this time, or the service connects again.
 /// A connection can stop without a close, for example when the Wi-Fi network changes.
@@ -171,11 +166,6 @@ struct Laptop {
     first: u64,
     status: ToPhone,
     prompt_ids: VecDeque<String>,
-    /// The texts of the prompts from phones that did not start yet. The app gives each prompt
-    /// back as `Event::UserText` when its turn starts.
-    phone_prompts: VecDeque<String>,
-    /// The turn now is from a phone.
-    remote_turn: bool,
     online: bool,
     error: Option<String>,
     /// The frames for the relay, while the service is connected.
@@ -216,8 +206,6 @@ impl Laptop {
             first: start.as_millis() as u64 * 1000 + 1,
             status: ToPhone::Status { agent: String::new(), busy: false, queued: 0 },
             prompt_ids: VecDeque::new(),
-            phone_prompts: VecDeque::new(),
-            remote_turn: false,
             online: false,
             error: None,
             frames: Vec::new(),
@@ -364,7 +352,6 @@ impl Laptop {
     fn command(&mut self, command: ToService) {
         match command {
             ToService::Event(event) => {
-                self.notify(&event);
                 self.log.push_back(event.clone());
                 if self.log.len() > LOG {
                     self.log.pop_front();
@@ -530,10 +517,6 @@ impl Laptop {
                 if self.prompt_ids.len() > PROMPT_IDS {
                     self.prompt_ids.pop_front();
                 }
-                self.phone_prompts.push_back(text.clone());
-                if self.phone_prompts.len() > PHONE_PROMPTS {
-                    self.phone_prompts.pop_front();
-                }
                 let _ = self.out.send(FromService::Prompt { text });
             }
             ToLaptop::Cancel => {
@@ -544,28 +527,6 @@ impl Laptop {
             }
             ToLaptop::Sync { after } => self.sync(device, after),
         }
-    }
-
-    /// Tell the relay to send a notification, for an event of a turn from a phone.
-    fn notify(&mut self, event: &Event) {
-        let kind = match event {
-            Event::UserText { text } => {
-                let found = self.phone_prompts.iter().position(|p| p == text);
-                self.remote_turn = found.and_then(|i| self.phone_prompts.remove(i)).is_some();
-                return;
-            }
-            Event::Permission { .. } if self.remote_turn => "permission",
-            Event::TurnEnded { reason } if self.remote_turn => {
-                self.remote_turn = false;
-                // The phone stopped the turn, so it does not need a notification.
-                if reason == "Cancelled" {
-                    return;
-                }
-                "turn_end"
-            }
-            _ => return,
-        };
-        self.control(serde_json::json!({ "type": "notify", "kind": kind }));
     }
 
     /// Send the events after `after` to a phone.
@@ -711,53 +672,4 @@ mod tests {
         assert!(!clock.slept());
     }
 
-    /// The control messages that the laptop sends to the relay.
-    fn controls(laptop: &mut Laptop) -> Vec<serde_json::Value> {
-        laptop
-            .frames
-            .drain(..)
-            .filter_map(|m| match m {
-                Message::Text(text) => serde_json::from_str(&text).ok(),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[test]
-    fn only_a_turn_from_a_phone_sends_notifications() {
-        let dir = std::env::temp_dir().join(format!("help-remote-{}", std::process::id()));
-        let config = Config {
-            relay: "ws://localhost".into(),
-            pwa: "http://localhost".into(),
-            state_file: dir.join("remote.json"),
-            name: "Mac".into(),
-        };
-        let (out, _rx) = mpsc::unbounded_channel();
-        let mut laptop = Laptop::load(config, out).unwrap();
-        laptop.online = true;
-        let ended = || ToService::Event(Event::TurnEnded { reason: "end_turn".into() });
-        let notify = |kind: &str| serde_json::json!({ "type": "notify", "kind": kind });
-
-        // A turn from the laptop.
-        laptop.command(ToService::Event(Event::UserText { text: "local".into() }));
-        laptop.command(ended());
-        assert!(controls(&mut laptop).is_empty());
-
-        // A turn from a phone, which waited in the queue of the app.
-        laptop.message("phone", ToLaptop::Prompt { id: "1".into(), text: "remote".into() });
-        laptop.command(ToService::Event(Event::UserText { text: "local again".into() }));
-        laptop.command(ended());
-        assert!(controls(&mut laptop).is_empty());
-        laptop.command(ToService::Event(Event::UserText { text: "remote".into() }));
-        laptop.command(ToService::Event(Event::Permission { request: 1, title: "Run".into(), options: Vec::new() }));
-        laptop.command(ended());
-        assert_eq!(controls(&mut laptop), vec![notify("permission"), notify("turn_end")]);
-
-        // The phone stopped its turn.
-        laptop.message("phone", ToLaptop::Prompt { id: "2".into(), text: "stop me".into() });
-        laptop.command(ToService::Event(Event::UserText { text: "stop me".into() }));
-        laptop.command(ToService::Event(Event::TurnEnded { reason: "Cancelled".into() }));
-        assert!(controls(&mut laptop).is_empty());
-        let _ = std::fs::remove_dir_all(dir);
-    }
 }

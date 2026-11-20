@@ -6,7 +6,6 @@ import { useSyncExternalStore } from "react";
 import { Connection, type State } from "./connection.ts";
 import { parsePairingLink } from "./pairing.ts";
 import type { PermissionOption, ToLaptop, ToPhone } from "./protocol.ts";
-import { dropPushSubscription } from "./push.ts";
 import { forgetLaptop, identity, loadLaptop, saveLaptop, type Laptop } from "./store.ts";
 import { Timeline, type Item } from "./timeline.ts";
 
@@ -141,8 +140,6 @@ class Remote {
         this.name = name;
         void saveLaptop({ ...laptop, name });
         current.send({ type: "sync", after: this.timeline.seq });
-        // The app does not send notifications now. Remove a subscription from an older version.
-        void dropPushSubscription().then((dropped) => dropped && current.control({ type: "push", subscription: null }));
       },
       onMessage: (message) => this.#receive(message),
     });
