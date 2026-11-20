@@ -133,7 +133,7 @@ function Composer() {
         send();
       }}
     >
-      <InputGroup>
+      <InputGroup className="has-[[data-slot=input-group-control]:focus-visible]:border-input has-[[data-slot=input-group-control]:focus-visible]:ring-0">
         <InputGroupTextarea
           rows={2}
           placeholder="Message the agent"
