@@ -1,7 +1,7 @@
 // The chat with the agent on the laptop: the header, the timeline, and the composer.
 
 import { useState } from "react";
-import { ArrowUpIcon, BellIcon, BellRingIcon, SquareIcon } from "lucide-react";
+import { ArrowUpIcon, SquareIcon } from "lucide-react";
 import { TimelineItem } from "@/components/timeline-item.tsx";
 import { Bubble, BubbleContent } from "@/components/ui/bubble";
 import { Button } from "@/components/ui/button";
@@ -14,7 +14,6 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller";
-import { iOS, pushSupported } from "@/push.ts";
 import { useRemote } from "@/remote.ts";
 
 export function Chat() {
@@ -30,28 +29,9 @@ export function Chat() {
 function Header() {
   const remote = useRemote();
 
-  async function notify() {
-    // Safari on iOS has Web Push only in an app on the Home Screen. The button tells how to do that.
-    if (!pushSupported) {
-      alert("To get notifications, add this app to the Home Screen: tap Share, then Add to Home Screen. Then open the app from the Home Screen.");
-      return;
-    }
-    try {
-      await remote.toggleNotifications();
-    } catch (error) {
-      alert((error as Error).message);
-    }
-  }
-
   return (
     <header className="flex items-center gap-2 border-b px-4 py-2">
       <strong className="min-w-0 flex-1 truncate text-sm font-semibold">{remote.name}</strong>
-      {(pushSupported || iOS) && (
-        <Button variant="ghost" size="sm" aria-pressed={remote.notifications} onClick={notify}>
-          {remote.notifications ? <BellRingIcon /> : <BellIcon />}
-          {remote.notifications ? "Notifications on" : "Notify me"}
-        </Button>
-      )}
       <Button
         variant="ghost"
         size="sm"

@@ -6,7 +6,7 @@ import { useSyncExternalStore } from "react";
 import { Connection, type State } from "./connection.ts";
 import { parsePairingLink } from "./pairing.ts";
 import type { PermissionOption, ToLaptop, ToPhone } from "./protocol.ts";
-import { pushSupported, subscribe, subscription } from "./push.ts";
+import { dropPushSubscription } from "./push.ts";
 import { forgetLaptop, identity, loadLaptop, saveLaptop, type Laptop } from "./store.ts";
 import { Timeline, type Item } from "./timeline.ts";
 
@@ -21,13 +21,10 @@ class Remote {
   state: State = { kind: "connecting" };
   status: AgentStatus | null = null;
   timeline = new Timeline();
-  notifications = false;
   // React renders again when this number changes.
   version = 0;
 
   #connection: Connection | null = null;
-  // The relay of the paired laptop.
-  #relay = "";
   #listeners = new Set<() => void>();
   #frame = 0;
 
@@ -103,24 +100,6 @@ class Remote {
     this.#connection?.wake();
   }
 
-  // Turn the notifications on or off. Call it from a click. Throws an error with a message for
-  // the user.
-  async toggleNotifications() {
-    if (this.notifications) {
-      await (await subscription())?.unsubscribe();
-      this.#connection?.control({ type: "push", subscription: null });
-    } else {
-      const sub = await subscribe(this.#relay);
-      this.#connection?.control({ type: "push", subscription: sub.toJSON() });
-    }
-    await this.#readNotifications();
-  }
-
-  async #readNotifications() {
-    this.notifications = pushSupported && (await subscription()) !== null;
-    this.#changed();
-  }
-
   #send(message: ToLaptop): boolean {
     return this.#connection?.send(message) ?? false;
   }
@@ -140,9 +119,7 @@ class Remote {
     this.state = { kind: "connecting" };
     this.screen = "chat";
     this.name = laptop.name;
-    this.#relay = laptop.relay;
     this.#changed();
-    void this.#readNotifications();
     const { device, key } = await identity();
     const current: Connection = new Connection({
       relay: laptop.relay,
@@ -164,8 +141,8 @@ class Remote {
         this.name = name;
         void saveLaptop({ ...laptop, name });
         current.send({ type: "sync", after: this.timeline.seq });
-        // The relay can lose the subscription, and the browser can change it. Send it again.
-        void subscription().then((sub) => sub && current.control({ type: "push", subscription: sub.toJSON() }));
+        // The app does not send notifications now. Remove a subscription from an older version.
+        void dropPushSubscription().then((dropped) => dropped && current.control({ type: "push", subscription: null }));
       },
       onMessage: (message) => this.#receive(message),
     });
