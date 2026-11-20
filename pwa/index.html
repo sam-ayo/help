@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content" />
@@ -11,36 +11,7 @@
     <title>Help</title>
   </head>
   <body>
-    <main id="pair" hidden>
-      <h1>Help</h1>
-      <p>On your Mac, open the Help app and click Phone in the sidebar. Then scan the QR code with the camera of this phone.</p>
-      <p>Or paste the pairing link here:</p>
-      <form id="pair-form">
-        <input id="pair-link" type="url" placeholder="https://…/#pair=…" autocomplete="off" required />
-        <button>Pair</button>
-      </form>
-      <p id="pair-error" class="error"></p>
-    </main>
-
-    <main id="chat" hidden>
-      <header>
-        <div>
-          <strong id="name"></strong>
-          <span id="state"></span>
-        </div>
-        <span class="actions">
-          <button id="notify" type="button" hidden>Notify me</button>
-          <button id="unpair" type="button">Unpair</button>
-        </span>
-      </header>
-      <section id="timeline"></section>
-      <form id="composer">
-        <textarea id="prompt" rows="2" placeholder="Message the agent"></textarea>
-        <button id="send">Send</button>
-        <button id="stop" type="button" hidden>Stop</button>
-      </form>
-    </main>
-
-    <script type="module" src="/src/main.ts"></script>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
