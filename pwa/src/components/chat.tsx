@@ -28,8 +28,6 @@ export function Chat() {
 
 function Header() {
   const remote = useRemote();
-  const status = stateText(remote);
-  const tone = remote.busy ? "bg-amber-400" : remote.ready ? "bg-emerald-500" : remote.state.kind === "stopped" ? "bg-destructive" : "bg-muted-foreground";
 
   async function notify() {
     // Safari on iOS has Web Push only in an app on the Home Screen. The button tells how to do that.
@@ -46,15 +44,7 @@ function Header() {
 
   return (
     <header className="flex items-center gap-2 border-b px-4 py-2">
-      <div className="flex min-w-0 flex-1 flex-col">
-        <strong className="truncate text-sm font-semibold">{remote.name}</strong>
-        {status && (
-          <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-            <span className={`size-1.5 shrink-0 rounded-full ${tone}`} />
-            <span className="truncate">{status}</span>
-          </span>
-        )}
-      </div>
+      <strong className="min-w-0 flex-1 truncate text-sm font-semibold">{remote.name}</strong>
       {(pushSupported || iOS) && (
         <Button variant="ghost" size="sm" aria-pressed={remote.notifications} onClick={notify}>
           {remote.notifications ? <BellRingIcon /> : <BellIcon />}
@@ -72,24 +62,6 @@ function Header() {
       </Button>
     </header>
   );
-}
-
-// The status line under the name of the laptop. It is empty when the agent is ready.
-function stateText(remote: ReturnType<typeof useRemote>): string {
-  const { state, status } = remote;
-  switch (state.kind) {
-    case "connecting":
-      return "Connecting";
-    case "offline":
-      return "Laptop offline";
-    case "stopped":
-      return state.reason;
-    case "ready": {
-      if (!status) return "";
-      const queued = status.queued ? `, ${status.queued} queued` : "";
-      return status.busy ? `Working${queued}` : "";
-    }
-  }
 }
 
 function Timeline() {
